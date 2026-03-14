@@ -34,7 +34,13 @@ export interface FullAccount {
     unrealizedPnl: number;
   };
   positions: Position[];
-  openOrders: any[];
+  openOrders: unknown[];
+}
+
+interface AccountResponse {
+  fullAccount?: FullAccount;
+  orderHistory?: unknown;
+  fills?: unknown[];
 }
 
 class BulkApiService {
@@ -49,7 +55,8 @@ class BulkApiService {
     try {
       const res = await fetch(`${this.baseUrl}/ticker/${symbol}`);
       if (!res.ok) return null;
-      return await res.json();
+      const data = await res.json() as Ticker;
+      return data;
     } catch (error) {
       console.error(`Failed to fetch ticker for ${symbol}:`, error);
       return null;
@@ -74,8 +81,11 @@ class BulkApiService {
         body: JSON.stringify({ type: 'fullAccount', user: walletAddress }),
       });
       if (!res.ok) return null;
-      const data = await res.json();
-      return data[0]?.fullAccount || null;
+      const data = await res.json() as AccountResponse[];
+      if (data && data[0] && data[0].fullAccount) {
+        return data[0].fullAccount;
+      }
+      return null;
     } catch (error) {
       console.error(`Failed to fetch account for ${walletAddress}:`, error);
       return null;
@@ -83,11 +93,12 @@ class BulkApiService {
   }
 
   // Fetch exchange stats
-  async getStats(): Promise<any> {
+  async getStats(): Promise<Record<string, unknown> | null> {
     try {
       const res = await fetch(`${this.baseUrl}/stats?period=1d`);
       if (!res.ok) return null;
-      return await res.json();
+      const data = await res.json() as Record<string, unknown>;
+      return data;
     } catch (error) {
       console.error('Failed to fetch stats:', error);
       return null;
@@ -95,7 +106,7 @@ class BulkApiService {
   }
 
   // Fetch order history for a wallet
-  async getOrderHistory(walletAddress: string): Promise<any[]> {
+  async getOrderHistory(walletAddress: string): Promise<unknown[]> {
     try {
       const res = await fetch(`${this.baseUrl}/account`, {
         method: 'POST',
@@ -103,8 +114,14 @@ class BulkApiService {
         body: JSON.stringify({ type: 'orderHistory', user: walletAddress }),
       });
       if (!res.ok) return [];
-      const data = await res.json();
-      return data.map((d: any) => d.orderHistory).filter(Boolean);
+      const data = await res.json() as AccountResponse[];
+      const results: unknown[] = [];
+      for (const item of data) {
+        if (item && item.orderHistory) {
+          results.push(item.orderHistory);
+        }
+      }
+      return results;
     } catch (error) {
       console.error(`Failed to fetch order history for ${walletAddress}:`, error);
       return [];
@@ -112,7 +129,7 @@ class BulkApiService {
   }
 
   // Fetch fills (executed trades) for a wallet
-  async getFills(walletAddress: string): Promise<any[]> {
+  async getFills(walletAddress: string): Promise<unknown[]> {
     try {
       const res = await fetch(`${this.baseUrl}/account`, {
         method: 'POST',
@@ -120,8 +137,14 @@ class BulkApiService {
         body: JSON.stringify({ type: 'fills', user: walletAddress }),
       });
       if (!res.ok) return [];
-      const data = await res.json();
-      return data.map((d: any) => d.fills).filter(Boolean).flat();
+      const data = await res.json() as AccountResponse[];
+      const results: unknown[] = [];
+      for (const item of data) {
+        if (item && item.fills && Array.isArray(item.fills)) {
+          results.push(...item.fills);
+        }
+      }
+      return results;
     } catch (error) {
       console.error(`Failed to fetch fills for ${walletAddress}:`, error);
       return [];
