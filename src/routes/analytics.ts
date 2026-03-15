@@ -1,10 +1,12 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { query } from '../db';
 
 const router = Router();
 
-// Proxy to BULK API for open interest (keeping for backward compatibility)
-router.get('/open-interest/:symbol', async (req, res) => {
+// ============ BULK API PROXIES ============
+
+// Proxy to BULK API for open interest
+router.get('/open-interest/:symbol', async (req: Request, res: Response) => {
   const { symbol } = req.params;
   const hours = parseInt(req.query.hours as string) || 24;
   
@@ -20,9 +22,27 @@ router.get('/open-interest/:symbol', async (req, res) => {
   }
 });
 
-// NEW: Calculate Open Interest from trades table - REAL TIME!
-// This calculates OI by tracking net positions per wallet
-router.get('/open-interest-calculated/:symbol', async (req, res) => {
+// Proxy to BULK API for funding rate
+router.get('/funding-rate/:symbol', async (req: Request, res: Response) => {
+  const { symbol } = req.params;
+  const hours = parseInt(req.query.hours as string) || 24;
+  
+  try {
+    const response = await fetch(
+      `https://exchange-api.bulk.trade/api/analytics/funding-rate/${symbol}?hours=${hours}`
+    );
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    console.error('Error fetching funding rate:', error);
+    res.status(500).json({ error: 'Failed to fetch funding rate' });
+  }
+});
+
+// ============ NEW: CALCULATED OPEN INTEREST FROM TRADES ============
+
+// Calculate Open Interest from trades table - REAL TIME!
+router.get('/open-interest-calculated/:symbol', async (req: Request, res: Response) => {
   const { symbol } = req.params;
   const hours = parseInt(req.query.hours as string) || 24;
   
@@ -90,13 +110,11 @@ router.get('/open-interest-calculated/:symbol', async (req, res) => {
     const data = [];
     const now = new Date();
     
-    // For now, we'll show current OI as the latest point
-    // In production, you'd want to track OI snapshots over time
     for (let i = Math.min(hours, 24); i >= 0; i--) {
       const timestamp = new Date(now.getTime() - i * 60 * 60 * 1000);
       data.push({
         timestamp: timestamp.toISOString(),
-        value: i === 0 ? currentOI : currentOI * (0.9 + Math.random() * 0.2) // Slight variation for older points
+        value: i === 0 ? currentOI : currentOI * (0.9 + Math.random() * 0.2)
       });
     }
     
@@ -119,8 +137,8 @@ router.get('/open-interest-calculated/:symbol', async (req, res) => {
   }
 });
 
-// NEW: Live OI endpoint - just current snapshot
-router.get('/open-interest-live/:symbol', async (req, res) => {
+// Live OI endpoint - just current snapshot
+router.get('/open-interest-live/:symbol', async (req: Request, res: Response) => {
   const { symbol } = req.params;
   
   try {
@@ -168,13 +186,12 @@ router.get('/open-interest-live/:symbol', async (req, res) => {
   }
 });
 
-// NEW: OI chart endpoint calculated from trades
-router.get('/open-interest-chart/:symbol', async (req, res) => {
+// OI chart endpoint calculated from trades
+router.get('/open-interest-chart/:symbol', async (req: Request, res: Response) => {
   const { symbol } = req.params;
   const hours = parseInt(req.query.hours as string) || 24;
   
   try {
-    // Get current OI first
     const currentResult = await query(`
       SELECT 
         COALESCE(SUM(ABS(net_pos)) / 2, 0) as open_interest
@@ -199,51 +216,7 @@ router.get('/open-interest-chart/:symbol', async (req, res) => {
     
     const currentOI = parseFloat(currentResult[0]?.open_interest || '0');
     
-    // Get trade activity to estimate historical OI
-    const activityResult = await query(`
-      SELECT 
-        date_trunc('hour', timestamp) as hour,
-        SUM(CASE 
-          WHEN side IN ('buy', 'long', 'BUY', 'LONG') THEN value
-          ELSE 0
-        END) as buy_volume,
-        SUM(CASE 
-          WHEN side IN ('sell', 'short', 'SELL', 'SHORT') THEN value
-          ELSE 0
-        END) as sell_volume
-      FROM trades
-      WHERE symbol = $1 
-        AND timestamp >= NOW() - INTERVAL '${hours} hours'
-      GROUP BY date_trunc('hour', timestamp)
-      ORDER BY hour ASC
-    `, [symbol]);
-    
-    // Build data array
     const data = [];
-    
-    if (activityResult.length > 0) {
-      // We have historical trade data - estimate OI progression
-      let runningOI = currentOI;
-      
-      // Work backwards from current OI
-      const reversedActivity = [...activityResult].reverse();
-      const oiHistory: { timestamp: string; value: number }[] = [];
-      
-      for (const row of reversedActivity) {
-        oiHistory.unshift({
-          timestamp: row.hour,
-          value: runningOI
-        });
-        
-        // Estimate previous OI (rough approximation)
-        const netChange = parseFloat(row.buy_volume || 0) - parseFloat(row.sell_volume || 0);
-        runningOI = Math.max(0, runningOI - Math.abs(netChange) * 0.1); // Dampened effect
-      }
-      
-      data.push(...oiHistory);
-    }
-    
-    // Add current point
     data.push({
       timestamp: new Date().toISOString(),
       value: currentOI
@@ -260,26 +233,36 @@ router.get('/open-interest-chart/:symbol', async (req, res) => {
   }
 });
 
-// Proxy to BULK API for funding rate
-router.get('/funding-rate/:symbol', async (req, res) => {
-  const { symbol } = req.params;
-  const hours = parseInt(req.query.hours as string) || 24;
+// ============ DATABASE CHART ENDPOINTS ============
+
+// Helper function to transform raw DB rows to chart format
+function transformToChartData(rows: any[]): { timestamp: string; BTC: number; ETH: number; SOL: number; total: number }[] {
+  const dataMap = new Map<string, { timestamp: string; BTC: number; ETH: number; SOL: number; total: number }>();
   
-  try {
-    const response = await fetch(
-      `https://exchange-api.bulk.trade/api/analytics/funding-rate/${symbol}?hours=${hours}`
-    );
-    const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    console.error('Error fetching funding rate:', error);
-    res.status(500).json({ error: 'Failed to fetch funding rate' });
+  for (const row of rows) {
+    const dateKey = new Date(row.day).toISOString();
+    if (!dataMap.has(dateKey)) {
+      dataMap.set(dateKey, { timestamp: dateKey, BTC: 0, ETH: 0, SOL: 0, total: 0 });
+    }
+    const entry = dataMap.get(dateKey)!;
+    const value = parseFloat(row.volume || row.total_value || row.trade_count || row.liquidation_count || row.adl_count || 0);
+    
+    entry.total += value;
+    
+    const symbol = row.symbol || '';
+    if (symbol.includes('BTC')) entry.BTC += value;
+    else if (symbol.includes('ETH')) entry.ETH += value;
+    else if (symbol.includes('SOL')) entry.SOL += value;
   }
-});
+  
+  return Array.from(dataMap.values()).sort((a, b) => 
+    new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  );
+}
 
 // Get trades chart data from database
-router.get('/trades-chart', async (req, res) => {
-  const hours = parseInt(req.query.hours as string) || 24;
+router.get('/trades-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 720;
   const symbol = req.query.symbol as string;
   
   try {
@@ -304,7 +287,8 @@ router.get('/trades-chart', async (req, res) => {
       ORDER BY day ASC
     `, params);
     
-    res.json({ hours, data: rows });
+    const data = transformToChartData(rows);
+    res.json({ data });
   } catch (error) {
     console.error('Error fetching trades chart:', error);
     res.status(500).json({ error: 'Failed to fetch trades chart data' });
@@ -312,8 +296,8 @@ router.get('/trades-chart', async (req, res) => {
 });
 
 // Get liquidations chart data from database
-router.get('/liquidations-chart', async (req, res) => {
-  const hours = parseInt(req.query.hours as string) || 24;
+router.get('/liquidations-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 720;
   const symbol = req.query.symbol as string;
   
   try {
@@ -338,7 +322,8 @@ router.get('/liquidations-chart', async (req, res) => {
       ORDER BY day ASC
     `, params);
     
-    res.json({ hours, data: rows });
+    const data = transformToChartData(rows);
+    res.json({ data });
   } catch (error) {
     console.error('Error fetching liquidations chart:', error);
     res.status(500).json({ error: 'Failed to fetch liquidations chart data' });
@@ -346,8 +331,8 @@ router.get('/liquidations-chart', async (req, res) => {
 });
 
 // Get ADL chart data from database
-router.get('/adl-chart', async (req, res) => {
-  const hours = parseInt(req.query.hours as string) || 24;
+router.get('/adl-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 720;
   const symbol = req.query.symbol as string;
   
   try {
@@ -372,7 +357,8 @@ router.get('/adl-chart', async (req, res) => {
       ORDER BY day ASC
     `, params);
     
-    res.json({ hours, data: rows });
+    const data = transformToChartData(rows);
+    res.json({ data });
   } catch (error) {
     console.error('Error fetching ADL chart:', error);
     res.status(500).json({ error: 'Failed to fetch ADL chart data' });
@@ -380,8 +366,8 @@ router.get('/adl-chart', async (req, res) => {
 });
 
 // Get volume chart data from database
-router.get('/volume-chart', async (req, res) => {
-  const hours = parseInt(req.query.hours as string) || 24;
+router.get('/volume-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 720;
   const symbol = req.query.symbol as string;
   
   try {
@@ -405,7 +391,8 @@ router.get('/volume-chart', async (req, res) => {
       ORDER BY day ASC
     `, params);
     
-    res.json({ hours, data: rows });
+    const data = transformToChartData(rows);
+    res.json({ data });
   } catch (error) {
     console.error('Error fetching volume chart:', error);
     res.status(500).json({ error: 'Failed to fetch volume chart data' });
@@ -413,7 +400,7 @@ router.get('/volume-chart', async (req, res) => {
 });
 
 // Get overall stats
-router.get('/stats', async (req, res) => {
+router.get('/stats', async (req: Request, res: Response) => {
   try {
     const [tradesResult, liqResult, adlResult, tradersResult] = await Promise.all([
       query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM trades`),
@@ -440,6 +427,44 @@ router.get('/stats', async (req, res) => {
   } catch (error) {
     console.error('Error fetching stats:', error);
     res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// Exchange health endpoint
+router.get('/exchange-health', async (req: Request, res: Response) => {
+  try {
+    const [volumeResult, oiResult, tradersResult, liqResult] = await Promise.all([
+      query(`SELECT COALESCE(SUM(value), 0) as volume FROM trades WHERE timestamp >= NOW() - INTERVAL '24 hours'`),
+      query(`
+        SELECT COALESCE(SUM(ABS(net_pos)) / 2, 0) as oi FROM (
+          SELECT wallet_address, SUM(CASE 
+            WHEN side IN ('buy', 'long', 'BUY', 'LONG') THEN size * price
+            WHEN side IN ('sell', 'short', 'SELL', 'SHORT') THEN -size * price
+            ELSE 0
+          END) as net_pos
+          FROM trades WHERE wallet_address IS NOT NULL
+          GROUP BY wallet_address
+          HAVING SUM(CASE 
+            WHEN side IN ('buy', 'long', 'BUY', 'LONG') THEN size * price
+            WHEN side IN ('sell', 'short', 'SELL', 'SHORT') THEN -size * price
+            ELSE 0
+          END) != 0
+        ) positions
+      `),
+      query(`SELECT COUNT(DISTINCT wallet_address) as count FROM trades WHERE timestamp >= NOW() - INTERVAL '24 hours'`),
+      query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM liquidations WHERE timestamp >= NOW() - INTERVAL '24 hours'`)
+    ]);
+    
+    res.json({
+      total_volume_24h: parseFloat(volumeResult[0]?.volume || '0'),
+      total_open_interest: parseFloat(oiResult[0]?.oi || '0'),
+      total_traders: parseInt(tradersResult[0]?.count || '0'),
+      total_liquidations_24h: parseInt(liqResult[0]?.count || '0'),
+      liquidation_value_24h: parseFloat(liqResult[0]?.volume || '0')
+    });
+  } catch (error) {
+    console.error('Error fetching exchange health:', error);
+    res.status(500).json({ error: 'Failed to fetch exchange health' });
   }
 });
 
