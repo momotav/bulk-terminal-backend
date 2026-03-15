@@ -35,7 +35,14 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
   
   try {
     const account = await bulkApi.getFullAccount(walletAddress);
-    if (!account) return;
+    if (!account) {
+      console.log(`⚠️ No account data for ${walletAddress.slice(0, 8)}...`);
+      return;
+    }
+    
+    // Debug: Log the raw account structure
+    console.log(`🔍 DEBUG ${walletAddress.slice(0, 8)}... margin:`, JSON.stringify(account.margin));
+    console.log(`🔍 DEBUG ${walletAddress.slice(0, 8)}... positions:`, JSON.stringify(account.positions));
     
     // Calculate total notional - use notional if exists, otherwise size * price
     const totalNotional = account.positions.reduce((sum, p) => {
@@ -67,7 +74,7 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
     
     console.log(`💰 Fetched ${walletAddress.slice(0, 8)}...: PnL=$${totalPnl.toFixed(2)} | Notional=$${totalNotional.toFixed(2)} | Positions=${account.positions.length}`);
   } catch (error) {
-    // Silently fail - wallet might not exist on BULK
+    console.error(`❌ Error fetching ${walletAddress.slice(0, 8)}...:`, error);
   }
 }
 
