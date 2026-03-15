@@ -33,7 +33,7 @@ class LeaderboardService {
     
     // If timeframe is 'all', use aggregated data from traders table
     if (timeframe === 'all') {
-      const rows = await query<{ wallet_address: string; total_pnl: number; total_trades: number }>(
+      const rows = await query<{ wallet_address: string; value: number; trades: number }>(
         `SELECT wallet_address, total_pnl as value, total_trades as trades
          FROM traders
          WHERE total_pnl != 0
@@ -45,8 +45,8 @@ class LeaderboardService {
       return rows.map((row, index) => ({
         rank: index + 1,
         wallet_address: row.wallet_address,
-        value: parseFloat(row.total_pnl as any) || 0,
-        trades: row.total_trades,
+        value: parseFloat(row.value as any) || 0,
+        trades: row.trades,
       }));
     }
     
