@@ -36,7 +36,7 @@ class LeaderboardService {
       const rows = await query<{ wallet_address: string; total_pnl: number; total_trades: number }>(
         `SELECT wallet_address, total_pnl as value, total_trades as trades
          FROM traders
-         WHERE total_pnl > 0
+         WHERE total_pnl != 0
          ORDER BY total_pnl DESC
          LIMIT $1`,
         [limit]
@@ -50,24 +50,26 @@ class LeaderboardService {
       }));
     }
     
-    // For time-based, use snapshots
-    const rows = await query<{ wallet_address: string; pnl_change: number }>(
-      `SELECT 
+    // For time-based, use latest snapshot for each wallet
+    const rows = await query<{ wallet_address: string; pnl: number }>(
+      `SELECT DISTINCT ON (wallet_address)
         wallet_address,
-        SUM(pnl) as pnl_change
+        pnl + unrealized_pnl as pnl
        FROM trader_snapshots
        WHERE 1=1 ${timeFilter}
-       GROUP BY wallet_address
-       HAVING SUM(pnl) > 0
-       ORDER BY pnl_change DESC
-       LIMIT $1`,
-      [limit]
+       ORDER BY wallet_address, timestamp DESC`,
+      []
     );
     
-    return rows.map((row, index) => ({
+    // Sort by PnL and limit
+    const sorted = rows
+      .sort((a, b) => (parseFloat(b.pnl as any) || 0) - (parseFloat(a.pnl as any) || 0))
+      .slice(0, limit);
+    
+    return sorted.map((row, index) => ({
       rank: index + 1,
       wallet_address: row.wallet_address,
-      value: parseFloat(row.pnl_change as any) || 0,
+      value: parseFloat(row.pnl as any) || 0,
     }));
   }
 
