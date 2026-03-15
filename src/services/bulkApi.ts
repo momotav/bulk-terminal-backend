@@ -66,12 +66,12 @@ class BulkApiService {
         return null;
       }
       
-      const data = await res.json();
+      const data: any = await res.json();
       console.log(`📊 Raw ticker data for ${symbol}:`, JSON.stringify(data).slice(0, 200));
       
       // Handle different response formats
       // Could be { symbol, markPrice, ... } or { data: { ... } } or array
-      const ticker = data.data || data[0] || data;
+      const ticker: any = data.data || data[0] || data;
       
       return {
         symbol: ticker.symbol || symbol,
@@ -96,8 +96,8 @@ class BulkApiService {
     try {
       const res = await fetch(`${this.baseUrl}/tickers`);
       if (res.ok) {
-        const data = await res.json();
-        const tickersArray = data.data || data || [];
+        const data: any = await res.json();
+        const tickersArray: any[] = data.data || data || [];
         if (Array.isArray(tickersArray) && tickersArray.length > 0) {
           console.log(`📊 Got ${tickersArray.length} tickers from bulk endpoint`);
           return tickersArray.map((t: any) => ({
