@@ -205,22 +205,10 @@ function processMessage(data: WebSocket.Data): void {
   }
 }
 
-// Start heartbeat
+// Start heartbeat - just keep connection alive, no ping needed
 function startHeartbeat(): void {
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval);
-  }
-
-  heartbeatInterval = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        // Try Hyperliquid-style ping
-        ws.send(JSON.stringify({ method: 'ping' }));
-      } catch (e) {
-        console.error('Failed to send ping:', e);
-      }
-    }
-  }, 25000);
+  // BULK API doesn't support ping method, connection stays alive automatically
+  // We'll just monitor for disconnects via the close event
 }
 
 // Stop heartbeat
@@ -277,28 +265,22 @@ function connect(): void {
       reconnectAttempts = 0;
       console.log('✅ WebSocket connected to BULK Exchange');
 
-      // Try Hyperliquid-style subscription format
+      // BULK expects subscription as an array, not object
+      // Format: { "method": "subscribe", "subscription": [{"type": "trades", "coin": "BTC"}] }
       const symbols = ['BTC', 'ETH', 'SOL'];
       
-      for (const coin of symbols) {
-        try {
-          // Subscribe to trades
-          ws?.send(JSON.stringify({
-            method: 'subscribe',
-            subscription: { type: 'trades', coin }
-          }));
-          
-          // Subscribe to liquidations
-          ws?.send(JSON.stringify({
-            method: 'subscribe',
-            subscription: { type: 'liquidation', coin }
-          }));
-        } catch (e) {
-          console.error(`Failed to subscribe to ${coin}:`, e);
-        }
+      try {
+        // Subscribe to all trades at once
+        ws?.send(JSON.stringify({
+          method: 'subscribe',
+          subscription: symbols.map(coin => ({ type: 'trades', coin }))
+        }));
+        
+        console.log('📡 Sent subscription for trades: BTC, ETH, SOL');
+      } catch (e) {
+        console.error('Failed to subscribe:', e);
       }
 
-      console.log('📡 Subscribed to trade streams for BTC, ETH, SOL');
       startHeartbeat();
     });
 
