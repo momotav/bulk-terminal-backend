@@ -118,8 +118,8 @@ class LeaderboardService {
 
   // Biggest Positions (Whale Watch)
   async getBiggestPositions(limit: number = 50): Promise<LeaderboardEntry[]> {
-    // This needs to be fetched live from snapshots (current state)
-    const rows = await query<{ wallet_address: string; total_notional: number; positions_count: number }>(
+    // Get latest snapshot for each wallet with notional > 0
+    const rows = await query<{ wallet_address: string; value: number; positions: number }>(
       `SELECT DISTINCT ON (wallet_address)
         wallet_address,
         total_notional as value,
@@ -130,16 +130,16 @@ class LeaderboardService {
       []
     );
     
-    // Sort by notional and limit
+    // Sort by value (notional) and limit
     const sorted = rows
-      .sort((a, b) => (parseFloat(b.total_notional as any) || 0) - (parseFloat(a.total_notional as any) || 0))
+      .sort((a, b) => (parseFloat(b.value as any) || 0) - (parseFloat(a.value as any) || 0))
       .slice(0, limit);
     
     return sorted.map((row, index) => ({
       rank: index + 1,
       wallet_address: row.wallet_address,
-      value: parseFloat(row.total_notional as any) || 0,
-      positions: row.positions_count,
+      value: parseFloat(row.value as any) || 0,
+      positions: row.positions,
     }));
   }
 
