@@ -46,7 +46,24 @@ app.get('/debug/db', async (req, res) => {
   try {
     const traders = await query('SELECT wallet_address, total_pnl, total_volume, total_trades FROM traders ORDER BY last_seen DESC LIMIT 10');
     const snapshots = await query('SELECT wallet_address, pnl, unrealized_pnl, total_notional, positions_count, timestamp FROM trader_snapshots ORDER BY timestamp DESC LIMIT 10');
-    res.json({ traders, snapshots });
+    const marketStats = await query('SELECT symbol, price, open_interest, volume_24h, funding_rate, timestamp FROM market_stats ORDER BY timestamp DESC LIMIT 20');
+    const marketStatsCount = await query('SELECT COUNT(*) as count FROM market_stats');
+    res.json({ traders, snapshots, marketStats, marketStatsCount });
+  } catch (error) {
+    res.status(500).json({ error: String(error) });
+  }
+});
+
+// Debug endpoint to manually trigger market stats collection
+app.get('/debug/collect', async (req, res) => {
+  try {
+    const { bulkApi } = await import('./services/bulkApi');
+    const tickers = await bulkApi.getAllTickers();
+    res.json({ 
+      message: 'Fetched tickers',
+      count: tickers.length,
+      tickers 
+    });
   } catch (error) {
     res.status(500).json({ error: String(error) });
   }
