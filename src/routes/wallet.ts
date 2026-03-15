@@ -14,6 +14,13 @@ router.get('/:address', async (req: Request, res: Response) => {
     // Get live account data from BULK
     const account = await bulkApi.getFullAccount(address);
     
+    // Get current mark prices for all symbols
+    const tickers = await bulkApi.getAllTickers();
+    const markPrices: Record<string, number> = {};
+    for (const ticker of tickers) {
+      markPrices[ticker.symbol] = ticker.markPrice;
+    }
+    
     console.log(`🔍 Wallet API for ${address.slice(0,8)}:`, JSON.stringify(account));
     
     // Get our tracked data
@@ -35,6 +42,7 @@ router.get('/:address', async (req: Request, res: Response) => {
     res.json({
       address,
       live: account,
+      markPrices,  // Include current mark prices
       tracked: trader,
       history: snapshots.reverse(),
     });
