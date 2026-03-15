@@ -5,7 +5,7 @@ import dotenv from 'dotenv';
 // Load environment variables
 dotenv.config();
 
-import { testConnection, initializeDatabase } from './db';
+import { testConnection, initializeDatabase, query } from './db';
 import { startDataCollector } from './jobs/dataCollector';
 import { startWebSocketListener, getWebSocketStats } from './jobs/wsListener';
 
@@ -39,6 +39,17 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     websocket: wsStats,
   });
+});
+
+// Debug endpoint to check actual database values
+app.get('/debug/db', async (req, res) => {
+  try {
+    const traders = await query('SELECT wallet_address, total_pnl, total_volume, total_trades FROM traders ORDER BY last_seen DESC LIMIT 10');
+    const snapshots = await query('SELECT wallet_address, pnl, unrealized_pnl, total_notional, positions_count, timestamp FROM trader_snapshots ORDER BY timestamp DESC LIMIT 10');
+    res.json({ traders, snapshots });
+  } catch (error) {
+    res.status(500).json({ error: String(error) });
+  }
 });
 
 // API Routes
