@@ -286,6 +286,11 @@ function processMessage(data: WebSocket.Data): void {
     if (message.type === 'trades' && message.data?.trades) {
       const trades = message.data.trades;
       
+      // Log first few trades to see all fields (for debugging ADL/liquidation detection)
+      if (stats.tradesReceived < 5) {
+        console.log(`🔍 Trade fields:`, JSON.stringify(trades[0], null, 2));
+      }
+      
       for (const trade of trades) {
         // Skip if this is a resting order, not a fill
         if (trade.status === 'resting' || trade.filledSize === 0) {
@@ -311,7 +316,24 @@ function processMessage(data: WebSocket.Data): void {
                               trade.type === 'liquidation' ||
                               (trade.reduceOnly && trade.forcedLiquidation);
         
-        if (isLiquidation) {
+        // Check if this is an ADL (Auto-Deleveraging) trade
+        // ADL is sent via trades with adl flag per Bulk dev
+        const isADL = trade.adl || trade.isAdl || trade.isADL || 
+                      trade.orderType === 'adl' || trade.type === 'adl' ||
+                      trade.autoDeleverage || trade.auto_deleverage;
+        
+        if (isADL) {
+          console.log(`⚡ ADL detected in trade: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
+          recordADL({
+            symbol,
+            price,
+            size,
+            side: side === 'buy' ? 'short' : 'long',
+            wallet: walletAddress,
+            counterparty: trade.counterparty || trade.reducer || (maker === walletAddress ? taker : maker),
+            time,
+          });
+        } else if (isLiquidation) {
           console.log(`🔥 LIQUIDATION detected in trade: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
           recordLiquidation({
             symbol,
@@ -343,7 +365,22 @@ function processMessage(data: WebSocket.Data): void {
       const trades = Array.isArray(message.data) ? message.data : [message.data];
       
       for (const trade of trades) {
-        if (trade.liquidation || trade.isLiquidation) {
+        // Check for ADL first
+        const isADL = trade.adl || trade.isAdl || trade.isADL || 
+                      trade.orderType === 'adl' || trade.type === 'adl' ||
+                      trade.autoDeleverage || trade.auto_deleverage;
+        
+        if (isADL) {
+          recordADL({
+            symbol: trade.coin || trade.symbol || 'UNKNOWN',
+            price: parseFloat(trade.px) || trade.price,
+            size: parseFloat(trade.sz) || trade.size,
+            side: trade.side === 'B' ? 'long' : 'short',
+            wallet: trade.users?.[0] || trade.user || trade.wallet,
+            counterparty: trade.users?.[1] || trade.counterparty,
+            time: trade.time || Date.now(),
+          });
+        } else if (trade.liquidation || trade.isLiquidation) {
           recordLiquidation({
             symbol: trade.coin || trade.symbol || 'UNKNOWN',
             price: parseFloat(trade.px) || trade.price,
