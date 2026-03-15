@@ -76,6 +76,25 @@ class AnalyticsService {
     }));
   }
 
+  // Get Price history
+  async getPriceHistory(
+    symbol: string, 
+    hours: number = 168
+  ): Promise<{ timestamp: Date; value: number }[]> {
+    const rows = await query<{ timestamp: Date; value: number }>(
+      `SELECT timestamp, price as value
+       FROM market_stats
+       WHERE symbol = $1 AND timestamp > NOW() - INTERVAL '${hours} hours'
+       ORDER BY timestamp ASC`,
+      [symbol]
+    );
+    
+    return rows.map(r => ({
+      timestamp: r.timestamp,
+      value: parseFloat(r.value as any) || 0,
+    }));
+  }
+
   // Get Long vs Short ratio history
   async getLongShortRatioHistory(
     symbol: string, 
