@@ -37,42 +37,70 @@ async function collectMarketStats(): Promise<void> {
 // Update trader snapshots every 5 minutes
 async function updateTraderSnapshots(): Promise<void> {
   try {
+    // Also load wallets from recent trades that aren't being tracked yet
+    const newWallets = await query<{ wallet_address: string }>(
+      `SELECT DISTINCT wallet_address FROM trades 
+       WHERE wallet_address IS NOT NULL 
+       AND wallet_address NOT IN (SELECT wallet_address FROM traders)
+       LIMIT 50`
+    );
+    
+    for (const row of newWallets) {
+      if (!trackedWallets.includes(row.wallet_address)) {
+        trackedWallets.push(row.wallet_address);
+        await query(
+          `INSERT INTO traders (wallet_address) VALUES ($1) ON CONFLICT DO NOTHING`,
+          [row.wallet_address]
+        );
+      }
+    }
+    
     let updated = 0;
     
     for (const wallet of trackedWallets) {
-      const account = await bulkApi.getFullAccount(wallet);
-      if (!account) continue;
-      
-      const totalNotional = account.positions.reduce(
-        (sum, p) => sum + Math.abs(p.notional || 0), 0
-      );
-      
-      // Update or create trader
-      await query(
-        `INSERT INTO traders (wallet_address, last_seen)
-         VALUES ($1, NOW())
-         ON CONFLICT (wallet_address) DO UPDATE SET last_seen = NOW()`,
-        [wallet]
-      );
-      
-      // Create snapshot
-      await query(
-        `INSERT INTO trader_snapshots 
-         (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          wallet,
-          account.margin.realizedPnl || 0,
-          account.margin.unrealizedPnl || 0,
-          account.positions.length,
-          totalNotional,
-        ]
-      );
-      
-      updated++;
-      
-      // Small delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 100));
+      try {
+        const account = await bulkApi.getFullAccount(wallet);
+        if (!account) continue;
+        
+        const totalNotional = account.positions.reduce(
+          (sum, p) => sum + Math.abs(p.notional || 0), 0
+        );
+        
+        const realizedPnl = account.margin.realizedPnl || 0;
+        const unrealizedPnl = account.margin.unrealizedPnl || 0;
+        const totalPnl = realizedPnl + unrealizedPnl;
+        
+        // Update trader with current PnL and notional
+        await query(
+          `UPDATE traders SET 
+             last_seen = NOW(),
+             total_pnl = $2
+           WHERE wallet_address = $1`,
+          [wallet, totalPnl]
+        );
+        
+        // Create snapshot
+        await query(
+          `INSERT INTO trader_snapshots 
+           (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [
+            wallet,
+            realizedPnl,
+            unrealizedPnl,
+            account.positions.length,
+            totalNotional,
+          ]
+        );
+        
+        updated++;
+        
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 200));
+      } catch (err) {
+        // Skip wallets that fail (might not exist on BULK)
+        console.error(`Failed to update wallet ${wallet.slice(0, 8)}:`, err);
+      }
     }
     
     console.log(`👤 Updated snapshots for ${updated} traders`);
