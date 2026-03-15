@@ -18,9 +18,28 @@ import walletRoutes from './routes/wallet';
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Allowed origins
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://bulkstats.com',
+  'https://www.bulkstats.com',
+  'https://bulk-terminal.vercel.app',
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
 // Middleware
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.log('Blocked by CORS:', origin);
+      callback(null, true); // Allow all for now, log blocked ones
+    }
+  },
   credentials: true,
 }));
 app.use(express.json());
