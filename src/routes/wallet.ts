@@ -14,6 +14,8 @@ router.get('/:address', async (req: Request, res: Response) => {
     // Get live account data from BULK
     const account = await bulkApi.getFullAccount(address);
     
+    console.log(`🔍 Wallet API for ${address.slice(0,8)}:`, JSON.stringify(account));
+    
     // Get our tracked data
     const trader = await queryOne(
       'SELECT * FROM traders WHERE wallet_address = $1',
