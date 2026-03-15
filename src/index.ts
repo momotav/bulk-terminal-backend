@@ -7,6 +7,7 @@ dotenv.config();
 
 import { testConnection, initializeDatabase } from './db';
 import { startDataCollector } from './jobs/dataCollector';
+import { startWebSocketListener, getWebSocketStats } from './jobs/wsListener';
 
 // Import routes
 import authRoutes from './routes/auth';
@@ -32,7 +33,12 @@ app.use((req, res, next) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  const wsStats = getWebSocketStats();
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    websocket: wsStats,
+  });
 });
 
 // API Routes
@@ -68,6 +74,9 @@ async function start() {
   
   // Start data collector cron jobs
   startDataCollector();
+  
+  // Start WebSocket listener for live trades/liquidations
+  startWebSocketListener();
   
   // Start HTTP server
   app.listen(PORT, () => {
