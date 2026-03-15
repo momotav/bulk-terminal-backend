@@ -78,7 +78,7 @@ class LeaderboardService {
     const timeFilter = this.getTimeFilter(timeframe);
     
     if (timeframe === 'all') {
-      const rows = await query<{ wallet_address: string; liquidation_value: number; total_liquidations: number }>(
+      const rows = await query<{ wallet_address: string; value: number; trades: number }>(
         `SELECT wallet_address, liquidation_value as value, total_liquidations as trades
          FROM traders
          WHERE liquidation_value > 0
@@ -90,8 +90,8 @@ class LeaderboardService {
       return rows.map((row, index) => ({
         rank: index + 1,
         wallet_address: row.wallet_address,
-        value: parseFloat(row.liquidation_value as any) || 0,
-        trades: row.total_liquidations,
+        value: parseFloat(row.value as any) || 0,
+        trades: row.trades,
       }));
     }
     
