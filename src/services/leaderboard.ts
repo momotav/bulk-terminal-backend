@@ -143,33 +143,15 @@ class LeaderboardService {
 
   // Most Active Traders
   async getMostActive(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
-    const timeFilter = this.getTimeFilter(timeframe);
-    
-    if (timeframe === 'all') {
-      const rows = await query<{ wallet_address: string; total_trades: number; total_volume: number }>(
-        `SELECT wallet_address, total_trades as trades, total_volume as value
-         FROM traders
-         WHERE total_trades > 0
-         ORDER BY total_trades DESC
-         LIMIT $1`,
-        [limit]
-      );
-      
-      return rows.map((row, index) => ({
-        rank: index + 1,
-        wallet_address: row.wallet_address,
-        value: parseFloat(row.total_volume as any) || 0,
-        trades: row.total_trades,
-      }));
-    }
+    const timeFilter = timeframe === 'all' ? '' : this.getTimeFilter(timeframe);
     
     const rows = await query<{ wallet_address: string; trade_count: number; total_value: number }>(
       `SELECT 
-        wallet_address,
+        COALESCE(wallet_address, 'unknown') as wallet_address,
         COUNT(*) as trade_count,
         SUM(value) as total_value
        FROM trades
-       WHERE wallet_address IS NOT NULL ${timeFilter}
+       WHERE 1=1 ${timeFilter}
        GROUP BY wallet_address
        ORDER BY trade_count DESC
        LIMIT $1`,
@@ -239,14 +221,13 @@ class LeaderboardService {
   }
 
   // Get recent big trades
-  async getRecentTrades(limit: number = 50, minValue: number = 10000): Promise<any[]> {
+  async getRecentTrades(limit: number = 50, minValue: number = 100): Promise<any[]> {
     return query(
       `SELECT id, wallet_address, symbol, side, size, price, value, timestamp
        FROM trades
-       WHERE value >= $1
        ORDER BY timestamp DESC
-       LIMIT $2`,
-      [minValue, limit]
+       LIMIT $1`,
+      [limit]
     );
   }
 }
