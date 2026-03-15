@@ -24,7 +24,7 @@ class AnalyticsService {
     symbol: string, 
     hours: number = 168 // 7 days default
   ): Promise<{ timestamp: Date; value: number }[]> {
-    const rows = await query<{ timestamp: Date; open_interest: number }>(
+    const rows = await query<{ timestamp: Date; value: number }>(
       `SELECT timestamp, open_interest as value
        FROM market_stats
        WHERE symbol = $1 AND timestamp > NOW() - INTERVAL '${hours} hours'
@@ -34,7 +34,7 @@ class AnalyticsService {
     
     return rows.map(r => ({
       timestamp: r.timestamp,
-      value: parseFloat(r.open_interest as any) || 0,
+      value: parseFloat(r.value as any) || 0,
     }));
   }
 
@@ -43,7 +43,7 @@ class AnalyticsService {
     symbol: string, 
     hours: number = 168
   ): Promise<{ timestamp: Date; value: number }[]> {
-    const rows = await query<{ timestamp: Date; funding_rate: number }>(
+    const rows = await query<{ timestamp: Date; value: number }>(
       `SELECT timestamp, funding_rate as value
        FROM market_stats
        WHERE symbol = $1 AND timestamp > NOW() - INTERVAL '${hours} hours'
@@ -53,7 +53,7 @@ class AnalyticsService {
     
     return rows.map(r => ({
       timestamp: r.timestamp,
-      value: parseFloat(r.funding_rate as any) || 0,
+      value: parseFloat(r.value as any) || 0,
     }));
   }
 
@@ -62,7 +62,7 @@ class AnalyticsService {
     symbol: string, 
     hours: number = 168
   ): Promise<{ timestamp: Date; value: number }[]> {
-    const rows = await query<{ timestamp: Date; volume_24h: number }>(
+    const rows = await query<{ timestamp: Date; value: number }>(
       `SELECT timestamp, volume_24h as value
        FROM market_stats
        WHERE symbol = $1 AND timestamp > NOW() - INTERVAL '${hours} hours'
@@ -72,7 +72,7 @@ class AnalyticsService {
     
     return rows.map(r => ({
       timestamp: r.timestamp,
-      value: parseFloat(r.volume_24h as any) || 0,
+      value: parseFloat(r.value as any) || 0,
     }));
   }
 
