@@ -53,10 +53,37 @@ class BulkApiService {
   // Fetch ticker for a symbol
   async getTicker(symbol: string): Promise<Ticker | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/ticker/${symbol}`);
-      if (!res.ok) return null;
-      const data = await res.json() as Ticker;
-      return data;
+      // Try the direct ticker endpoint first
+      let res = await fetch(`${this.baseUrl}/ticker/${symbol}`);
+      
+      // If that fails, try without the symbol in path (some APIs use query params)
+      if (!res.ok) {
+        res = await fetch(`${this.baseUrl}/ticker?symbol=${symbol}`);
+      }
+      
+      if (!res.ok) {
+        console.log(`⚠️ Ticker endpoint failed for ${symbol}: ${res.status}`);
+        return null;
+      }
+      
+      const data = await res.json();
+      console.log(`📊 Raw ticker data for ${symbol}:`, JSON.stringify(data).slice(0, 200));
+      
+      // Handle different response formats
+      // Could be { symbol, markPrice, ... } or { data: { ... } } or array
+      const ticker = data.data || data[0] || data;
+      
+      return {
+        symbol: ticker.symbol || symbol,
+        lastPrice: parseFloat(ticker.lastPrice || ticker.last || ticker.price || 0),
+        markPrice: parseFloat(ticker.markPrice || ticker.mark || ticker.price || 0),
+        priceChangePercent: parseFloat(ticker.priceChangePercent || ticker.change || 0),
+        volume: parseFloat(ticker.volume || ticker.vol || 0),
+        quoteVolume: parseFloat(ticker.quoteVolume || ticker.turnover || ticker.volume || 0),
+        openInterest: parseFloat(ticker.openInterest || ticker.oi || 0),
+        fundingRate: parseFloat(ticker.fundingRate || ticker.funding || 0),
+        timestamp: ticker.timestamp || Date.now(),
+      };
     } catch (error) {
       console.error(`Failed to fetch ticker for ${symbol}:`, error);
       return null;
@@ -65,6 +92,32 @@ class BulkApiService {
 
   // Fetch all tickers
   async getAllTickers(): Promise<Ticker[]> {
+    // First try bulk endpoint
+    try {
+      const res = await fetch(`${this.baseUrl}/tickers`);
+      if (res.ok) {
+        const data = await res.json();
+        const tickersArray = data.data || data || [];
+        if (Array.isArray(tickersArray) && tickersArray.length > 0) {
+          console.log(`📊 Got ${tickersArray.length} tickers from bulk endpoint`);
+          return tickersArray.map((t: any) => ({
+            symbol: t.symbol,
+            lastPrice: parseFloat(t.lastPrice || t.last || t.price || 0),
+            markPrice: parseFloat(t.markPrice || t.mark || t.price || 0),
+            priceChangePercent: parseFloat(t.priceChangePercent || t.change || 0),
+            volume: parseFloat(t.volume || 0),
+            quoteVolume: parseFloat(t.quoteVolume || t.turnover || t.volume || 0),
+            openInterest: parseFloat(t.openInterest || t.oi || 0),
+            fundingRate: parseFloat(t.fundingRate || t.funding || 0),
+            timestamp: t.timestamp || Date.now(),
+          }));
+        }
+      }
+    } catch (e) {
+      console.log('Bulk tickers endpoint not available, falling back to individual');
+    }
+    
+    // Fall back to individual symbol requests
     const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
     const tickers = await Promise.all(
       symbols.map(symbol => this.getTicker(symbol))
