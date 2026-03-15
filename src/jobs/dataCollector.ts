@@ -10,22 +10,38 @@ async function collectMarketStats(): Promise<void> {
   try {
     const tickers = await bulkApi.getAllTickers();
     
+    if (tickers.length === 0) {
+      console.log('⚠️ No tickers returned from BULK API');
+      return;
+    }
+    
     for (const ticker of tickers) {
-      await query(
-        `INSERT INTO market_stats 
-         (symbol, price, open_interest, volume_24h, funding_rate, long_open_interest, short_open_interest)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [
-          ticker.symbol,
-          ticker.lastPrice || ticker.markPrice,
-          ticker.openInterest || 0,
-          ticker.quoteVolume || ticker.volume || 0,
-          ticker.fundingRate || 0,
-          // Estimate long/short OI (in real scenario, API might provide this)
-          (ticker.openInterest || 0) * 0.5,
-          (ticker.openInterest || 0) * 0.5,
-        ]
-      );
+      // Log first few times to debug
+      console.log(`📊 Ticker ${ticker.symbol}:`, JSON.stringify(ticker));
+      
+      const price = ticker.markPrice || ticker.lastPrice || 0;
+      const openInterest = ticker.openInterest || 0;
+      const volume = ticker.quoteVolume || ticker.volume || 0;
+      const fundingRate = ticker.fundingRate || 0;
+      
+      // Only insert if we have valid data
+      if (price > 0) {
+        await query(
+          `INSERT INTO market_stats 
+           (symbol, price, open_interest, volume_24h, funding_rate, long_open_interest, short_open_interest)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            ticker.symbol,
+            price,
+            openInterest,
+            volume,
+            fundingRate,
+            // Estimate long/short OI (50/50 split as placeholder)
+            openInterest * 0.5,
+            openInterest * 0.5,
+          ]
+        );
+      }
     }
     
     console.log(`📊 Collected market stats for ${tickers.length} symbols`);
