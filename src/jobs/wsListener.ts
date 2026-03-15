@@ -19,8 +19,10 @@ const FETCH_COOLDOWN = 60000; // Only fetch wallet data once per minute
 const stats = {
   tradesReceived: 0,
   liquidationsReceived: 0,
+  adlReceived: 0,
   lastTradeTime: null as Date | null,
   lastLiquidationTime: null as Date | null,
+  lastAdlTime: null as Date | null,
 };
 
 // Fetch wallet PnL from BULK API and store it
@@ -202,6 +204,59 @@ async function recordLiquidation(liq: {
   }
 }
 
+// Record an ADL (Auto-Deleveraging) event to database
+async function recordADL(adl: {
+  symbol: string;
+  price: number;
+  size: number;
+  side: string;
+  wallet?: string;
+  counterparty?: string;
+  time: number;
+}): Promise<void> {
+  const value = adl.price * Math.abs(adl.size);
+  const walletAddress = adl.wallet || null;
+  const counterparty = adl.counterparty || null;
+
+  try {
+    // Insert ADL event
+    await query(
+      `INSERT INTO adl_events (wallet_address, counterparty, symbol, side, size, price, value, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8/1000.0))
+       ON CONFLICT DO NOTHING`,
+      [walletAddress, counterparty, adl.symbol, adl.side, Math.abs(adl.size), adl.price, value, adl.time]
+    );
+
+    // Update trader stats if wallet known
+    if (walletAddress) {
+      await query(
+        `INSERT INTO traders (wallet_address, total_adl, adl_value, last_seen)
+         VALUES ($1, 1, $2, NOW())
+         ON CONFLICT (wallet_address) DO UPDATE SET
+           total_adl = COALESCE(traders.total_adl, 0) + 1,
+           adl_value = COALESCE(traders.adl_value, 0) + $2,
+           last_seen = NOW()`,
+        [walletAddress, value]
+      );
+      
+      // Create notifications for users following this wallet
+      await query(
+        `INSERT INTO notifications (user_id, wallet_address, type, symbol, side, size, price, value)
+         SELECT user_id, $1, 'adl', $2, $3, $4, $5, $6
+         FROM watchlist WHERE wallet_address = $1`,
+        [walletAddress, adl.symbol, adl.side, Math.abs(adl.size), adl.price, value]
+      );
+    }
+
+    stats.adlReceived++;
+    stats.lastAdlTime = new Date();
+    
+    console.log(`⚡ ADL: ${adl.side} ${adl.symbol} | $${value.toFixed(2)} | ${walletAddress || 'unknown'} -> ${counterparty || 'unknown'}`);
+  } catch (error) {
+    console.error('Failed to record ADL:', error);
+  }
+}
+
 // Process incoming WebSocket message
 function processMessage(data: WebSocket.Data): void {
   try {
@@ -362,6 +417,37 @@ function processMessage(data: WebSocket.Data): void {
       return;
     }
 
+    // Handle ADL (Auto-Deleveraging) messages
+    if (message.channel === 'adl' || message.type === 'adl' || 
+        message.channel === 'auto_deleverage' || message.type === 'auto_deleverage') {
+      
+      const adlEvents = message.data?.adl || message.data || [message];
+      const adlArray = Array.isArray(adlEvents) ? adlEvents : [adlEvents];
+      
+      for (const adl of adlArray) {
+        const symbol = adl.s || adl.coin || adl.symbol || 'UNKNOWN';
+        const price = parseFloat(adl.px || adl.price || 0);
+        const size = parseFloat(adl.sz || adl.size || adl.qty || 0);
+        
+        if (price > 0 && size > 0) {
+          console.log(`⚡ ADL message: ${symbol} | $${(price * size).toFixed(2)}`);
+          recordADL({
+            symbol,
+            price,
+            size,
+            side: adl.side || 'unknown',
+            wallet: adl.wallet || adl.user || adl.account || adl.deleveraged,
+            counterparty: adl.counterparty || adl.reducer,
+            time: adl.time || adl.timestamp || Date.now(),
+          });
+        }
+      }
+      return;
+    }
+
+    // Also check if trade has ADL flag (BULK might send ADL as trades with a flag)
+    // This is common in perp exchanges
+
     // Handle pong
     if (message.channel === 'pong' || message.type === 'pong') {
       return;
@@ -473,6 +559,24 @@ function connect(): void {
           method: 'subscribe',
           subscription: [{ type: 'liquidation' }]
         }));
+        
+        // Subscribe to ADL events
+        ws?.send(JSON.stringify({
+          method: 'subscribe',
+          subscription: symbols.map(symbol => ({ type: 'adl', symbol }))
+        }));
+        
+        ws?.send(JSON.stringify({
+          method: 'subscribe',
+          subscription: [{ type: 'adl' }]
+        }));
+        
+        ws?.send(JSON.stringify({
+          method: 'subscribe',
+          subscription: [{ type: 'auto_deleverage' }]
+        }));
+        
+        console.log('📡 Sent subscription for ADL events');
         
       } catch (e) {
         console.error('Failed to subscribe:', e);
