@@ -145,6 +145,30 @@ export async function initializeDatabase(): Promise<void> {
       );
     `);
 
+    // Notifications for followed wallets activity
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        wallet_address VARCHAR(64) NOT NULL,
+        type VARCHAR(20) NOT NULL,
+        symbol VARCHAR(20),
+        side VARCHAR(10),
+        size DECIMAL(20, 8),
+        price DECIMAL(20, 2),
+        value DECIMAL(20, 2),
+        read BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW(),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_time 
+      ON notifications(user_id, created_at DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_notifications_unread 
+      ON notifications(user_id, read) WHERE read = false;
+    `);
+
     // Alerts
     await client.query(`
       CREATE TABLE IF NOT EXISTS alerts (
