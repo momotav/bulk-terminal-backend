@@ -40,18 +40,25 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
       return;
     }
     
-    // Debug: Log the raw account structure
-    console.log(`🔍 DEBUG ${walletAddress.slice(0, 8)}... margin:`, JSON.stringify(account.margin));
-    console.log(`🔍 DEBUG ${walletAddress.slice(0, 8)}... positions:`, JSON.stringify(account.positions));
+    // Calculate totals from positions (the actual data source)
+    let totalNotional = 0;
+    let totalRealizedPnl = 0;
+    let totalUnrealizedPnl = 0;
     
-    // Calculate total notional - use notional if exists, otherwise size * price
-    const totalNotional = account.positions.reduce((sum, p) => {
-      const posNotional = p.notional || (Math.abs(p.size || 0) * (p.price || 0));
-      return sum + Math.abs(posNotional);
-    }, 0);
+    for (const p of account.positions) {
+      // Notional is already provided, use absolute value
+      totalNotional += Math.abs(p.notional || 0);
+      totalRealizedPnl += p.realizedPnl || 0;
+      totalUnrealizedPnl += p.unrealizedPnl || 0;
+    }
     
-    const realizedPnl = account.margin.realizedPnl || 0;
-    const unrealizedPnl = account.margin.unrealizedPnl || 0;
+    // Also check margin object if it has better totals
+    const marginRealizedPnl = account.margin?.realizedPnl || 0;
+    const marginUnrealizedPnl = account.margin?.unrealizedPnl || 0;
+    
+    // Use whichever source has data (prefer margin totals if available)
+    const realizedPnl = marginRealizedPnl !== 0 ? marginRealizedPnl : totalRealizedPnl;
+    const unrealizedPnl = marginUnrealizedPnl !== 0 ? marginUnrealizedPnl : totalUnrealizedPnl;
     const totalPnl = realizedPnl + unrealizedPnl;
     
     // Upsert trader with PnL data
@@ -72,7 +79,7 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
       [walletAddress, realizedPnl, unrealizedPnl, account.positions.length, totalNotional]
     );
     
-    console.log(`💰 Fetched ${walletAddress.slice(0, 8)}...: PnL=$${totalPnl.toFixed(2)} | Notional=$${totalNotional.toFixed(2)} | Positions=${account.positions.length}`);
+    console.log(`💰 ${walletAddress.slice(0, 8)}...: PnL=$${totalPnl.toFixed(2)} | Notional=$${totalNotional.toFixed(2)} | Positions=${account.positions.length}`);
   } catch (error) {
     console.error(`❌ Error fetching ${walletAddress.slice(0, 8)}...:`, error);
   }
