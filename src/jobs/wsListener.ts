@@ -37,9 +37,11 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
     const account = await bulkApi.getFullAccount(walletAddress);
     if (!account) return;
     
-    const totalNotional = account.positions.reduce(
-      (sum, p) => sum + Math.abs(p.notional || 0), 0
-    );
+    // Calculate total notional - use notional if exists, otherwise size * price
+    const totalNotional = account.positions.reduce((sum, p) => {
+      const posNotional = p.notional || (Math.abs(p.size || 0) * (p.price || 0));
+      return sum + Math.abs(posNotional);
+    }, 0);
     
     const realizedPnl = account.margin.realizedPnl || 0;
     const unrealizedPnl = account.margin.unrealizedPnl || 0;
@@ -63,7 +65,7 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
       [walletAddress, realizedPnl, unrealizedPnl, account.positions.length, totalNotional]
     );
     
-    console.log(`💰 Fetched PnL for ${walletAddress.slice(0, 8)}...: $${totalPnl.toFixed(2)} | Positions: ${account.positions.length}`);
+    console.log(`💰 Fetched ${walletAddress.slice(0, 8)}...: PnL=$${totalPnl.toFixed(2)} | Notional=$${totalNotional.toFixed(2)} | Positions=${account.positions.length}`);
   } catch (error) {
     // Silently fail - wallet might not exist on BULK
   }
