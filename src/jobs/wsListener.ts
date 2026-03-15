@@ -222,29 +222,47 @@ function processMessage(data: WebSocket.Data): void {
         }
         
         // Extract data from BULK format
-        const symbol = trade.s || 'UNKNOWN';  // "ETH-USD"
-        const price = parseFloat(trade.px);    // 2087.25
-        const size = parseFloat(trade.sz);     // 0.024
+        const symbol = trade.s || trade.symbol || 'UNKNOWN';  // "ETH-USD"
+        const price = parseFloat(trade.px || trade.price);    // 2087.25
+        const size = parseFloat(trade.sz || trade.size);     // 0.024
         const time = trade.time || Date.now();
         const side = trade.side === true ? 'buy' : 'sell';
         const maker = trade.maker || null;
         const taker = trade.taker || null;
         
         // Use taker as the primary wallet (they initiated the trade)
-        // Only record once per trade to avoid duplicates
         const walletAddress = taker || maker || null;
         
-        console.log(`🔍 Trade: ${side} ${symbol} | price=${price} size=${size} | wallet=${walletAddress?.slice(0,8)}`);
+        // Check if this is a liquidation trade
+        // BULK may mark liquidations with: liquidation, isLiquidation, reduceOnly flags, or special order types
+        const isLiquidation = trade.liquidation || trade.isLiquidation || 
+                              trade.orderType === 'liquidation' || 
+                              trade.type === 'liquidation' ||
+                              (trade.reduceOnly && trade.forcedLiquidation);
         
-        recordTrade({
-          symbol,
-          price,
-          size,
-          side,
-          maker,
-          taker: walletAddress,  // Use single wallet
-          time,
-        });
+        if (isLiquidation) {
+          console.log(`🔥 LIQUIDATION detected in trade: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
+          recordLiquidation({
+            symbol,
+            price,
+            size,
+            side: side === 'buy' ? 'short' : 'long', // If liquidation buys, it's closing a short
+            wallet: walletAddress,
+            time,
+          });
+        } else {
+          console.log(`🔍 Trade: ${side} ${symbol} | price=${price} size=${size} | wallet=${walletAddress?.slice(0,8)}`);
+          
+          recordTrade({
+            symbol,
+            price,
+            size,
+            side,
+            maker,
+            taker: walletAddress,
+            time,
+          });
+        }
       }
       return;
     }
@@ -295,17 +313,30 @@ function processMessage(data: WebSocket.Data): void {
       return;
     }
 
-    // Handle liquidation messages
-    if (message.channel === 'liquidation' || message.type === 'liquidation') {
-      const liq = message.data || message;
-      recordLiquidation({
-        symbol: liq.coin || liq.symbol || 'UNKNOWN',
-        price: parseFloat(liq.px || liq.price),
-        size: parseFloat(liq.sz || liq.size),
-        side: liq.side || 'unknown',
-        wallet: liq.wallet || liq.user,
-        time: liq.time || Date.now(),
-      });
+    // Handle liquidation messages (various formats BULK might use)
+    if (message.channel === 'liquidation' || message.channel === 'liquidations' ||
+        message.type === 'liquidation' || message.type === 'liquidations') {
+      
+      const liquidations = message.data?.liquidations || message.data || [message];
+      const liqArray = Array.isArray(liquidations) ? liquidations : [liquidations];
+      
+      for (const liq of liqArray) {
+        const symbol = liq.s || liq.coin || liq.symbol || 'UNKNOWN';
+        const price = parseFloat(liq.px || liq.price || 0);
+        const size = parseFloat(liq.sz || liq.size || liq.qty || 0);
+        
+        if (price > 0 && size > 0) {
+          console.log(`🔥 LIQUIDATION message: ${symbol} | $${(price * size).toFixed(2)}`);
+          recordLiquidation({
+            symbol,
+            price,
+            size,
+            side: liq.side || 'unknown',
+            wallet: liq.wallet || liq.user || liq.account || liq.trader,
+            time: liq.time || liq.timestamp || Date.now(),
+          });
+        }
+      }
       return;
     }
 
@@ -400,12 +431,33 @@ function connect(): void {
         // BULK uses 'symbol' not 'coin', and format like 'BTC-USD'
         const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
         
+        // Subscribe to trades
         ws?.send(JSON.stringify({
           method: 'subscribe',
           subscription: symbols.map(symbol => ({ type: 'trades', symbol }))
         }));
         
         console.log('📡 Sent subscription for trades: BTC-USD, ETH-USD, SOL-USD');
+        
+        // Also try subscribing to liquidations (if BULK supports it)
+        ws?.send(JSON.stringify({
+          method: 'subscribe',
+          subscription: symbols.map(symbol => ({ type: 'liquidations', symbol }))
+        }));
+        
+        console.log('📡 Sent subscription for liquidations: BTC-USD, ETH-USD, SOL-USD');
+        
+        // Alternative liquidation subscription formats BULK might use
+        ws?.send(JSON.stringify({
+          method: 'subscribe',
+          subscription: [{ type: 'liquidations' }]
+        }));
+        
+        ws?.send(JSON.stringify({
+          method: 'subscribe',
+          subscription: [{ type: 'liquidation' }]
+        }));
+        
       } catch (e) {
         console.error('Failed to subscribe:', e);
       }
