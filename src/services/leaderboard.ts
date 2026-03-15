@@ -11,6 +11,11 @@ export interface LeaderboardEntry {
 
 export type TimeFrame = '24h' | '7d' | '30d' | 'all';
 
+// Wallets to exclude from leaderboards (e.g., Market Makers)
+const EXCLUDED_WALLETS = [
+  '7DHvrCZMMLZ2ovNfKaGpvJZXAQyydbTz6dM7w7qXtzX5', // BULK MM
+];
+
 class LeaderboardService {
   // Get timeframe filter for SQL
   private getTimeFilter(timeframe: TimeFrame): string {
@@ -27,16 +32,24 @@ class LeaderboardService {
     }
   }
 
+  // Get excluded wallets filter
+  private getExcludedFilter(column: string = 'wallet_address'): string {
+    if (EXCLUDED_WALLETS.length === 0) return '';
+    const placeholders = EXCLUDED_WALLETS.map(w => `'${w}'`).join(', ');
+    return `AND ${column} NOT IN (${placeholders})`;
+  }
+
   // Top Traders by PnL
   async getTopTradersByPnL(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
     const timeFilter = this.getTimeFilter(timeframe);
+    const excludeFilter = this.getExcludedFilter();
     
     // If timeframe is 'all', use aggregated data from traders table
     if (timeframe === 'all') {
       const rows = await query<{ wallet_address: string; value: number; trades: number }>(
         `SELECT wallet_address, total_pnl as value, total_trades as trades
          FROM traders
-         WHERE total_pnl != 0
+         WHERE total_pnl != 0 ${excludeFilter}
          ORDER BY total_pnl DESC
          LIMIT $1`,
         [limit]
@@ -56,7 +69,7 @@ class LeaderboardService {
         wallet_address,
         pnl + unrealized_pnl as pnl
        FROM trader_snapshots
-       WHERE 1=1 ${timeFilter}
+       WHERE 1=1 ${timeFilter} ${excludeFilter}
        ORDER BY wallet_address, timestamp DESC`,
       []
     );
@@ -76,12 +89,13 @@ class LeaderboardService {
   // Most Liquidated (Hall of Shame)
   async getMostLiquidated(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
     const timeFilter = this.getTimeFilter(timeframe);
+    const excludeFilter = this.getExcludedFilter();
     
     if (timeframe === 'all') {
       const rows = await query<{ wallet_address: string; value: number; trades: number }>(
         `SELECT wallet_address, liquidation_value as value, total_liquidations as trades
          FROM traders
-         WHERE liquidation_value > 0
+         WHERE liquidation_value > 0 ${excludeFilter}
          ORDER BY liquidation_value DESC
          LIMIT $1`,
         [limit]
@@ -101,7 +115,7 @@ class LeaderboardService {
         SUM(value) as total_value,
         COUNT(*) as liq_count
        FROM liquidations
-       WHERE wallet_address IS NOT NULL ${timeFilter}
+       WHERE wallet_address IS NOT NULL ${timeFilter} ${excludeFilter}
        GROUP BY wallet_address
        ORDER BY total_value DESC
        LIMIT $1`,
@@ -118,6 +132,8 @@ class LeaderboardService {
 
   // Biggest Positions (Whale Watch)
   async getBiggestPositions(limit: number = 50): Promise<LeaderboardEntry[]> {
+    const excludeFilter = this.getExcludedFilter();
+    
     // Get latest snapshot for each wallet with notional > 0
     const rows = await query<{ wallet_address: string; value: number; positions: number }>(
       `SELECT DISTINCT ON (wallet_address)
@@ -125,7 +141,7 @@ class LeaderboardService {
         total_notional as value,
         positions_count as positions
        FROM trader_snapshots
-       WHERE total_notional > 0
+       WHERE total_notional > 0 ${excludeFilter}
        ORDER BY wallet_address, timestamp DESC`,
       []
     );
@@ -146,6 +162,7 @@ class LeaderboardService {
   // Most Active Traders
   async getMostActive(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
     const timeFilter = timeframe === 'all' ? '' : this.getTimeFilter(timeframe);
+    const excludeFilter = this.getExcludedFilter();
     
     const rows = await query<{ wallet_address: string; trade_count: number; total_value: number }>(
       `SELECT 
@@ -153,7 +170,7 @@ class LeaderboardService {
         COUNT(*) as trade_count,
         SUM(value) as total_value
        FROM trades
-       WHERE 1=1 ${timeFilter}
+       WHERE 1=1 ${timeFilter} ${excludeFilter}
        GROUP BY wallet_address
        ORDER BY trade_count DESC
        LIMIT $1`,
@@ -171,12 +188,13 @@ class LeaderboardService {
   // Top Volume Traders
   async getTopVolume(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
     const timeFilter = this.getTimeFilter(timeframe);
+    const excludeFilter = this.getExcludedFilter();
     
     if (timeframe === 'all') {
       const rows = await query<{ wallet_address: string; total_volume: number; total_trades: number }>(
         `SELECT wallet_address, total_volume as value, total_trades as trades
          FROM traders
-         WHERE total_volume > 0
+         WHERE total_volume > 0 ${excludeFilter}
          ORDER BY total_volume DESC
          LIMIT $1`,
         [limit]
@@ -196,7 +214,7 @@ class LeaderboardService {
         SUM(value) as total_volume,
         COUNT(*) as trade_count
        FROM trades
-       WHERE wallet_address IS NOT NULL ${timeFilter}
+       WHERE wallet_address IS NOT NULL ${timeFilter} ${excludeFilter}
        GROUP BY wallet_address
        ORDER BY total_volume DESC
        LIMIT $1`,
