@@ -31,8 +31,8 @@ async function recordTrade(trade: {
 }): Promise<void> {
   const value = trade.price * Math.abs(trade.size);
   
-  // Only record significant trades (> $100)
-  if (value < 100) return;
+  // Record all trades (minimum $1 to filter dust)
+  if (value < 1) return;
 
   const walletAddress = trade.taker || trade.maker || null;
   
@@ -40,8 +40,7 @@ async function recordTrade(trade: {
     // Insert trade
     await query(
       `INSERT INTO trades (wallet_address, symbol, side, size, price, value, timestamp)
-       VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0))
-       ON CONFLICT DO NOTHING`,
+       VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0))`,
       [walletAddress, trade.symbol, trade.side, Math.abs(trade.size), trade.price, value, trade.time]
     );
 
@@ -137,7 +136,11 @@ function processMessage(data: WebSocket.Data): void {
         const maker = trade.maker || null;
         const taker = trade.taker || null;
         
-        console.log(`🔍 Trade: ${side} ${symbol} | price=${price} size=${size} | maker=${maker?.slice(0,8)} taker=${taker?.slice(0,8)}`);
+        // Use taker as the primary wallet (they initiated the trade)
+        // Only record once per trade to avoid duplicates
+        const walletAddress = taker || maker || null;
+        
+        console.log(`🔍 Trade: ${side} ${symbol} | price=${price} size=${size} | wallet=${walletAddress?.slice(0,8)}`);
         
         recordTrade({
           symbol,
@@ -145,7 +148,7 @@ function processMessage(data: WebSocket.Data): void {
           size,
           side,
           maker,
-          taker,
+          taker: walletAddress,  // Use single wallet
           time,
         });
       }
