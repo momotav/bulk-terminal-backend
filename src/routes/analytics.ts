@@ -132,12 +132,12 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
       ORDER BY timestamp ASC
     `;
     
-    const result = await query(queryStr);
+    const rows = await query(queryStr);
     
     // Transform to chart format grouped by date with all symbols
     const dataMap = new Map<string, { timestamp: string; BTC: number; ETH: number; SOL: number; total: number }>();
     
-    for (const row of result.rows) {
+    for (const row of rows) {
       const dateKey = new Date(row.timestamp).toISOString();
       if (!dataMap.has(dateKey)) {
         dataMap.set(dateKey, { timestamp: dateKey, BTC: 0, ETH: 0, SOL: 0, total: 0 });
@@ -186,11 +186,11 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
       ORDER BY timestamp ASC
     `;
     
-    const result = await query(queryStr);
+    const rows = await query(queryStr);
     
     const dataMap = new Map<string, { timestamp: string; BTC: number; ETH: number; SOL: number; total: number }>();
     
-    for (const row of result.rows) {
+    for (const row of rows) {
       const dateKey = new Date(row.timestamp).toISOString();
       if (!dataMap.has(dateKey)) {
         dataMap.set(dateKey, { timestamp: dateKey, BTC: 0, ETH: 0, SOL: 0, total: 0 });
@@ -239,11 +239,11 @@ router.get('/adl-chart', async (req: Request, res: Response) => {
       ORDER BY timestamp ASC
     `;
     
-    const result = await query(queryStr);
+    const rows = await query(queryStr);
     
     const dataMap = new Map<string, { timestamp: string; BTC: number; ETH: number; SOL: number; total: number }>();
     
-    for (const row of result.rows) {
+    for (const row of rows) {
       const dateKey = new Date(row.timestamp).toISOString();
       if (!dataMap.has(dateKey)) {
         dataMap.set(dateKey, { timestamp: dateKey, BTC: 0, ETH: 0, SOL: 0, total: 0 });
@@ -272,7 +272,7 @@ router.get('/volume-chart', async (req: Request, res: Response) => {
   try {
     const hours = Math.min(parseInt(req.query.hours as string) || 720, 8760);
     
-    const result = await query(`
+    const rows = await query(`
       SELECT 
         date_trunc('day', timestamp) as timestamp,
         symbol,
@@ -285,7 +285,7 @@ router.get('/volume-chart', async (req: Request, res: Response) => {
     
     const dataMap = new Map<string, { timestamp: string; BTC: number; ETH: number; SOL: number; total: number }>();
     
-    for (const row of result.rows) {
+    for (const row of rows) {
       const dateKey = new Date(row.timestamp).toISOString();
       if (!dataMap.has(dateKey)) {
         dataMap.set(dateKey, { timestamp: dateKey, BTC: 0, ETH: 0, SOL: 0, total: 0 });
@@ -312,27 +312,25 @@ router.get('/volume-chart', async (req: Request, res: Response) => {
 // GET /analytics/stats - Overall stats from database
 router.get('/stats', async (req: Request, res: Response) => {
   try {
-    const [tradesResult, liqResult, adlResult, tradersResult] = await Promise.all([
-      query(`SELECT COUNT(*) as count, SUM(value) as volume FROM trades`),
-      query(`SELECT COUNT(*) as count, SUM(value) as volume FROM liquidations`),
-      query(`SELECT COUNT(*) as count, SUM(value) as volume FROM adl_events`),
-      query(`SELECT COUNT(DISTINCT wallet_address) as count FROM traders`),
-    ]);
+    const tradesRows = await query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM trades`);
+    const liqRows = await query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM liquidations`);
+    const adlRows = await query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM adl_events`);
+    const tradersRows = await query(`SELECT COUNT(DISTINCT wallet_address) as count FROM traders`);
     
     res.json({
       trades: {
-        count: parseInt(tradesResult.rows[0]?.count || '0'),
-        volume: parseFloat(tradesResult.rows[0]?.volume || '0'),
+        count: parseInt(tradesRows[0]?.count || '0'),
+        volume: parseFloat(tradesRows[0]?.volume || '0'),
       },
       liquidations: {
-        count: parseInt(liqResult.rows[0]?.count || '0'),
-        volume: parseFloat(liqResult.rows[0]?.volume || '0'),
+        count: parseInt(liqRows[0]?.count || '0'),
+        volume: parseFloat(liqRows[0]?.volume || '0'),
       },
       adl: {
-        count: parseInt(adlResult.rows[0]?.count || '0'),
-        volume: parseFloat(adlResult.rows[0]?.volume || '0'),
+        count: parseInt(adlRows[0]?.count || '0'),
+        volume: parseFloat(adlRows[0]?.volume || '0'),
       },
-      uniqueTraders: parseInt(tradersResult.rows[0]?.count || '0'),
+      uniqueTraders: parseInt(tradersRows[0]?.count || '0'),
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch stats' });
