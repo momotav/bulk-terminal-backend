@@ -80,32 +80,11 @@ class BulkApiService {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'fullAccount', user: walletAddress }),
       });
-      
-      if (!res.ok) {
-        console.log(`❌ BULK API returned ${res.status} for ${walletAddress.slice(0,8)}`);
-        return null;
+      if (!res.ok) return null;
+      const data = await res.json() as AccountResponse[];
+      if (data && data[0] && data[0].fullAccount) {
+        return data[0].fullAccount;
       }
-      
-      const data = await res.json();
-      console.log(`📦 RAW BULK API response for ${walletAddress.slice(0,8)}:`, JSON.stringify(data).slice(0, 500));
-      
-      // Handle array response
-      if (Array.isArray(data) && data[0]) {
-        if (data[0].fullAccount) {
-          return data[0].fullAccount;
-        }
-        // Maybe the account data is directly in data[0]?
-        if (data[0].margin || data[0].positions) {
-          return data[0] as FullAccount;
-        }
-      }
-      
-      // Maybe data is directly the account?
-      if (data && (data.margin || data.positions)) {
-        return data as FullAccount;
-      }
-      
-      console.log(`⚠️ Could not find fullAccount in response for ${walletAddress.slice(0,8)}`);
       return null;
     } catch (error) {
       console.error(`Failed to fetch account for ${walletAddress}:`, error);
