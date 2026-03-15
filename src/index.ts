@@ -44,11 +44,57 @@ app.get('/health', (req, res) => {
 // Debug endpoint to check actual database values
 app.get('/debug/db', async (req, res) => {
   try {
-    const traders = await query('SELECT wallet_address, total_pnl, total_volume, total_trades FROM traders ORDER BY last_seen DESC LIMIT 10');
+    const traders = await query('SELECT wallet_address, total_pnl, total_volume, total_trades, total_liquidations, liquidation_value FROM traders ORDER BY last_seen DESC LIMIT 10');
     const snapshots = await query('SELECT wallet_address, pnl, unrealized_pnl, total_notional, positions_count, timestamp FROM trader_snapshots ORDER BY timestamp DESC LIMIT 10');
     const marketStats = await query('SELECT symbol, price, open_interest, volume_24h, funding_rate, timestamp FROM market_stats ORDER BY timestamp DESC LIMIT 20');
     const marketStatsCount = await query('SELECT COUNT(*) as count FROM market_stats');
-    res.json({ traders, snapshots, marketStats, marketStatsCount });
+    const liquidations = await query('SELECT * FROM liquidations ORDER BY timestamp DESC LIMIT 10');
+    const liquidationsCount = await query('SELECT COUNT(*) as count FROM liquidations');
+    const trades = await query('SELECT * FROM trades ORDER BY timestamp DESC LIMIT 10');
+    const tradesCount = await query('SELECT COUNT(*) as count FROM trades');
+    res.json({ traders, snapshots, marketStats, marketStatsCount, liquidations, liquidationsCount, trades, tradesCount });
+  } catch (error) {
+    res.status(500).json({ error: String(error) });
+  }
+});
+
+// Debug endpoint to check WebSocket status
+app.get('/debug/ws', async (req, res) => {
+  const wsStats = getWebSocketStats();
+  res.json(wsStats);
+});
+
+// Debug endpoint to insert a test liquidation (for testing UI)
+app.get('/debug/test-liquidation', async (req, res) => {
+  try {
+    const testWallet = 'TEST_WALLET_' + Math.random().toString(36).substring(7);
+    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    const symbol = symbols[Math.floor(Math.random() * symbols.length)];
+    const side = Math.random() > 0.5 ? 'long' : 'short';
+    const price = symbol === 'BTC-USD' ? 71000 + Math.random() * 1000 : symbol === 'ETH-USD' ? 2100 + Math.random() * 50 : 88 + Math.random() * 2;
+    const size = Math.random() * 10;
+    const value = price * size;
+    
+    await query(
+      `INSERT INTO liquidations (wallet_address, symbol, side, size, price, value, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [testWallet, symbol, side, size, price, value]
+    );
+    
+    await query(
+      `INSERT INTO traders (wallet_address, total_liquidations, liquidation_value, last_seen)
+       VALUES ($1, 1, $2, NOW())
+       ON CONFLICT (wallet_address) DO UPDATE SET
+         total_liquidations = traders.total_liquidations + 1,
+         liquidation_value = traders.liquidation_value + $2,
+         last_seen = NOW()`,
+      [testWallet, value]
+    );
+    
+    res.json({ 
+      message: 'Test liquidation inserted',
+      liquidation: { wallet: testWallet, symbol, side, size, price, value }
+    });
   } catch (error) {
     res.status(500).json({ error: String(error) });
   }
