@@ -166,4 +166,80 @@ router.delete('/watchlist/:address', requireAuth, async (req: Request, res: Resp
   }
 });
 
+// ============ NOTIFICATIONS ============
+
+// GET /wallet/notifications - Get user's notifications
+router.get('/user/notifications', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+    const unreadOnly = req.query.unread === 'true';
+    
+    let sql = `
+      SELECT n.*, w.nickname
+      FROM notifications n
+      LEFT JOIN watchlist w ON n.wallet_address = w.wallet_address AND w.user_id = n.user_id
+      WHERE n.user_id = $1
+    `;
+    
+    if (unreadOnly) {
+      sql += ' AND n.read = false';
+    }
+    
+    sql += ' ORDER BY n.created_at DESC LIMIT $2';
+    
+    const notifications = await query(sql, [req.userId, limit]);
+    
+    // Get unread count
+    const [countResult] = await query<{ count: string }>(
+      'SELECT COUNT(*) as count FROM notifications WHERE user_id = $1 AND read = false',
+      [req.userId]
+    );
+    
+    res.json({ 
+      data: notifications,
+      unread_count: parseInt(countResult?.count || '0')
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to fetch notifications' });
+  }
+});
+
+// POST /wallet/notifications/read - Mark notifications as read
+router.post('/user/notifications/read', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { ids } = req.body; // Array of notification IDs, or empty for all
+    
+    if (ids && Array.isArray(ids) && ids.length > 0) {
+      await query(
+        'UPDATE notifications SET read = true WHERE user_id = $1 AND id = ANY($2)',
+        [req.userId, ids]
+      );
+    } else {
+      // Mark all as read
+      await query(
+        'UPDATE notifications SET read = true WHERE user_id = $1 AND read = false',
+        [req.userId]
+      );
+    }
+    
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to mark notifications as read' });
+  }
+});
+
+// DELETE /wallet/notifications - Clear all notifications
+router.delete('/user/notifications', requireAuth, async (req: Request, res: Response) => {
+  try {
+    await query(
+      'DELETE FROM notifications WHERE user_id = $1',
+      [req.userId]
+    );
+    
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to clear notifications' });
+  }
+});
+
 export default router;
