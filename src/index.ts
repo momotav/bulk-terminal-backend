@@ -64,6 +64,17 @@ app.get('/debug/ws', async (req, res) => {
   res.json(wsStats);
 });
 
+// Debug endpoint to clear test liquidations
+app.get('/debug/clear-test-liquidations', async (req, res) => {
+  try {
+    await query(`DELETE FROM liquidations WHERE wallet_address LIKE 'TEST_WALLET_%'`);
+    await query(`DELETE FROM traders WHERE wallet_address LIKE 'TEST_WALLET_%'`);
+    res.json({ message: 'Test liquidations cleared' });
+  } catch (error) {
+    res.status(500).json({ error: String(error) });
+  }
+});
+
 // Debug endpoint to insert a test liquidation (for testing UI)
 app.get('/debug/test-liquidation', async (req, res) => {
   try {
