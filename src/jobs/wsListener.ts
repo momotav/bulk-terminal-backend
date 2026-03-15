@@ -191,8 +191,23 @@ function processMessage(data: WebSocket.Data): void {
   try {
     const message = JSON.parse(data.toString());
     
-    // Log messages for debugging
-    if (stats.tradesReceived < 5) {
+    // FILTER 1: Ignore order book data (arrays of resting orders)
+    // These have "status": "resting" and "filledSize": 0
+    if (Array.isArray(message)) {
+      // Check if this looks like order book data
+      if (message.length > 0 && message[0]?.status === 'resting') {
+        // Silently ignore order book snapshots - these are not trades
+        return;
+      }
+    }
+    
+    // FILTER 2: Ignore single order objects with status "resting"
+    if (message.status === 'resting' || message.filledSize === 0) {
+      return;
+    }
+    
+    // Log non-trade messages for debugging (limit to first 10)
+    if (stats.tradesReceived < 10) {
       console.log(`📨 Raw message:`, JSON.stringify(message).slice(0, 500));
     }
 
@@ -201,6 +216,11 @@ function processMessage(data: WebSocket.Data): void {
       const trades = message.data.trades;
       
       for (const trade of trades) {
+        // Skip if this is a resting order, not a fill
+        if (trade.status === 'resting' || trade.filledSize === 0) {
+          continue;
+        }
+        
         // Extract data from BULK format
         const symbol = trade.s || 'UNKNOWN';  // "ETH-USD"
         const price = parseFloat(trade.px);    // 2087.25
