@@ -271,12 +271,15 @@ function connect(): void {
       
       try {
         // Subscribe to all trades at once
+        // BULK uses 'symbol' not 'coin', and format like 'BTC-USD'
+        const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+        
         ws?.send(JSON.stringify({
           method: 'subscribe',
-          subscription: symbols.map(coin => ({ type: 'trades', coin }))
+          subscription: symbols.map(symbol => ({ type: 'trades', symbol }))
         }));
         
-        console.log('📡 Sent subscription for trades: BTC, ETH, SOL');
+        console.log('📡 Sent subscription for trades: BTC-USD, ETH-USD, SOL-USD');
       } catch (e) {
         console.error('Failed to subscribe:', e);
       }
