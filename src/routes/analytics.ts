@@ -42,6 +42,19 @@ router.get('/volume/:symbol', async (req: Request, res: Response) => {
   }
 });
 
+// GET /analytics/price/:symbol
+router.get('/price/:symbol', async (req: Request, res: Response) => {
+  try {
+    const { symbol } = req.params;
+    const hours = Math.min(parseInt(req.query.hours as string) || 168, 720);
+    
+    const data = await analyticsService.getPriceHistory(symbol, hours);
+    res.json({ symbol, hours, data });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to fetch data' });
+  }
+});
+
 // GET /analytics/long-short-ratio/:symbol
 router.get('/long-short-ratio/:symbol', async (req: Request, res: Response) => {
   try {
