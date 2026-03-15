@@ -118,16 +118,45 @@ function processMessage(data: WebSocket.Data): void {
   try {
     const message = JSON.parse(data.toString());
     
-    // Log first few messages to understand the format
-    if (stats.tradesReceived < 3) {
-      console.log(`📨 Message received:`, JSON.stringify(message).slice(0, 200));
+    // Log messages for debugging
+    if (stats.tradesReceived < 5) {
+      console.log(`📨 Raw message:`, JSON.stringify(message).slice(0, 500));
     }
 
-    // Handle Hyperliquid-style format
+    // Handle BULK format: { type: 'trades', data: { trades: [...] } }
+    if (message.type === 'trades' && message.data?.trades) {
+      const trades = message.data.trades;
+      
+      for (const trade of trades) {
+        // Extract data from BULK format
+        const symbol = trade.s || 'UNKNOWN';  // "ETH-USD"
+        const price = parseFloat(trade.px);    // 2087.25
+        const size = parseFloat(trade.sz);     // 0.024
+        const time = trade.time || Date.now();
+        const side = trade.side === true ? 'buy' : 'sell';
+        const maker = trade.maker || null;
+        const taker = trade.taker || null;
+        
+        console.log(`🔍 Trade: ${side} ${symbol} | price=${price} size=${size} | maker=${maker?.slice(0,8)} taker=${taker?.slice(0,8)}`);
+        
+        recordTrade({
+          symbol,
+          price,
+          size,
+          side,
+          maker,
+          taker,
+          time,
+        });
+      }
+      return;
+    }
+
+    // Handle Hyperliquid-style format (channel instead of type)
     if (message.channel === 'trades' && message.data) {
       const trades = Array.isArray(message.data) ? message.data : [message.data];
+      
       for (const trade of trades) {
-        // Check for liquidation
         if (trade.liquidation || trade.isLiquidation) {
           recordLiquidation({
             symbol: trade.coin || trade.symbol || 'UNKNOWN',
