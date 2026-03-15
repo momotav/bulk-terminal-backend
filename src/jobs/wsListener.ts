@@ -127,6 +127,14 @@ async function recordTrade(trade: {
         [walletAddress, value]
       );
       
+      // Create notifications for users following this wallet
+      await query(
+        `INSERT INTO notifications (user_id, wallet_address, type, symbol, side, size, price, value)
+         SELECT user_id, $1, 'trade', $2, $3, $4, $5, $6
+         FROM watchlist WHERE wallet_address = $1`,
+        [walletAddress, trade.symbol, trade.side, Math.abs(trade.size), trade.price, value]
+      );
+      
       // Fetch full wallet PnL from BULK API (async, don't wait)
       fetchAndStoreWalletData(walletAddress).catch(() => {});
     }
@@ -171,6 +179,14 @@ async function recordLiquidation(liq: {
            liquidation_value = traders.liquidation_value + $2,
            last_seen = NOW()`,
         [walletAddress, value]
+      );
+      
+      // Create notifications for users following this wallet
+      await query(
+        `INSERT INTO notifications (user_id, wallet_address, type, symbol, side, size, price, value)
+         SELECT user_id, $1, 'liquidation', $2, $3, $4, $5, $6
+         FROM watchlist WHERE wallet_address = $1`,
+        [walletAddress, liq.symbol, liq.side, Math.abs(liq.size), liq.price, value]
       );
       
       // Auto-track liquidated wallets
