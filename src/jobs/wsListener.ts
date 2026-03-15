@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import { query } from '../db';
-import { addWalletToTrack } from './dataCollector';
+import { bulkApi } from '../services/bulkApi';
 
 const WS_URL = process.env.BULK_WS_URL || 'wss://exchange-wss1.northstarlabs.xyz';
 
@@ -11,6 +11,10 @@ let isConnected = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
 
+// Cache to avoid fetching same wallet too often (wallet -> last fetch time)
+const walletFetchCache: Map<string, number> = new Map();
+const FETCH_COOLDOWN = 60000; // Only fetch wallet data once per minute
+
 // Stats for logging
 const stats = {
   tradesReceived: 0,
@@ -18,6 +22,57 @@ const stats = {
   lastTradeTime: null as Date | null,
   lastLiquidationTime: null as Date | null,
 };
+
+// Fetch wallet PnL from BULK API and store it
+async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
+  // Check cache to avoid spamming API
+  const lastFetch = walletFetchCache.get(walletAddress) || 0;
+  if (Date.now() - lastFetch < FETCH_COOLDOWN) {
+    return; // Skip, fetched recently
+  }
+  
+  walletFetchCache.set(walletAddress, Date.now());
+  
+  try {
+    const account = await bulkApi.getFullAccount(walletAddress);
+    if (!account) return;
+    
+    const totalNotional = account.positions.reduce(
+      (sum, p) => sum + Math.abs(p.notional || 0), 0
+    );
+    
+    const realizedPnl = account.margin.realizedPnl || 0;
+    const unrealizedPnl = account.margin.unrealizedPnl || 0;
+    const totalPnl = realizedPnl + unrealizedPnl;
+    
+    // Upsert trader with PnL data
+    await query(
+      `INSERT INTO traders (wallet_address, total_pnl, last_seen)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (wallet_address) DO UPDATE SET
+         total_pnl = $2,
+         last_seen = NOW()`,
+      [walletAddress, totalPnl]
+    );
+    
+    // Store snapshot for history
+    await query(
+      `INSERT INTO trader_snapshots 
+       (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [walletAddress, realizedPnl, unrealizedPnl, account.positions.length, totalNotional]
+    );
+    
+    console.log(`💰 Fetched PnL for ${walletAddress.slice(0, 8)}...: $${totalPnl.toFixed(2)} | Positions: ${account.positions.length}`);
+  } catch (error) {
+    // Silently fail - wallet might not exist on BULK
+  }
+}
+
+// Export for use in dataCollector
+export function addWalletToTrack(wallet: string): Promise<void> {
+  return fetchAndStoreWalletData(wallet);
+}
 
 // Record a trade to database
 async function recordTrade(trade: {
@@ -55,6 +110,9 @@ async function recordTrade(trade: {
            last_seen = NOW()`,
         [walletAddress, value]
       );
+      
+      // Fetch full wallet PnL from BULK API (async, don't wait)
+      fetchAndStoreWalletData(walletAddress).catch(() => {});
     }
 
     stats.tradesReceived++;
