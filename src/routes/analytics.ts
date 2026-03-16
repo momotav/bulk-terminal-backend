@@ -89,7 +89,7 @@ router.get('/funding-rate/:symbol', async (req: Request, res: Response) => {
       });
     }
     
-    res.json(data);
+    res.json({ data });
   } catch (error) {
     console.error('Error fetching funding rate:', error);
     res.status(500).json({ error: 'Failed to fetch funding rate' });
@@ -126,7 +126,7 @@ router.get('/open-interest/:symbol', async (req: Request, res: Response) => {
       });
     }
     
-    res.json(data);
+    res.json({ data });
   } catch (error) {
     console.error('Error fetching open interest:', error);
     res.status(500).json({ error: 'Failed to fetch open interest' });
