@@ -52,8 +52,23 @@ export async function initializeDatabase(): Promise<void> {
         total_trades INTEGER DEFAULT 0,
         total_pnl DECIMAL(20, 2) DEFAULT 0,
         total_liquidations INTEGER DEFAULT 0,
-        liquidation_value DECIMAL(20, 2) DEFAULT 0
+        liquidation_value DECIMAL(20, 2) DEFAULT 0,
+        total_adl INTEGER DEFAULT 0,
+        adl_value DECIMAL(20, 2) DEFAULT 0
       );
+    `);
+
+    // Add missing columns if they don't exist (for existing databases)
+    await client.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='traders' AND column_name='total_adl') THEN
+          ALTER TABLE traders ADD COLUMN total_adl INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='traders' AND column_name='adl_value') THEN
+          ALTER TABLE traders ADD COLUMN adl_value DECIMAL(20, 2) DEFAULT 0;
+        END IF;
+      END $$;
     `);
 
     // Trader snapshots (for historical tracking)
@@ -94,7 +109,7 @@ export async function initializeDatabase(): Promise<void> {
       ON liquidations(wallet_address);
     `);
 
-    // Big trades table (trades > $10k)
+    // Trades table
     await client.query(`
       CREATE TABLE IF NOT EXISTS trades (
         id SERIAL PRIMARY KEY,
@@ -112,6 +127,36 @@ export async function initializeDatabase(): Promise<void> {
       
       CREATE INDEX IF NOT EXISTS idx_trades_value 
       ON trades(value DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_trades_wallet 
+      ON trades(wallet_address);
+      
+      CREATE INDEX IF NOT EXISTS idx_trades_symbol 
+      ON trades(symbol);
+    `);
+
+    // ADL (Auto-Deleveraging) events table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS adl_events (
+        id SERIAL PRIMARY KEY,
+        wallet_address VARCHAR(64),
+        counterparty VARCHAR(64),
+        symbol VARCHAR(20) NOT NULL,
+        side VARCHAR(10) NOT NULL,
+        size DECIMAL(20, 8) NOT NULL,
+        price DECIMAL(20, 2) NOT NULL,
+        value DECIMAL(20, 2) NOT NULL,
+        timestamp TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_adl_events_time 
+      ON adl_events(timestamp DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_adl_events_wallet 
+      ON adl_events(wallet_address);
+      
+      CREATE INDEX IF NOT EXISTS idx_adl_events_symbol 
+      ON adl_events(symbol);
     `);
 
     // Market stats (for analytics charts)
