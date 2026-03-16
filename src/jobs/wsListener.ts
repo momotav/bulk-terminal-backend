@@ -2,7 +2,7 @@ import WebSocket from 'ws';
 import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
 
-const WS_URL = process.env.BULK_WS_URL || 'wss://exchange-wss1.northstarlabs.xyz';
+const WS_URL = process.env.BULK_WS_URL || 'wss://exchange-ws1.bulk.trade';
 
 let ws: WebSocket | null = null;
 let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
