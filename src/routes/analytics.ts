@@ -3,8 +3,8 @@ import { query } from '../db';
 
 const router = Router();
 
-// BULK API base URL (correct one from BULK dev)
-const BULK_API_BASE = 'https://exchange-api1.northstarlabs.xyz/api/v1';
+// BULK API base URL (new production endpoint)
+const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
 // Type for BULK ticker response
 interface BulkTicker {
