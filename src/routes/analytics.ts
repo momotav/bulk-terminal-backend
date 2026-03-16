@@ -3,8 +3,8 @@ import { query } from '../db';
 
 const router = Router();
 
-// BULK API base URL (correct one from their docs)
-const BULK_API_BASE = 'https://api.bulk.exchange/api/v1';
+// BULK API base URL (correct one from BULK dev)
+const BULK_API_BASE = 'https://exchange-api1.northstarlabs.xyz/api/v1';
 
 // Type for BULK ticker response
 interface BulkTicker {
@@ -23,7 +23,7 @@ interface BulkTicker {
   timestamp: number;
 }
 
-// ============ BULK API PROXIES (CORRECTED) ============
+// ============ BULK API PROXIES ============
 
 // Get ticker data (includes fundingRate and openInterest)
 router.get('/ticker/:symbol', async (req: Request, res: Response) => {
@@ -96,7 +96,7 @@ router.get('/funding-rate/:symbol', async (req: Request, res: Response) => {
   }
 });
 
-// Open interest endpoint - gets from ticker
+// Open interest endpoint - gets from ticker (note: OI is in coins, not USD)
 router.get('/open-interest/:symbol', async (req: Request, res: Response) => {
   const { symbol } = req.params;
   const hours = parseInt(req.query.hours as string) || 24;
@@ -110,9 +110,11 @@ router.get('/open-interest/:symbol', async (req: Request, res: Response) => {
     const ticker = await response.json() as BulkTicker;
     
     // Generate historical data points
+    // Note: OI from API is in coins, multiply by price to get USD value
     const data = [];
     const now = new Date();
-    const currentOI = (ticker.openInterest || 0) * (ticker.markPrice || ticker.lastPrice || 1);
+    const price = ticker.markPrice || ticker.lastPrice || 1;
+    const currentOI = (ticker.openInterest || 0) * price;
     
     const numPoints = Math.min(hours, 168);
     for (let i = numPoints; i >= 0; i--) {
