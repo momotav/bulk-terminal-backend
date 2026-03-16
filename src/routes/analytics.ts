@@ -525,4 +525,166 @@ router.get('/exchange-health', async (req: Request, res: Response) => {
   }
 });
 
+// ============ BULK API KLINES PROXY ============
+
+// Klines proxy endpoint
+router.get('/klines/:symbol', async (req: Request, res: Response) => {
+  const { symbol } = req.params;
+  const interval = (req.query.interval as string) || '1h';
+  const startTime = req.query.startTime as string;
+  const endTime = req.query.endTime as string;
+  
+  try {
+    let url = `${BULK_API_BASE}/klines?symbol=${symbol}&interval=${interval}`;
+    if (startTime) url += `&startTime=${startTime}`;
+    if (endTime) url += `&endTime=${endTime}`;
+    
+    console.log(`📊 Fetching klines: ${url}`);
+    
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`BULK API returned ${response.status}`);
+    }
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    console.error('Error fetching klines:', error);
+    res.status(500).json({ error: 'Failed to fetch klines' });
+  }
+});
+
+// Volume chart from BULK API klines (aggregated by symbol)
+router.get('/volume-chart-api', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 24;
+  
+  try {
+    const now = Date.now();
+    const startTime = now - (hours * 60 * 60 * 1000);
+    
+    // Determine interval based on hours
+    let interval = '1h';
+    if (hours <= 24) interval = '1h';
+    else if (hours <= 168) interval = '4h';
+    else if (hours <= 720) interval = '1d';
+    else interval = '1d';
+    
+    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    const klinesPromises = symbols.map(symbol => 
+      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=${interval}&startTime=${startTime}&endTime=${now}`)
+        .then(r => r.ok ? r.json() : [])
+        .catch(() => [])
+    );
+    
+    const [btcKlines, ethKlines, solKlines] = await Promise.all(klinesPromises);
+    
+    // Create a map of timestamp -> volumes
+    const volumeMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
+    
+    // Process BTC
+    (btcKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!volumeMap.has(ts)) volumeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      volumeMap.get(ts)!.BTC = (k.v || 0) * (k.c || 0); // volume in USD
+    });
+    
+    // Process ETH
+    (ethKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!volumeMap.has(ts)) volumeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      volumeMap.get(ts)!.ETH = (k.v || 0) * (k.c || 0);
+    });
+    
+    // Process SOL
+    (solKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!volumeMap.has(ts)) volumeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      volumeMap.get(ts)!.SOL = (k.v || 0) * (k.c || 0);
+    });
+    
+    // Convert to array and sort
+    const data = Array.from(volumeMap.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([ts, vol]) => ({
+        timestamp: new Date(ts).toISOString(),
+        BTC: vol.BTC,
+        ETH: vol.ETH,
+        SOL: vol.SOL,
+        total: vol.BTC + vol.ETH + vol.SOL,
+      }));
+    
+    console.log(`📊 Volume chart: ${data.length} data points from BULK API klines`);
+    res.json({ data });
+  } catch (error) {
+    console.error('Error fetching volume chart from API:', error);
+    res.status(500).json({ error: 'Failed to fetch volume chart' });
+  }
+});
+
+// Trades count chart from BULK API klines
+router.get('/trades-chart-api', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 24;
+  
+  try {
+    const now = Date.now();
+    const startTime = now - (hours * 60 * 60 * 1000);
+    
+    // Determine interval based on hours
+    let interval = '1h';
+    if (hours <= 24) interval = '1h';
+    else if (hours <= 168) interval = '4h';
+    else if (hours <= 720) interval = '1d';
+    else interval = '1d';
+    
+    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    const klinesPromises = symbols.map(symbol => 
+      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=${interval}&startTime=${startTime}&endTime=${now}`)
+        .then(r => r.ok ? r.json() : [])
+        .catch(() => [])
+    );
+    
+    const [btcKlines, ethKlines, solKlines] = await Promise.all(klinesPromises);
+    
+    // Create a map of timestamp -> trade counts
+    const tradesMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
+    
+    // Process BTC
+    (btcKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!tradesMap.has(ts)) tradesMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      tradesMap.get(ts)!.BTC = k.n || 0; // number of trades
+    });
+    
+    // Process ETH
+    (ethKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!tradesMap.has(ts)) tradesMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      tradesMap.get(ts)!.ETH = k.n || 0;
+    });
+    
+    // Process SOL
+    (solKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!tradesMap.has(ts)) tradesMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      tradesMap.get(ts)!.SOL = k.n || 0;
+    });
+    
+    // Convert to array and sort
+    const data = Array.from(tradesMap.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([ts, trades]) => ({
+        timestamp: new Date(ts).toISOString(),
+        BTC: trades.BTC,
+        ETH: trades.ETH,
+        SOL: trades.SOL,
+        total: trades.BTC + trades.ETH + trades.SOL,
+      }));
+    
+    console.log(`📊 Trades chart: ${data.length} data points from BULK API klines`);
+    res.json({ data });
+  } catch (error) {
+    console.error('Error fetching trades chart from API:', error);
+    res.status(500).json({ error: 'Failed to fetch trades chart' });
+  }
+});
+
 export default router;
