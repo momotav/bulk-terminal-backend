@@ -96,7 +96,7 @@ router.get('/funding-rate/:symbol', async (req: Request, res: Response) => {
   }
 });
 
-// Open interest endpoint - gets from ticker (note: OI is in coins, not USD)
+// Open interest endpoint - gets from ticker (OI is in coins, converted to USD)
 router.get('/open-interest/:symbol', async (req: Request, res: Response) => {
   const { symbol } = req.params;
   const hours = parseInt(req.query.hours as string) || 24;
@@ -109,12 +109,16 @@ router.get('/open-interest/:symbol', async (req: Request, res: Response) => {
     }
     const ticker = await response.json() as BulkTicker;
     
-    // Generate historical data points
-    // Note: OI from API is in coins, multiply by price to get USD value
-    const data = [];
-    const now = new Date();
+    // OI from API is in coins, multiply by mark price to get USD value
     const price = ticker.markPrice || ticker.lastPrice || 1;
     const currentOI = (ticker.openInterest || 0) * price;
+    
+    console.log(`📊 OI for ${symbol}: ${ticker.openInterest} coins × $${price} = $${currentOI.toFixed(2)}`);
+    
+    // For now, return current value with simulated history
+    // TODO: Store OI snapshots in database for real historical data
+    const data = [];
+    const now = new Date();
     
     const numPoints = Math.min(hours, 168);
     for (let i = numPoints; i >= 0; i--) {
@@ -126,7 +130,13 @@ router.get('/open-interest/:symbol', async (req: Request, res: Response) => {
       });
     }
     
-    res.json({ data });
+    res.json({ 
+      data,
+      currentOI,
+      openInterestCoins: ticker.openInterest,
+      markPrice: price,
+      symbol
+    });
   } catch (error) {
     console.error('Error fetching open interest:', error);
     res.status(500).json({ error: 'Failed to fetch open interest' });
