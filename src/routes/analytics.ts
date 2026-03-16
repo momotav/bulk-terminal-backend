@@ -6,6 +6,23 @@ const router = Router();
 // BULK API base URL (correct one from their docs)
 const BULK_API_BASE = 'https://api.bulk.exchange/api/v1';
 
+// Type for BULK ticker response
+interface BulkTicker {
+  symbol: string;
+  priceChange: number;
+  priceChangePercent: number;
+  lastPrice: number;
+  highPrice: number;
+  lowPrice: number;
+  volume: number;
+  quoteVolume: number;
+  markPrice: number;
+  oraclePrice: number;
+  openInterest: number;
+  fundingRate: number;
+  timestamp: number;
+}
+
 // ============ BULK API PROXIES (CORRECTED) ============
 
 // Get ticker data (includes fundingRate and openInterest)
@@ -53,7 +70,7 @@ router.get('/funding-rate/:symbol', async (req: Request, res: Response) => {
     if (!response.ok) {
       throw new Error(`BULK API returned ${response.status}`);
     }
-    const ticker = await response.json();
+    const ticker = await response.json() as BulkTicker;
     
     // Generate historical data points (simulated based on current rate with some variance)
     const data = [];
@@ -90,7 +107,7 @@ router.get('/open-interest/:symbol', async (req: Request, res: Response) => {
     if (!response.ok) {
       throw new Error(`BULK API returned ${response.status}`);
     }
-    const ticker = await response.json();
+    const ticker = await response.json() as BulkTicker;
     
     // Generate historical data points
     const data = [];
