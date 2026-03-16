@@ -1,6 +1,6 @@
 // Service to interact with BULK Exchange API
 
-const BULK_API_URL = process.env.BULK_API_URL || 'https://exchange-api1.northstarlabs.xyz/api/v1';
+const BULK_API_URL = process.env.BULK_API_URL || 'https://exchange-api.bulk.trade/api/v1';
 
 export interface Ticker {
   symbol: string;
