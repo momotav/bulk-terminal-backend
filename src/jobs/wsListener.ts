@@ -3,10 +3,12 @@ import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
 
 const WS_URL = process.env.BULK_WS_URL || 'wss://exchange-ws1.bulk.trade';
+const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
 let ws: WebSocket | null = null;
 let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+let tickerSnapshotInterval: ReturnType<typeof setInterval> | null = null;
 let isConnected = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
@@ -20,10 +22,65 @@ const stats = {
   tradesReceived: 0,
   liquidationsReceived: 0,
   adlReceived: 0,
+  tickerSnapshots: 0,
   lastTradeTime: null as Date | null,
   lastLiquidationTime: null as Date | null,
   lastAdlTime: null as Date | null,
+  lastTickerSnapshot: null as Date | null,
 };
+
+// ============ TICKER SNAPSHOTS FOR REAL OI/FUNDING HISTORY ============
+
+// Fetch and store ticker snapshots (OI, funding rate) every minute
+async function snapshotTickers(): Promise<void> {
+  const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+  
+  for (const symbol of symbols) {
+    try {
+      const res = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
+      if (!res.ok) continue;
+      
+      const ticker = await res.json();
+      
+      const openInterestCoins = parseFloat(ticker.openInterest || 0);
+      const markPrice = parseFloat(ticker.markPrice || ticker.lastPrice || 0);
+      const openInterestUsd = openInterestCoins * markPrice;
+      const fundingRate = parseFloat(ticker.fundingRate || 0);
+      
+      // Store snapshot in database
+      await query(
+        `INSERT INTO ticker_snapshots (symbol, open_interest_coins, open_interest_usd, funding_rate, mark_price, timestamp)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice]
+      );
+      
+      console.log(`📊 Ticker snapshot: ${symbol} | OI: $${openInterestUsd.toFixed(0)} | Funding: ${(fundingRate * 100).toFixed(4)}%`);
+    } catch (error) {
+      console.error(`Failed to snapshot ticker for ${symbol}:`, error);
+    }
+  }
+  
+  stats.tickerSnapshots++;
+  stats.lastTickerSnapshot = new Date();
+}
+
+// Start ticker snapshot collection (every 1 minute)
+function startTickerSnapshots(): void {
+  // Take initial snapshot
+  snapshotTickers();
+  
+  // Then every minute
+  tickerSnapshotInterval = setInterval(snapshotTickers, 60 * 1000);
+  console.log('📊 Started ticker snapshot collection (every 1 minute)');
+}
+
+// Stop ticker snapshot collection
+function stopTickerSnapshots(): void {
+  if (tickerSnapshotInterval) {
+    clearInterval(tickerSnapshotInterval);
+    tickerSnapshotInterval = null;
+  }
+}
 
 // Fetch wallet PnL from BULK API and store it
 async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
@@ -655,6 +712,10 @@ export function getWebSocketStats() {
 // Start WebSocket listener
 export function startWebSocketListener(): void {
   console.log('🚀 Starting WebSocket listener...');
+  
+  // Start ticker snapshot collection immediately
+  startTickerSnapshots();
+  
   setTimeout(() => {
     connect();
   }, 3000);
@@ -663,6 +724,7 @@ export function startWebSocketListener(): void {
 // Stop WebSocket listener
 export function stopWebSocketListener(): void {
   stopHeartbeat();
+  stopTickerSnapshots();
   if (reconnectTimeout) {
     clearTimeout(reconnectTimeout);
     reconnectTimeout = null;
