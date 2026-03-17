@@ -32,6 +32,13 @@ const stats = {
 // ============ TICKER SNAPSHOTS FOR REAL OI/FUNDING HISTORY ============
 
 // Fetch and store ticker snapshots (OI, funding rate) every minute
+interface TickerData {
+  openInterest?: string | number;
+  markPrice?: string | number;
+  lastPrice?: string | number;
+  fundingRate?: string | number;
+}
+
 async function snapshotTickers(): Promise<void> {
   const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
   
@@ -40,12 +47,12 @@ async function snapshotTickers(): Promise<void> {
       const res = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
       if (!res.ok) continue;
       
-      const ticker = await res.json();
+      const ticker: TickerData = await res.json();
       
-      const openInterestCoins = parseFloat(ticker.openInterest || 0);
-      const markPrice = parseFloat(ticker.markPrice || ticker.lastPrice || 0);
+      const openInterestCoins = parseFloat(String(ticker.openInterest || 0));
+      const markPrice = parseFloat(String(ticker.markPrice || ticker.lastPrice || 0));
       const openInterestUsd = openInterestCoins * markPrice;
-      const fundingRate = parseFloat(ticker.fundingRate || 0);
+      const fundingRate = parseFloat(String(ticker.fundingRate || 0));
       
       // Store snapshot in database
       await query(
