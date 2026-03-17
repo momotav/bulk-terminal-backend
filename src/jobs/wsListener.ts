@@ -47,7 +47,7 @@ async function snapshotTickers(): Promise<void> {
       const res = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
       if (!res.ok) continue;
       
-      const ticker: TickerData = await res.json();
+      const ticker = await res.json() as TickerData;
       
       const openInterestCoins = parseFloat(String(ticker.openInterest || 0));
       const markPrice = parseFloat(String(ticker.markPrice || ticker.lastPrice || 0));
