@@ -23,6 +23,167 @@ interface BulkTicker {
   timestamp: number;
 }
 
+// ============ REAL HISTORICAL OI & FUNDING FROM TICKER SNAPSHOTS ============
+
+// Real Open Interest history from ticker_snapshots table
+router.get('/open-interest-history/:symbol', async (req: Request, res: Response) => {
+  const { symbol } = req.params;
+  const hours = parseInt(req.query.hours as string) || 24;
+  
+  try {
+    const result = await query(`
+      SELECT 
+        timestamp,
+        open_interest_usd as value
+      FROM ticker_snapshots
+      WHERE symbol = $1 
+        AND timestamp >= NOW() - INTERVAL '${hours} hours'
+      ORDER BY timestamp ASC
+    `, [symbol]);
+    
+    const data = result.map((row: any) => ({
+      timestamp: row.timestamp,
+      value: parseFloat(row.value || 0)
+    }));
+    
+    res.json({ 
+      symbol,
+      hours,
+      dataPoints: data.length,
+      data 
+    });
+  } catch (error) {
+    console.error('Error fetching OI history:', error);
+    res.status(500).json({ error: 'Failed to fetch OI history' });
+  }
+});
+
+// Real Funding Rate history from ticker_snapshots table
+router.get('/funding-rate-history/:symbol', async (req: Request, res: Response) => {
+  const { symbol } = req.params;
+  const hours = parseInt(req.query.hours as string) || 24;
+  
+  try {
+    const result = await query(`
+      SELECT 
+        timestamp,
+        funding_rate as value
+      FROM ticker_snapshots
+      WHERE symbol = $1 
+        AND timestamp >= NOW() - INTERVAL '${hours} hours'
+      ORDER BY timestamp ASC
+    `, [symbol]);
+    
+    const data = result.map((row: any) => ({
+      timestamp: row.timestamp,
+      value: parseFloat(row.value || 0)
+    }));
+    
+    res.json({ 
+      symbol,
+      hours,
+      dataPoints: data.length,
+      data 
+    });
+  } catch (error) {
+    console.error('Error fetching funding rate history:', error);
+    res.status(500).json({ error: 'Failed to fetch funding rate history' });
+  }
+});
+
+// Combined OI chart data for all symbols
+router.get('/oi-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 24;
+  
+  try {
+    const result = await query(`
+      SELECT 
+        date_trunc('minute', timestamp) as timestamp,
+        symbol,
+        AVG(open_interest_usd) as value
+      FROM ticker_snapshots
+      WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('minute', timestamp), symbol
+      ORDER BY timestamp ASC
+    `);
+    
+    // Group by timestamp
+    const dataMap = new Map<string, { BTC: number; ETH: number; SOL: number }>();
+    
+    for (const row of result) {
+      const ts = new Date(row.timestamp).toISOString();
+      if (!dataMap.has(ts)) {
+        dataMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      }
+      const coin = row.symbol.split('-')[0] as 'BTC' | 'ETH' | 'SOL';
+      if (coin in dataMap.get(ts)!) {
+        dataMap.get(ts)![coin] = parseFloat(row.value || 0);
+      }
+    }
+    
+    const data = Array.from(dataMap.entries()).map(([timestamp, values]) => ({
+      timestamp,
+      ...values,
+      total: values.BTC + values.ETH + values.SOL
+    }));
+    
+    res.json({ 
+      hours,
+      dataPoints: data.length,
+      data 
+    });
+  } catch (error) {
+    console.error('Error fetching OI chart:', error);
+    res.status(500).json({ error: 'Failed to fetch OI chart' });
+  }
+});
+
+// Combined Funding Rate chart data for all symbols
+router.get('/funding-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 24;
+  
+  try {
+    const result = await query(`
+      SELECT 
+        date_trunc('minute', timestamp) as timestamp,
+        symbol,
+        AVG(funding_rate) as value
+      FROM ticker_snapshots
+      WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('minute', timestamp), symbol
+      ORDER BY timestamp ASC
+    `);
+    
+    // Group by timestamp
+    const dataMap = new Map<string, { BTC: number; ETH: number; SOL: number }>();
+    
+    for (const row of result) {
+      const ts = new Date(row.timestamp).toISOString();
+      if (!dataMap.has(ts)) {
+        dataMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      }
+      const coin = row.symbol.split('-')[0] as 'BTC' | 'ETH' | 'SOL';
+      if (coin in dataMap.get(ts)!) {
+        dataMap.get(ts)![coin] = parseFloat(row.value || 0);
+      }
+    }
+    
+    const data = Array.from(dataMap.entries()).map(([timestamp, values]) => ({
+      timestamp,
+      ...values
+    }));
+    
+    res.json({ 
+      hours,
+      dataPoints: data.length,
+      data 
+    });
+  } catch (error) {
+    console.error('Error fetching funding chart:', error);
+    res.status(500).json({ error: 'Failed to fetch funding chart' });
+  }
+});
+
 // ============ BULK API PROXIES ============
 
 // Get ticker data (includes fundingRate and openInterest)
