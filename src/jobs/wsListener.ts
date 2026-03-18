@@ -40,7 +40,8 @@ interface TickerData {
 }
 
 async function snapshotTickers(): Promise<void> {
-  const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+  // All available BULK markets
+  const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
   
   for (const symbol of symbols) {
     try {
@@ -727,61 +728,26 @@ function connect(): void {
       reconnectAttempts = 0;
       console.log('✅ WebSocket connected to BULK Exchange');
 
-      // BULK expects subscription as an array, not object
-      // Format: { "method": "subscribe", "subscription": [{"type": "trades", "coin": "BTC"}] }
-      const symbols = ['BTC', 'ETH', 'SOL'];
+      // BULK API v1.0.12 valid streams:
+      // - trades (includes liquidations/ADL via "reason" field)
+      // - ticker, candle, l2Snapshot, l2Delta, risk, frontendContext
+      // - account.{wallet} (for per-wallet events)
+      
+      // All available BULK markets
+      const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
       
       try {
-        // Subscribe to all trades at once
-        // BULK uses 'symbol' not 'coin', and format like 'BTC-USD'
-        const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
-        
-        // Subscribe to trades
+        // Subscribe to trades for all symbols
+        // Liquidations and ADL come through trades with reason: "liquidation" or "adl"
         ws?.send(JSON.stringify({
           method: 'subscribe',
           subscription: symbols.map(symbol => ({ type: 'trades', symbol }))
         }));
         
-        console.log('📡 Sent subscription for trades: BTC-USD, ETH-USD, SOL-USD');
+        console.log('📡 Subscribed to trades:', symbols.join(', '));
+        console.log('📡 (Liquidations & ADL come via trades with reason field)');
         
-        // Also try subscribing to liquidations (if BULK supports it)
-        ws?.send(JSON.stringify({
-          method: 'subscribe',
-          subscription: symbols.map(symbol => ({ type: 'liquidations', symbol }))
-        }));
-        
-        console.log('📡 Sent subscription for liquidations: BTC-USD, ETH-USD, SOL-USD');
-        
-        // Alternative liquidation subscription formats BULK might use
-        ws?.send(JSON.stringify({
-          method: 'subscribe',
-          subscription: [{ type: 'liquidations' }]
-        }));
-        
-        ws?.send(JSON.stringify({
-          method: 'subscribe',
-          subscription: [{ type: 'liquidation' }]
-        }));
-        
-        // Subscribe to ADL events
-        ws?.send(JSON.stringify({
-          method: 'subscribe',
-          subscription: symbols.map(symbol => ({ type: 'adl', symbol }))
-        }));
-        
-        ws?.send(JSON.stringify({
-          method: 'subscribe',
-          subscription: [{ type: 'adl' }]
-        }));
-        
-        ws?.send(JSON.stringify({
-          method: 'subscribe',
-          subscription: [{ type: 'auto_deleverage' }]
-        }));
-        
-        console.log('📡 Sent subscription for ADL events');
-        
-        // Subscribe to tracked wallets' account channels for liquidation events
+        // Subscribe to tracked wallets' account channels for additional liquidation events
         // Do this after a short delay to ensure connection is stable
         setTimeout(() => {
           subscribeToTrackedWallets();
