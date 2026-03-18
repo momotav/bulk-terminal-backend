@@ -472,18 +472,53 @@ function processMessage(data: WebSocket.Data): void {
     }
 
     // Handle generic trade messages
+    // BULK API v1.0.12: trades now have optional "reason" field: "liquidation" or "adl"
     if (message.type === 'trades' || message.e === 'trade') {
       const trades = message.data?.trades || message.trades || [message];
       for (const trade of trades) {
-        recordTrade({
-          symbol: trade.s || trade.symbol || message.symbol || 'UNKNOWN',
-          price: parseFloat(trade.px || trade.p || trade.price),
-          size: parseFloat(trade.sz || trade.q || trade.size || trade.qty),
-          side: trade.side === true || trade.side === 'B' || trade.side === 'buy' ? 'buy' : 'sell',
-          maker: trade.maker,
-          taker: trade.taker,
-          time: trade.time || trade.T || Date.now(),
-        });
+        const symbol = trade.s || trade.symbol || message.symbol || 'UNKNOWN';
+        const price = parseFloat(trade.px || trade.p || trade.price);
+        const size = parseFloat(trade.sz || trade.q || trade.size || trade.qty);
+        const side = trade.side === true || trade.side === 'B' || trade.side === 'buy' ? 'buy' : 'sell';
+        const reason = trade.reason; // NEW: "liquidation", "adl", or undefined for normal trades
+        const maker = trade.maker;
+        const taker = trade.taker;
+        const time = trade.time || trade.T || Date.now();
+        
+        // Route based on reason field
+        if (reason === 'liquidation' || trade.liq === true) {
+          console.log(`🔥 LIQUIDATION (from trades): ${symbol} | $${(price * size).toFixed(2)}`);
+          recordLiquidation({
+            symbol,
+            price,
+            size,
+            side,
+            wallet: taker || maker,
+            time,
+          });
+        } else if (reason === 'adl') {
+          console.log(`⚡ ADL (from trades): ${symbol} | $${(price * size).toFixed(2)}`);
+          recordADL({
+            symbol,
+            price,
+            size,
+            side,
+            wallet: taker,
+            counterparty: maker,
+            time,
+          });
+        } else {
+          // Normal trade
+          recordTrade({
+            symbol,
+            price,
+            size,
+            side,
+            maker,
+            taker,
+            time,
+          });
+        }
       }
       return;
     }
@@ -564,8 +599,10 @@ function processMessage(data: WebSocket.Data): void {
     }
 
     // Handle subscription confirmations
-    if (message.channel === 'subscriptionResponse') {
-      console.log(`✅ Subscription confirmed:`, JSON.stringify(message.data?.subscription || message));
+    // BULK API v1.0.12: returns { type: "subscriptionResponse", topics: ["ticker.BTC-USD", ...] }
+    if (message.type === 'subscriptionResponse' || message.channel === 'subscriptionResponse') {
+      const topics = message.topics || message.data?.topics || message.data?.subscription;
+      console.log(`✅ Subscription confirmed:`, JSON.stringify(topics || message));
       return;
     }
 
@@ -616,10 +653,24 @@ function processMessage(data: WebSocket.Data): void {
   }
 }
 
-// Start heartbeat - just keep connection alive, no ping needed
+// Track last pong time for connection health
+let lastPongTime: number = Date.now();
+
+// Start heartbeat - respond to server pings (BULK API v1.0.12 requires pong response)
 function startHeartbeat(): void {
-  // BULK API doesn't support ping method, connection stays alive automatically
-  // We'll just monitor for disconnects via the close event
+  // The 'ws' library automatically responds to ping frames with pong
+  // But we'll also track connection health
+  lastPongTime = Date.now();
+  
+  // Monitor connection health every 45 seconds (server pings every 30s, timeout at 10s)
+  heartbeatInterval = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    
+    const timeSinceLastActivity = Date.now() - lastPongTime;
+    if (timeSinceLastActivity > 60000) {
+      console.warn('⚠️ No ping/pong activity for 60s, connection may be stale');
+    }
+  }, 45000);
 }
 
 // Stop heartbeat
@@ -745,6 +796,18 @@ function connect(): void {
 
     ws.on('message', (data: WebSocket.Data) => {
       processMessage(data);
+    });
+
+    // BULK API v1.0.12: Server sends ping every 30s, must respond with pong within 10s
+    // The 'ws' library automatically sends pong in response to ping frames
+    ws.on('ping', () => {
+      lastPongTime = Date.now();
+      // ws library auto-responds with pong, but we can also do it explicitly
+      ws?.pong();
+    });
+
+    ws.on('pong', () => {
+      lastPongTime = Date.now();
     });
 
     ws.on('close', (code, reason) => {
