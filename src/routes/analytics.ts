@@ -648,34 +648,28 @@ router.get('/stats', async (req: Request, res: Response) => {
   }
 });
 
-// Exchange health endpoint
+// Exchange health endpoint - uses BULK API /stats for volume and OI
 router.get('/exchange-health', async (req: Request, res: Response) => {
   try {
-    const [volumeResult, oiResult, tradersResult, liqResult] = await Promise.all([
-      query(`SELECT COALESCE(SUM(value), 0) as volume FROM trades WHERE timestamp >= NOW() - INTERVAL '24 hours'`),
-      query(`
-        SELECT COALESCE(SUM(ABS(net_pos)) / 2, 0) as oi FROM (
-          SELECT wallet_address, SUM(CASE 
-            WHEN side IN ('buy', 'long', 'BUY', 'LONG') THEN size * price
-            WHEN side IN ('sell', 'short', 'SELL', 'SHORT') THEN -size * price
-            ELSE 0
-          END) as net_pos
-          FROM trades WHERE wallet_address IS NOT NULL
-          GROUP BY wallet_address
-          HAVING SUM(CASE 
-            WHEN side IN ('buy', 'long', 'BUY', 'LONG') THEN size * price
-            WHEN side IN ('sell', 'short', 'SELL', 'SHORT') THEN -size * price
-            ELSE 0
-          END) != 0
-        ) positions
-      `),
+    // Fetch from BULK API /stats for official 24h volume and OI
+    const bulkStatsPromise = fetch(`${BULK_API_BASE}/stats?period=1d`)
+      .then(res => res.ok ? res.json() : null)
+      .catch(() => null);
+    
+    // Fetch from our DB for traders and liquidations (BULK doesn't have these endpoints)
+    const [bulkStats, tradersResult, liqResult] = await Promise.all([
+      bulkStatsPromise,
       query(`SELECT COUNT(DISTINCT wallet_address) as count FROM trades WHERE timestamp >= NOW() - INTERVAL '24 hours'`),
       query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM liquidations WHERE timestamp >= NOW() - INTERVAL '24 hours'`)
     ]);
     
+    // Use BULK API data for volume and OI, fallback to 0 if unavailable
+    const volume24h = bulkStats?.volume?.totalUsd || 0;
+    const openInterest = bulkStats?.openInterest?.totalUsd || 0;
+    
     res.json({
-      total_volume_24h: parseFloat(volumeResult[0]?.volume || '0'),
-      total_open_interest: parseFloat(oiResult[0]?.oi || '0'),
+      total_volume_24h: volume24h,
+      total_open_interest: openInterest,
       total_traders: parseInt(tradersResult[0]?.count || '0'),
       total_liquidations_24h: parseInt(liqResult[0]?.count || '0'),
       liquidation_value_24h: parseFloat(liqResult[0]?.volume || '0')
