@@ -203,6 +203,9 @@ async function recordTrade(trade: {
       
       // Fetch full wallet PnL from BULK API (async, don't wait)
       fetchAndStoreWalletData(walletAddress).catch(() => {});
+      
+      // Subscribe to wallet's account channel for liquidation events
+      subscribeToWalletAccount(walletAddress);
     }
 
     stats.tradesReceived++;
@@ -512,6 +515,54 @@ function processMessage(data: WebSocket.Data): void {
       return;
     }
 
+    // Handle BULK account channel messages (liquidations come through here!)
+    // Format: { "type": "account", "data": { "type": "liquidation", ... }, "topic": "account.{wallet}" }
+    if (message.type === 'account' && message.data?.type === 'liquidation') {
+      const liq = message.data;
+      const walletAddress = message.topic?.replace('account.', '') || null;
+      const symbol = liq.symbol || 'UNKNOWN';
+      const price = parseFloat(liq.price || 0);
+      const size = parseFloat(liq.size || 0);
+      const side = liq.isBuy ? 'long' : 'short';
+      
+      if (price > 0 && size > 0) {
+        console.log(`🔥 BULK LIQUIDATION: ${walletAddress?.slice(0,8)}... | ${symbol} | $${(price * size).toFixed(2)}`);
+        recordLiquidation({
+          symbol,
+          price,
+          size,
+          side,
+          wallet: walletAddress,
+          time: liq.timestamp ? Math.floor(liq.timestamp / 1000000) : Date.now(), // BULK uses nanoseconds
+        });
+      }
+      return;
+    }
+
+    // Handle BULK account channel ADL events
+    // Format: { "type": "account", "data": { "type": "ADL", ... }, "topic": "account.{wallet}" }
+    if (message.type === 'account' && (message.data?.type === 'ADL' || message.data?.type === 'adl')) {
+      const adl = message.data;
+      const walletAddress = message.topic?.replace('account.', '') || null;
+      const symbol = adl.symbol || 'UNKNOWN';
+      const price = parseFloat(adl.price || 0);
+      const size = parseFloat(adl.size || 0);
+      const side = adl.isBuy ? 'long' : 'short';
+      
+      if (price > 0 && size > 0) {
+        console.log(`⚡ BULK ADL: ${walletAddress?.slice(0,8)}... | ${symbol} | $${(price * size).toFixed(2)}`);
+        recordADL({
+          symbol,
+          price,
+          size,
+          side,
+          wallet: walletAddress,
+          time: adl.timestamp ? Math.floor(adl.timestamp / 1000000) : Date.now(), // BULK uses nanoseconds
+        });
+      }
+      return;
+    }
+
     // Handle subscription confirmations
     if (message.channel === 'subscriptionResponse') {
       console.log(`✅ Subscription confirmed:`, JSON.stringify(message.data?.subscription || message));
@@ -679,6 +730,12 @@ function connect(): void {
         
         console.log('📡 Sent subscription for ADL events');
         
+        // Subscribe to tracked wallets' account channels for liquidation events
+        // Do this after a short delay to ensure connection is stable
+        setTimeout(() => {
+          subscribeToTrackedWallets();
+        }, 2000);
+        
       } catch (e) {
         console.error('Failed to subscribe:', e);
       }
@@ -714,6 +771,52 @@ export function getWebSocketStats() {
     reconnectAttempts,
     ...stats,
   };
+}
+
+// Set to track which wallets we're subscribed to
+const subscribedWallets = new Set<string>();
+
+// Subscribe to a wallet's account channel to receive liquidation events
+export function subscribeToWalletAccount(walletAddress: string): void {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.log(`⚠️ Cannot subscribe to ${walletAddress.slice(0,8)}... - WebSocket not connected`);
+    return;
+  }
+  
+  if (subscribedWallets.has(walletAddress)) {
+    return; // Already subscribed
+  }
+  
+  try {
+    ws.send(JSON.stringify({
+      method: 'subscribe',
+      subscription: [{ type: 'account', wallet: walletAddress }]
+    }));
+    
+    // Also try topic format
+    ws.send(JSON.stringify({
+      method: 'subscribe',
+      subscription: [{ type: 'account', topic: `account.${walletAddress}` }]
+    }));
+    
+    subscribedWallets.add(walletAddress);
+    console.log(`📡 Subscribed to account channel: ${walletAddress.slice(0,8)}...`);
+  } catch (e) {
+    console.error(`Failed to subscribe to wallet ${walletAddress}:`, e);
+  }
+}
+
+// Subscribe to all tracked wallets on connection
+async function subscribeToTrackedWallets(): Promise<void> {
+  try {
+    const result = await query(`SELECT wallet_address FROM traders ORDER BY last_seen DESC LIMIT 100`);
+    for (const row of result) {
+      subscribeToWalletAccount(row.wallet_address);
+    }
+    console.log(`📡 Subscribed to ${result.length} tracked wallet accounts`);
+  } catch (error) {
+    console.error('Failed to subscribe to tracked wallets:', error);
+  }
 }
 
 // Start WebSocket listener
