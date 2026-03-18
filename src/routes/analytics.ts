@@ -649,16 +649,26 @@ router.get('/stats', async (req: Request, res: Response) => {
 });
 
 // Exchange health endpoint - uses BULK API /stats for volume and OI
+interface BulkStatsResponse {
+  volume?: { totalUsd?: number };
+  openInterest?: { totalUsd?: number };
+}
+
 router.get('/exchange-health', async (req: Request, res: Response) => {
   try {
     // Fetch from BULK API /stats for official 24h volume and OI
-    const bulkStatsPromise = fetch(`${BULK_API_BASE}/stats?period=1d`)
-      .then(res => res.ok ? res.json() : null)
-      .catch(() => null);
+    let bulkStats: BulkStatsResponse | null = null;
+    try {
+      const statsRes = await fetch(`${BULK_API_BASE}/stats?period=1d`);
+      if (statsRes.ok) {
+        bulkStats = await statsRes.json() as BulkStatsResponse;
+      }
+    } catch (e) {
+      console.error('Failed to fetch BULK stats:', e);
+    }
     
     // Fetch from our DB for traders and liquidations (BULK doesn't have these endpoints)
-    const [bulkStats, tradersResult, liqResult] = await Promise.all([
-      bulkStatsPromise,
+    const [tradersResult, liqResult] = await Promise.all([
       query(`SELECT COUNT(DISTINCT wallet_address) as count FROM trades WHERE timestamp >= NOW() - INTERVAL '24 hours'`),
       query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM liquidations WHERE timestamp >= NOW() - INTERVAL '24 hours'`)
     ]);
