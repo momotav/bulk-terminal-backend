@@ -14,6 +14,7 @@ import authRoutes from './routes/auth';
 import leaderboardRoutes from './routes/leaderboard';
 import analyticsRoutes from './routes/analytics';
 import walletRoutes from './routes/wallet';
+import userRoutes from './routes/users';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
