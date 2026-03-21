@@ -4,10 +4,32 @@ import { query } from '../db';
 const router = Router();
 
 const BULK_API = 'https://exchange-api.bulk.trade/api/v1';
-const BULK_WS = 'wss://exchange-ws1.bulk.trade';
+
+// Type definitions for BULK API response
+interface BulkMarket {
+  symbol: string;
+  volume: number;
+  quoteVolume: number | null;
+  openInterest: number;
+  fundingRate: number;
+  fundingRateAnnualized: number;
+  lastPrice: number | null;
+  markPrice: number | null;
+}
+
+interface BulkStatsResponse {
+  timestamp: number;
+  period: string;
+  volume: { totalUsd: number | null };
+  openInterest: { totalUsd: number };
+  funding: {
+    rates: Record<string, { current: number; annualized: number }>;
+  };
+  markets: BulkMarket[];
+}
 
 // Helper to fetch from BULK API
-async function fetchBulkAPI(endpoint: string) {
+async function fetchBulkAPI(endpoint: string): Promise<any> {
   try {
     const response = await fetch(`${BULK_API}${endpoint}`);
     if (!response.ok) {
@@ -24,7 +46,7 @@ async function fetchBulkAPI(endpoint: string) {
 router.get('/exchange-stats', async (req: Request, res: Response) => {
   try {
     // Fetch from new BULK /stats endpoint
-    const stats = await fetchBulkAPI('/stats?period=1d');
+    const stats: BulkStatsResponse | null = await fetchBulkAPI('/stats?period=1d');
     
     if (!stats) {
       return res.status(503).json({ error: 'BULK API unavailable' });
@@ -153,13 +175,13 @@ router.get('/stats', async (req: Request, res: Response) => {
 // GET /api/analytics/markets - Get market data
 router.get('/markets', async (req: Request, res: Response) => {
   try {
-    const stats = await fetchBulkAPI('/stats?period=1d');
+    const stats: BulkStatsResponse | null = await fetchBulkAPI('/stats?period=1d');
     
     if (!stats || !stats.markets) {
       return res.status(503).json({ error: 'BULK API unavailable' });
     }
 
-    const markets = stats.markets.map((m: any) => ({
+    const markets = stats.markets.map((m: BulkMarket) => ({
       symbol: m.symbol,
       lastPrice: m.lastPrice,
       markPrice: m.markPrice,
