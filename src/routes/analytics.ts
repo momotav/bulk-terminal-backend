@@ -64,7 +64,7 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
         const markPrice = market.markPrice || 0;
         
         totalVolume24h += quoteVolume;
-        totalOpenInterest += oi * markPrice; // Convert to USD
+        totalOpenInterest += oi * markPrice;
         
         marketStats.push({
           symbol: market.symbol,
@@ -83,22 +83,41 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       totalOpenInterest = stats.openInterest.totalUsd;
     }
 
-    // Get unique traders count from our database
-    const tradersResult = await query(`
-      SELECT COUNT(DISTINCT wallet_address) as count 
-      FROM tracked_wallets 
-      WHERE last_trade_at > NOW() - INTERVAL '24 hours'
-    `);
-    const activeTraders = parseInt(tradersResult[0]?.count || '0');
+    // Get unique traders count from traders table (last 24h)
+    let activeTraders = 0;
+    try {
+      const tradersResult = await query(`
+        SELECT COUNT(DISTINCT wallet_address) as count 
+        FROM traders 
+        WHERE last_seen > NOW() - INTERVAL '24 hours'
+      `);
+      activeTraders = parseInt(tradersResult[0]?.count || '0');
+    } catch (e) {
+      // Fallback: count from trades table
+      try {
+        const tradersResult = await query(`
+          SELECT COUNT(DISTINCT wallet_address) as count 
+          FROM trades 
+          WHERE timestamp > NOW() - INTERVAL '24 hours'
+        `);
+        activeTraders = parseInt(tradersResult[0]?.count || '0');
+      } catch (e2) {
+        console.error('Failed to get active traders:', e2);
+      }
+    }
 
-    // Get liquidations from our database (last 24h)
-    const liqResult = await query(`
-      SELECT COALESCE(SUM(value), 0) as total
-      FROM trades 
-      WHERE type = 'liquidation' 
-      AND timestamp > NOW() - INTERVAL '24 hours'
-    `);
-    const liquidations24h = parseFloat(liqResult[0]?.total || '0');
+    // Get liquidations from liquidations table (last 24h)
+    let liquidations24h = 0;
+    try {
+      const liqResult = await query(`
+        SELECT COALESCE(SUM(value), 0) as total
+        FROM liquidations 
+        WHERE timestamp > NOW() - INTERVAL '24 hours'
+      `);
+      liquidations24h = parseFloat(liqResult[0]?.total || '0');
+    } catch (e) {
+      console.error('Failed to get liquidations:', e);
+    }
 
     res.json({
       timestamp: stats.timestamp || Date.now(),
@@ -124,7 +143,6 @@ router.get('/stats', async (req: Request, res: Response) => {
         COUNT(*) as count,
         COALESCE(SUM(value), 0) as volume
       FROM trades
-      WHERE type = 'trade'
     `);
 
     // Get liquidation stats
@@ -132,23 +150,13 @@ router.get('/stats', async (req: Request, res: Response) => {
       SELECT 
         COUNT(*) as count,
         COALESCE(SUM(value), 0) as volume
-      FROM trades
-      WHERE type = 'liquidation'
+      FROM liquidations
     `);
 
-    // Get ADL stats
-    const adlStats = await query(`
-      SELECT 
-        COUNT(*) as count,
-        COALESCE(SUM(value), 0) as volume
-      FROM trades
-      WHERE type = 'adl'
-    `);
-
-    // Get unique traders
+    // Get unique traders from traders table
     const uniqueTraders = await query(`
-      SELECT COUNT(DISTINCT wallet_address) as count
-      FROM tracked_wallets
+      SELECT COUNT(*) as count
+      FROM traders
     `);
 
     res.json({
@@ -161,8 +169,8 @@ router.get('/stats', async (req: Request, res: Response) => {
         volume: parseFloat(liqStats[0]?.volume || '0'),
       },
       adl: {
-        count: parseInt(adlStats[0]?.count || '0'),
-        volume: parseFloat(adlStats[0]?.volume || '0'),
+        count: 0,
+        volume: 0,
       },
       uniqueTraders: parseInt(uniqueTraders[0]?.count || '0'),
     });
@@ -198,68 +206,181 @@ router.get('/markets', async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/analytics/leaderboard/:type - Get leaderboard data
-router.get('/leaderboard/:type', async (req: Request, res: Response) => {
+// GET /api/analytics/oi-chart - Open Interest chart data
+router.get('/oi-chart', async (req: Request, res: Response) => {
   try {
-    const { type } = req.params;
-    const { timeframe = '24h', limit = '50' } = req.query;
+    const hours = parseInt(req.query.hours as string) || 24;
     
-    let interval = '24 hours';
-    if (timeframe === '7d') interval = '7 days';
-    else if (timeframe === '30d') interval = '30 days';
-    else if (timeframe === 'all') interval = '10 years';
+    const result = await query(`
+      SELECT 
+        date_trunc('hour', timestamp) as timestamp,
+        SUM(CASE WHEN symbol = 'BTC-USD' THEN open_interest_usd ELSE 0 END) as "BTC",
+        SUM(CASE WHEN symbol = 'ETH-USD' THEN open_interest_usd ELSE 0 END) as "ETH",
+        SUM(CASE WHEN symbol = 'SOL-USD' THEN open_interest_usd ELSE 0 END) as "SOL",
+        SUM(open_interest_usd) as total
+      FROM ticker_snapshots
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('hour', timestamp)
+      ORDER BY timestamp ASC
+    `);
 
-    let queryStr = '';
-    
-    if (type === 'pnl') {
-      queryStr = `
-        SELECT 
-          wallet_address,
-          total_pnl as value,
-          total_volume as volume,
-          total_trades as trades
-        FROM tracked_wallets
-        WHERE last_trade_at > NOW() - INTERVAL '${interval}'
-        ORDER BY total_pnl DESC
-        LIMIT $1
-      `;
-    } else if (type === 'volume' || type === 'whales') {
-      queryStr = `
-        SELECT 
-          wallet_address,
-          total_volume as value,
-          total_pnl as pnl,
-          total_trades as trades
-        FROM tracked_wallets
-        ORDER BY total_volume DESC
-        LIMIT $1
-      `;
-    } else if (type === 'liquidated') {
-      queryStr = `
-        SELECT 
-          wallet_address,
-          total_liquidations as value,
-          total_volume as volume,
-          total_trades as trades
-        FROM tracked_wallets
-        WHERE total_liquidations > 0
-        ORDER BY total_liquidations DESC
-        LIMIT $1
-      `;
-    } else {
-      return res.status(400).json({ error: 'Invalid leaderboard type' });
-    }
-
-    const result = await query(queryStr, [parseInt(limit as string)]);
-    
-    res.json({
-      type,
-      timeframe,
-      data: result,
-    });
+    res.json({ data: result });
   } catch (error) {
-    console.error('Error fetching leaderboard:', error);
-    res.status(500).json({ error: 'Failed to fetch leaderboard' });
+    console.error('Error fetching OI chart:', error);
+    res.status(500).json({ error: 'Failed to fetch OI chart' });
+  }
+});
+
+// GET /api/analytics/funding-chart - Funding rate chart data
+router.get('/funding-chart', async (req: Request, res: Response) => {
+  try {
+    const hours = parseInt(req.query.hours as string) || 24;
+    
+    const result = await query(`
+      SELECT 
+        date_trunc('hour', timestamp) as timestamp,
+        AVG(CASE WHEN symbol = 'BTC-USD' THEN funding_rate ELSE NULL END) as "BTC",
+        AVG(CASE WHEN symbol = 'ETH-USD' THEN funding_rate ELSE NULL END) as "ETH",
+        AVG(CASE WHEN symbol = 'SOL-USD' THEN funding_rate ELSE NULL END) as "SOL"
+      FROM ticker_snapshots
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('hour', timestamp)
+      ORDER BY timestamp ASC
+    `);
+
+    res.json({ data: result });
+  } catch (error) {
+    console.error('Error fetching funding chart:', error);
+    res.status(500).json({ error: 'Failed to fetch funding chart' });
+  }
+});
+
+// GET /api/analytics/volume-chart - Volume chart data from trades
+router.get('/volume-chart', async (req: Request, res: Response) => {
+  try {
+    const hours = parseInt(req.query.hours as string) || 720;
+    
+    const result = await query(`
+      SELECT 
+        date_trunc('day', timestamp) as timestamp,
+        SUM(CASE WHEN symbol = 'BTC-USD' THEN value ELSE 0 END) as "BTC",
+        SUM(CASE WHEN symbol = 'ETH-USD' THEN value ELSE 0 END) as "ETH",
+        SUM(CASE WHEN symbol = 'SOL-USD' THEN value ELSE 0 END) as "SOL",
+        SUM(value) as total
+      FROM trades
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('day', timestamp)
+      ORDER BY timestamp ASC
+    `);
+
+    // Add cumulative
+    let cumulative = 0;
+    const dataWithCumulative = result.map((row: any) => {
+      cumulative += parseFloat(row.total || 0);
+      return {
+        ...row,
+        BTC: parseFloat(row.BTC || 0),
+        ETH: parseFloat(row.ETH || 0),
+        SOL: parseFloat(row.SOL || 0),
+        total: parseFloat(row.total || 0),
+        Cumulative: cumulative,
+      };
+    });
+
+    res.json({ data: dataWithCumulative });
+  } catch (error) {
+    console.error('Error fetching volume chart:', error);
+    res.status(500).json({ error: 'Failed to fetch volume chart' });
+  }
+});
+
+// GET /api/analytics/liquidations-chart - Liquidations chart data
+router.get('/liquidations-chart', async (req: Request, res: Response) => {
+  try {
+    const hours = parseInt(req.query.hours as string) || 720;
+    
+    const result = await query(`
+      SELECT 
+        date_trunc('day', timestamp) as timestamp,
+        SUM(CASE WHEN symbol = 'BTC-USD' THEN value ELSE 0 END) as "BTC",
+        SUM(CASE WHEN symbol = 'ETH-USD' THEN value ELSE 0 END) as "ETH",
+        SUM(CASE WHEN symbol = 'SOL-USD' THEN value ELSE 0 END) as "SOL",
+        SUM(value) as total
+      FROM liquidations
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('day', timestamp)
+      ORDER BY timestamp ASC
+    `);
+
+    // Add cumulative
+    let cumulative = 0;
+    const dataWithCumulative = result.map((row: any) => {
+      cumulative += parseFloat(row.total || 0);
+      return {
+        ...row,
+        BTC: parseFloat(row.BTC || 0),
+        ETH: parseFloat(row.ETH || 0),
+        SOL: parseFloat(row.SOL || 0),
+        total: parseFloat(row.total || 0),
+        Cumulative: cumulative,
+      };
+    });
+
+    res.json({ data: dataWithCumulative });
+  } catch (error) {
+    console.error('Error fetching liquidations chart:', error);
+    res.status(500).json({ error: 'Failed to fetch liquidations chart' });
+  }
+});
+
+// GET /api/analytics/trades-chart - Trades count chart
+router.get('/trades-chart', async (req: Request, res: Response) => {
+  try {
+    const hours = parseInt(req.query.hours as string) || 720;
+    
+    const result = await query(`
+      SELECT 
+        date_trunc('day', timestamp) as timestamp,
+        COUNT(CASE WHEN symbol = 'BTC-USD' THEN 1 END) as "BTC",
+        COUNT(CASE WHEN symbol = 'ETH-USD' THEN 1 END) as "ETH",
+        COUNT(CASE WHEN symbol = 'SOL-USD' THEN 1 END) as "SOL",
+        COUNT(*) as total
+      FROM trades
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('day', timestamp)
+      ORDER BY timestamp ASC
+    `);
+
+    // Add cumulative
+    let cumulative = 0;
+    const dataWithCumulative = result.map((row: any) => {
+      cumulative += parseInt(row.total || 0);
+      return {
+        ...row,
+        BTC: parseInt(row.BTC || 0),
+        ETH: parseInt(row.ETH || 0),
+        SOL: parseInt(row.SOL || 0),
+        total: parseInt(row.total || 0),
+        Cumulative: cumulative,
+      };
+    });
+
+    res.json({ data: dataWithCumulative });
+  } catch (error) {
+    console.error('Error fetching trades chart:', error);
+    res.status(500).json({ error: 'Failed to fetch trades chart' });
+  }
+});
+
+// GET /api/analytics/adl-chart - ADL chart (placeholder - BULK tracks this via trades with reason='adl')
+router.get('/adl-chart', async (req: Request, res: Response) => {
+  try {
+    // ADL events would come through trades with reason='adl' from the WebSocket
+    // For now, return empty data since we don't have a separate ADL table
+    res.json({ data: [] });
+  } catch (error) {
+    console.error('Error fetching ADL chart:', error);
+    res.status(500).json({ error: 'Failed to fetch ADL chart' });
   }
 });
 
@@ -267,33 +388,88 @@ router.get('/leaderboard/:type', async (req: Request, res: Response) => {
 router.get('/activity', async (req: Request, res: Response) => {
   try {
     const { limit = '50', type } = req.query;
-    
-    let whereClause = '';
-    if (type === 'trades') whereClause = "WHERE type = 'trade'";
-    else if (type === 'liquidations') whereClause = "WHERE type = 'liquidation'";
-    else if (type === 'adl') whereClause = "WHERE type = 'adl'";
+    const limitNum = Math.min(parseInt(limit as string) || 50, 100);
 
+    if (type === 'liquidations') {
+      const result = await query(`
+        SELECT 
+          id,
+          wallet_address,
+          symbol,
+          side,
+          'liquidation' as type,
+          size,
+          price,
+          value,
+          timestamp
+        FROM liquidations
+        ORDER BY timestamp DESC
+        LIMIT $1
+      `, [limitNum]);
+      return res.json({ data: result });
+    }
+
+    // Default: return trades
     const result = await query(`
       SELECT 
         id,
         wallet_address,
         symbol,
         side,
-        type,
+        'trade' as type,
         size,
         price,
         value,
         timestamp
       FROM trades
-      ${whereClause}
       ORDER BY timestamp DESC
       LIMIT $1
-    `, [parseInt(limit as string)]);
+    `, [limitNum]);
 
     res.json({ data: result });
   } catch (error) {
     console.error('Error fetching activity:', error);
     res.status(500).json({ error: 'Failed to fetch activity' });
+  }
+});
+
+// GET /api/analytics/open-interest-history/:symbol
+router.get('/open-interest-history/:symbol', async (req: Request, res: Response) => {
+  try {
+    const { symbol } = req.params;
+    const hours = parseInt(req.query.hours as string) || 24;
+    
+    const result = await query(`
+      SELECT timestamp, open_interest_usd as value
+      FROM ticker_snapshots
+      WHERE symbol = $1 AND timestamp > NOW() - INTERVAL '${hours} hours'
+      ORDER BY timestamp ASC
+    `, [symbol]);
+
+    res.json({ data: result });
+  } catch (error) {
+    console.error('Error fetching OI history:', error);
+    res.status(500).json({ error: 'Failed to fetch OI history' });
+  }
+});
+
+// GET /api/analytics/funding-rate-history/:symbol
+router.get('/funding-rate-history/:symbol', async (req: Request, res: Response) => {
+  try {
+    const { symbol } = req.params;
+    const hours = parseInt(req.query.hours as string) || 24;
+    
+    const result = await query(`
+      SELECT timestamp, funding_rate as value
+      FROM ticker_snapshots
+      WHERE symbol = $1 AND timestamp > NOW() - INTERVAL '${hours} hours'
+      ORDER BY timestamp ASC
+    `, [symbol]);
+
+    res.json({ data: result });
+  } catch (error) {
+    console.error('Error fetching funding rate history:', error);
+    res.status(500).json({ error: 'Failed to fetch funding rate history' });
   }
 });
 
