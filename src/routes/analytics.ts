@@ -24,6 +24,7 @@ interface BulkTicker {
 }
 
 interface BulkStatsResponse {
+  timestamp?: number;
   volume?: { totalUsd?: number };
   openInterest?: { totalUsd?: number };
   markets?: Array<{
@@ -56,17 +57,73 @@ router.get('/ticker/:symbol', async (req: Request, res: Response) => {
 
 // ============ EXCHANGE STATS (Dashboard header) ============
 
-// Get exchange stats - uses BULK API /stats for volume and OI
+// Get exchange stats - transforms BULK API data for dashboard
 router.get('/exchange-stats', async (req: Request, res: Response) => {
-  const period = (req.query.period as string) || '1d';
-  
   try {
-    const response = await fetch(`${BULK_API_BASE}/stats?period=${period}`);
-    if (!response.ok) {
-      throw new Error(`BULK API returned ${response.status}`);
+    // Fetch from BULK API /stats
+    let totalVolume24h = 0;
+    let totalOpenInterest = 0;
+    let timestamp = Date.now();
+    
+    try {
+      const response = await fetch(`${BULK_API_BASE}/stats?period=1d`);
+      if (response.ok) {
+        const bulkStats = await response.json() as BulkStatsResponse;
+        timestamp = bulkStats.timestamp || Date.now();
+        
+        // Calculate from markets
+        if (bulkStats?.markets) {
+          for (const market of bulkStats.markets) {
+            totalVolume24h += market.quoteVolume || 0;
+            totalOpenInterest += (market.openInterest || 0) * (market.markPrice || 0);
+          }
+        }
+        
+        // Use totals if available
+        if (bulkStats?.volume?.totalUsd) {
+          totalVolume24h = bulkStats.volume.totalUsd;
+        }
+        if (bulkStats?.openInterest?.totalUsd) {
+          totalOpenInterest = bulkStats.openInterest.totalUsd;
+        }
+      }
+    } catch (e) {
+      console.error('Failed to fetch BULK stats:', e);
     }
-    const data = await response.json();
-    res.json(data);
+    
+    // Get active traders from DB (last 24h)
+    let activeTraders = 0;
+    try {
+      const tradersResult = await query(`
+        SELECT COUNT(DISTINCT wallet_address) as count 
+        FROM trades 
+        WHERE timestamp > NOW() - INTERVAL '24 hours'
+      `);
+      activeTraders = parseInt(tradersResult[0]?.count || '0');
+    } catch (e) {
+      console.error('Failed to get active traders:', e);
+    }
+    
+    // Get liquidations from DB (last 24h)
+    let liquidations24h = 0;
+    try {
+      const liqResult = await query(`
+        SELECT COALESCE(SUM(value), 0) as total
+        FROM liquidations 
+        WHERE timestamp > NOW() - INTERVAL '24 hours'
+      `);
+      liquidations24h = parseFloat(liqResult[0]?.total || '0');
+    } catch (e) {
+      console.error('Failed to get liquidations:', e);
+    }
+    
+    res.json({
+      timestamp,
+      volume24h: totalVolume24h,
+      openInterest: totalOpenInterest,
+      activeTraders,
+      liquidations24h,
+    });
   } catch (error) {
     console.error('Error fetching exchange stats:', error);
     res.status(500).json({ error: 'Failed to fetch exchange stats' });
