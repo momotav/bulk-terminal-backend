@@ -91,35 +91,61 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Wallet address required' });
     }
 
-    // Check if user exists
-    const existingUser = await query(
+    // First, check if user exists by privy_id
+    let userResult = await query(
       'SELECT * FROM users WHERE privy_id = $1',
       [privyUserId]
     );
 
-    let user;
-    if (existingUser.length > 0) {
-      // Update wallet address if changed
-      if (existingUser[0].wallet_address !== walletAddress) {
+    let user = userResult[0];
+
+    if (user) {
+      // User exists by privy_id - update wallet if needed
+      if (user.wallet_address !== walletAddress) {
+        console.log('[Users] Updating wallet address for existing user:', user.id);
         await query(
-          'UPDATE users SET wallet_address = $1 WHERE privy_id = $2',
-          [walletAddress, privyUserId]
+          'UPDATE users SET wallet_address = $1 WHERE id = $2',
+          [walletAddress, user.id]
         );
+        user.wallet_address = walletAddress;
       }
-      user = existingUser[0];
-      user.wallet_address = walletAddress;
-      console.log('[Users] Existing user found:', user.id);
+      console.log('[Users] Existing user found by privy_id:', user.id);
     } else {
-      // Create new user
-      const result = await query(
-        `INSERT INTO users (privy_id, wallet_address, created_at) 
-         VALUES ($1, $2, NOW()) 
-         RETURNING *`,
-        [privyUserId, walletAddress]
+      // Check if wallet already exists (different privy account)
+      const walletCheck = await query(
+        'SELECT * FROM users WHERE wallet_address = $1',
+        [walletAddress]
       );
-      user = result[0];
-      console.log('[Users] New user created:', user.id);
+
+      if (walletCheck[0]) {
+        // Wallet exists with different privy_id - update privy_id
+        console.log('[Users] Wallet exists, updating privy_id');
+        await query(
+          'UPDATE users SET privy_id = $1 WHERE wallet_address = $2',
+          [privyUserId, walletAddress]
+        );
+        user = walletCheck[0];
+        user.privy_id = privyUserId;
+      } else {
+        // Create new user
+        console.log('[Users] Creating new user');
+        const insertResult = await query(
+          `INSERT INTO users (privy_id, wallet_address, created_at) 
+           VALUES ($1, $2, NOW()) 
+           RETURNING *`,
+          [privyUserId, walletAddress]
+        );
+        user = insertResult[0];
+        console.log('[Users] New user created:', user?.id);
+      }
     }
+
+    if (!user) {
+      console.error('[Users] Failed to create or find user');
+      return res.status(500).json({ error: 'Failed to create user' });
+    }
+
+    console.log('[Users] User authenticated:', user.id, user.wallet_address);
 
     // Get following count
     const followingResult = await query(
@@ -133,9 +159,12 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
         following_count: parseInt(followingResult[0]?.count || '0')
       }
     });
-  } catch (error) {
-    console.error('Auth error:', error);
-    res.status(500).json({ error: 'Authentication failed' });
+  } catch (error: any) {
+    console.error('[Users] Auth error:', error);
+    console.error('[Users] Auth error message:', error?.message);
+    console.error('[Users] Auth error code:', error?.code);
+    console.error('[Users] Auth error detail:', error?.detail);
+    res.status(500).json({ error: 'Authentication failed', detail: error?.message });
   }
 });
 
