@@ -266,7 +266,7 @@ router.get('/following', verifyPrivyToken, async (req: Request, res: Response) =
     }
     const userId = userResult[0].id;
 
-    // Get followed wallets with their stats
+    // Get followed wallets with their stats AND Twitter profile if they have one
     const result = await query(`
       SELECT 
         wf.followed_wallet as wallet_address,
@@ -275,9 +275,13 @@ router.get('/following', verifyPrivyToken, async (req: Request, res: Response) =
         t.total_trades as trade_count,
         t.total_volume,
         t.total_pnl,
-        t.last_seen as last_trade_time
+        t.last_seen as last_trade_time,
+        u.twitter_handle,
+        u.twitter_name,
+        u.twitter_avatar
       FROM wallet_follows wf
       LEFT JOIN traders t ON t.wallet_address = wf.followed_wallet
+      LEFT JOIN users u ON u.wallet_address = wf.followed_wallet
       WHERE wf.user_id = $1
       ORDER BY wf.created_at DESC
     `, [userId]);
