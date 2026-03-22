@@ -356,6 +356,54 @@ router.get('/is-following/:walletAddress', verifyPrivyToken, async (req: Request
   }
 });
 
+// GET /api/users/search - Search users by Twitter handle or wallet address (NO AUTH REQUIRED)
+router.get('/search', async (req: Request, res: Response) => {
+  try {
+    const { q } = req.query;
+    
+    if (!q || typeof q !== 'string' || q.length < 2) {
+      return res.json({ results: [] });
+    }
+
+    const searchTerm = q.trim().toLowerCase().replace('@', ''); // Remove @ if present
+    console.log('[Users] Searching for:', searchTerm);
+
+    // Search by Twitter handle, Twitter name, or wallet address
+    const results = await query(`
+      SELECT 
+        u.wallet_address, 
+        u.twitter_handle, 
+        u.twitter_name, 
+        u.twitter_avatar,
+        u.display_name,
+        t.total_pnl,
+        t.total_volume,
+        t.total_trades as trade_count
+      FROM users u
+      LEFT JOIN traders t ON t.wallet_address = u.wallet_address
+      WHERE 
+        LOWER(u.twitter_handle) LIKE $1
+        OR LOWER(u.twitter_name) LIKE $1
+        OR LOWER(u.wallet_address) LIKE $1
+      ORDER BY 
+        CASE 
+          WHEN LOWER(u.twitter_handle) = $2 THEN 0
+          WHEN LOWER(u.twitter_handle) LIKE $3 THEN 1
+          ELSE 2
+        END,
+        t.total_volume DESC NULLS LAST
+      LIMIT 10
+    `, [`%${searchTerm}%`, searchTerm, `${searchTerm}%`]);
+
+    console.log('[Users] Search results:', results.length);
+
+    res.json({ results });
+  } catch (error) {
+    console.error('[Users] Search error:', error);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
 // GET /api/users/wallet/:address - Get public wallet profile (NO AUTH REQUIRED)
 router.get('/wallet/:address', async (req: Request, res: Response) => {
   try {
