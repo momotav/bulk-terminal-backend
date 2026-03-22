@@ -49,120 +49,88 @@ async function verifyPrivyToken(req: Request, res: Response, next: Function) {
     
     // Try to decode header to see algorithm
     try {
-      const header = JSON.parse(Buffer.from(parts[0], 'base64').toString());
-      console.log('[Privy] Token header:', JSON.stringify(header));
+      const headerJson = Buffer.from(parts[0], 'base64').toString();
+      console.log('[Privy] Token header:', headerJson);
     } catch (e) {
       console.log('[Privy] Could not decode token header');
     }
-    
-    // Check if Privy is configured
-    if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
-      console.error('[Privy] ERROR: Missing PRIVY_APP_ID or PRIVY_APP_SECRET environment variables');
-      return res.status(500).json({ error: 'Privy not configured on server' });
-    }
-    
+
     console.log('[Privy] Calling verifyAuthToken...');
     
-    // Verify token with Privy
-    // If verification key is set, pass it to avoid API call
-    let verifiedClaims;
-    if (PRIVY_VERIFICATION_KEY) {
-      verifiedClaims = await privy.verifyAuthToken(token, PRIVY_VERIFICATION_KEY);
-    } else {
-      verifiedClaims = await privy.verifyAuthToken(token);
-    }
+    // Verify the token with Privy
+    const verifiedClaims = await privy.verifyAuthToken(token);
     
-    const elapsed = Date.now() - startTime;
-    console.log('[Privy] ✓ Token verified successfully in', elapsed, 'ms');
+    const duration = Date.now() - startTime;
+    console.log(`[Privy] ✓ Token verified successfully in ${duration} ms`);
     console.log('[Privy] User ID:', verifiedClaims.userId);
-    console.log('[Privy] App ID:', verifiedClaims.appId);
-    console.log('[Privy] Session ID:', verifiedClaims.sessionId);
-    console.log('[Privy] Issued at:', new Date(verifiedClaims.issuedAt * 1000).toISOString());
-    console.log('[Privy] Expires at:', new Date(verifiedClaims.expiration * 1000).toISOString());
     
-    // Check if token is expired
-    const now = Math.floor(Date.now() / 1000);
-    if (verifiedClaims.expiration < now) {
-      console.error('[Privy] Token is expired!');
-      return res.status(401).json({ error: 'Token expired, please reconnect' });
-    }
-    
-    // Attach user info to request
+    // Add the verified user ID to the request
     (req as any).privyUserId = verifiedClaims.userId;
-    (req as any).privyUser = verifiedClaims;
-    
     next();
   } catch (error: any) {
-    const elapsed = Date.now() - startTime;
-    console.error('[Privy] ✗ Token verification FAILED in', elapsed, 'ms');
-    console.error('[Privy] Error type:', error?.constructor?.name);
+    const duration = Date.now() - startTime;
+    console.error(`[Privy] ✗ Token verification FAILED in ${duration} ms`);
+    console.error('[Privy] Error type:', error?.constructor?.name || typeof error);
     console.error('[Privy] Error message:', error?.message);
     console.error('[Privy] Error code:', error?.code);
     console.error('[Privy] Error status:', error?.status);
-    
-    // Log full error for debugging
     console.error('[Privy] Full error:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
-    
-    // Check for specific error types
-    if (error?.message?.includes('expired')) {
-      return res.status(401).json({ error: 'Token expired, please reconnect' });
-    }
-    if (error?.message?.includes('invalid') || error?.message?.includes('Invalid')) {
-      return res.status(401).json({ error: 'Invalid token' });
-    }
-    if (error?.message?.includes('network') || error?.code === 'ECONNREFUSED') {
-      console.error('[Privy] Network error connecting to Privy API');
-      return res.status(503).json({ error: 'Cannot reach authentication service' });
-    }
-    
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
 
-// POST /api/users/auth - Authenticate/create user after Privy login
+// POST /api/users/auth - Authenticate after Privy login
 router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
   try {
     const privyUserId = (req as any).privyUserId;
     const { walletAddress } = req.body;
 
+    console.log('[Users] Auth request:', { privyUserId, walletAddress });
+
     if (!walletAddress) {
       return res.status(400).json({ error: 'Wallet address required' });
     }
 
-    console.log('[Auth] Creating/updating user:', { privyUserId, walletAddress });
+    // Check if user exists
+    const existingUser = await query(
+      'SELECT * FROM users WHERE privy_id = $1',
+      [privyUserId]
+    );
 
-    // Upsert user
-    const users = await query(`
-      INSERT INTO users (wallet_address, privy_id, email, password_hash, last_login_at)
-      VALUES ($1, $2, $1, 'privy_auth', NOW())
-      ON CONFLICT (wallet_address) 
-      DO UPDATE SET 
-        privy_id = COALESCE(users.privy_id, $2),
-        last_login_at = NOW()
-      RETURNING id, wallet_address, privy_id, twitter_handle, twitter_name, twitter_avatar,
-                telegram_handle, display_name, avatar_url, created_at
-    `, [walletAddress, privyUserId]);
-
-    const user = users[0];
-    console.log('[Auth] User upserted:', user.id);
+    let user;
+    if (existingUser.length > 0) {
+      // Update wallet address if changed
+      if (existingUser[0].wallet_address !== walletAddress) {
+        await query(
+          'UPDATE users SET wallet_address = $1 WHERE privy_id = $2',
+          [walletAddress, privyUserId]
+        );
+      }
+      user = existingUser[0];
+      user.wallet_address = walletAddress;
+      console.log('[Users] Existing user found:', user.id);
+    } else {
+      // Create new user
+      const result = await query(
+        `INSERT INTO users (privy_id, wallet_address, created_at) 
+         VALUES ($1, $2, NOW()) 
+         RETURNING *`,
+        [privyUserId, walletAddress]
+      );
+      user = result[0];
+      console.log('[Users] New user created:', user.id);
+    }
 
     // Get following count
-    const followsResult = await query(
+    const followingResult = await query(
       'SELECT COUNT(*) as count FROM wallet_follows WHERE user_id = $1',
       [user.id]
     );
 
-    // Get trading stats
-    const statsResult = await query(
-      'SELECT total_trades as trade_count, total_volume, total_pnl, win_rate FROM traders WHERE wallet_address = $1',
-      [walletAddress]
-    );
-
-    res.json({
+    res.json({ 
       user: {
         ...user,
-        following_count: parseInt(followsResult[0]?.count || '0'),
-        stats: statsResult[0] || null
+        following_count: parseInt(followingResult[0]?.count || '0')
       }
     });
   } catch (error) {
@@ -171,39 +139,43 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
   }
 });
 
-// GET /api/users/me - Get current user profile
+// GET /api/users/me - Get current user
 router.get('/me', verifyPrivyToken, async (req: Request, res: Response) => {
   try {
     const privyUserId = (req as any).privyUserId;
 
-    const users = await query(`
-      SELECT u.id, u.wallet_address, u.privy_id, u.twitter_handle, u.twitter_name, 
-             u.twitter_avatar, u.telegram_handle, u.display_name, u.avatar_url, u.created_at,
-             COUNT(wf.id) as following_count
-      FROM users u
-      LEFT JOIN wallet_follows wf ON u.id = wf.user_id
-      WHERE u.privy_id = $1
-      GROUP BY u.id
-    `, [privyUserId]);
+    const users = await query(
+      'SELECT * FROM users WHERE privy_id = $1',
+      [privyUserId]
+    );
 
     if (users.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Get trading stats
+    const user = users[0];
+
+    // Get following count
+    const followingResult = await query(
+      'SELECT COUNT(*) as count FROM wallet_follows WHERE user_id = $1',
+      [user.id]
+    );
+
+    // Get wallet stats from traders table
     const statsResult = await query(
-      'SELECT total_trades as trade_count, total_volume, total_pnl, win_rate FROM traders WHERE wallet_address = $1',
-      [users[0].wallet_address]
+      'SELECT total_trades as trade_count, total_volume, total_pnl FROM traders WHERE wallet_address = $1',
+      [user.wallet_address]
     );
 
     res.json({ 
       user: {
-        ...users[0],
+        ...user,
+        following_count: parseInt(followingResult[0]?.count || '0'),
         stats: statsResult[0] || null
       }
     });
   } catch (error) {
-    console.error('Get user error:', error);
+    console.error('Get me error:', error);
     res.status(500).json({ error: 'Failed to get user' });
   }
 });
@@ -214,26 +186,18 @@ router.post('/link/twitter', verifyPrivyToken, async (req: Request, res: Respons
     const privyUserId = (req as any).privyUserId;
     const { twitterId, twitterHandle, twitterName, twitterAvatar } = req.body;
 
-    if (!twitterId || !twitterHandle) {
-      return res.status(400).json({ error: 'Twitter info required' });
-    }
+    console.log('[Users] Link Twitter:', { privyUserId, twitterHandle });
 
-    const users = await query(`
-      UPDATE users 
-      SET twitter_id = $1, 
-          twitter_handle = $2, 
-          twitter_name = $3,
-          twitter_avatar = $4,
-          updated_at = NOW()
-      WHERE privy_id = $5
-      RETURNING *
-    `, [twitterId, twitterHandle, twitterName, twitterAvatar, privyUserId]);
+    await query(
+      `UPDATE users 
+       SET twitter_id = $1, twitter_handle = $2, twitter_name = $3, twitter_avatar = $4 
+       WHERE privy_id = $5`,
+      [twitterId, twitterHandle, twitterName, twitterAvatar, privyUserId]
+    );
 
-    if (users.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    const users = await query('SELECT * FROM users WHERE privy_id = $1', [privyUserId]);
 
-    res.json({ user: users[0], message: 'Twitter linked successfully' });
+    res.json({ user: users[0] });
   } catch (error) {
     console.error('Link Twitter error:', error);
     res.status(500).json({ error: 'Failed to link Twitter' });
@@ -245,55 +209,51 @@ router.delete('/link/twitter', verifyPrivyToken, async (req: Request, res: Respo
   try {
     const privyUserId = (req as any).privyUserId;
 
-    const users = await query(`
-      UPDATE users 
-      SET twitter_id = NULL, 
-          twitter_handle = NULL, 
-          twitter_name = NULL,
-          twitter_avatar = NULL,
-          updated_at = NOW()
-      WHERE privy_id = $1
-      RETURNING *
-    `, [privyUserId]);
+    await query(
+      `UPDATE users 
+       SET twitter_id = NULL, twitter_handle = NULL, twitter_name = NULL, twitter_avatar = NULL 
+       WHERE privy_id = $1`,
+      [privyUserId]
+    );
 
-    if (users.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    const users = await query('SELECT * FROM users WHERE privy_id = $1', [privyUserId]);
 
-    res.json({ user: users[0], message: 'Twitter unlinked' });
+    res.json({ user: users[0] });
   } catch (error) {
     console.error('Unlink Twitter error:', error);
     res.status(500).json({ error: 'Failed to unlink Twitter' });
   }
 });
 
-// GET /api/users/following - Get wallets the user follows
+// GET /api/users/following - Get followed wallets
 router.get('/following', verifyPrivyToken, async (req: Request, res: Response) => {
   try {
     const privyUserId = (req as any).privyUserId;
 
+    // Get user ID
     const userResult = await query('SELECT id FROM users WHERE privy_id = $1', [privyUserId]);
     if (userResult.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      return res.json({ following: [] });
     }
     const userId = userResult[0].id;
 
-    const following = await query(`
-      SELECT wf.followed_wallet as wallet_address,
-             wf.nickname,
-             wf.created_at as followed_at,
-             t.total_trades as trade_count,
-             t.total_volume,
-             t.total_pnl,
-             t.win_rate,
-             t.last_seen as last_trade_time
+    // Get followed wallets with their stats
+    const result = await query(`
+      SELECT 
+        wf.followed_wallet as wallet_address,
+        wf.nickname,
+        wf.created_at as followed_at,
+        t.total_trades as trade_count,
+        t.total_volume,
+        t.total_pnl,
+        t.last_seen as last_trade_time
       FROM wallet_follows wf
-      LEFT JOIN traders t ON wf.followed_wallet = t.wallet_address
+      LEFT JOIN traders t ON t.wallet_address = wf.followed_wallet
       WHERE wf.user_id = $1
       ORDER BY wf.created_at DESC
     `, [userId]);
 
-    res.json({ following });
+    res.json({ following: result });
   } catch (error) {
     console.error('Get following error:', error);
     res.status(500).json({ error: 'Failed to get following' });
@@ -306,29 +266,40 @@ router.post('/follow', verifyPrivyToken, async (req: Request, res: Response) => 
     const privyUserId = (req as any).privyUserId;
     const { walletAddress, nickname } = req.body;
 
-    console.log('[Follow] Request:', { privyUserId, walletAddress, nickname });
+    console.log('[Users] Follow wallet:', { privyUserId, walletAddress });
 
     if (!walletAddress) {
       return res.status(400).json({ error: 'Wallet address required' });
     }
 
+    // Get user ID
     const userResult = await query('SELECT id FROM users WHERE privy_id = $1', [privyUserId]);
     if (userResult.length === 0) {
-      console.log('[Follow] User not found for privy_id:', privyUserId);
-      return res.status(404).json({ error: 'User not found. Please reconnect your wallet.' });
+      return res.status(404).json({ error: 'User not found' });
     }
     const userId = userResult[0].id;
 
-    const result = await query(`
-      INSERT INTO wallet_follows (user_id, followed_wallet, nickname)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (user_id, followed_wallet) 
-      DO UPDATE SET nickname = COALESCE($3, wallet_follows.nickname)
-      RETURNING *
-    `, [userId, walletAddress, nickname || null]);
+    // Check if already following
+    const existing = await query(
+      'SELECT id FROM wallet_follows WHERE user_id = $1 AND followed_wallet = $2',
+      [userId, walletAddress]
+    );
 
-    console.log('[Follow] Success:', result[0]);
-    res.json({ follow: result[0], message: 'Wallet followed' });
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Already following this wallet' });
+    }
+
+    // Add follow
+    const result = await query(
+      `INSERT INTO wallet_follows (user_id, followed_wallet, nickname, created_at) 
+       VALUES ($1, $2, $3, NOW()) 
+       RETURNING *`,
+      [userId, walletAddress, nickname || null]
+    );
+
+    console.log('[Users] Follow created:', result[0]);
+
+    res.json({ follow: result[0] });
   } catch (error) {
     console.error('Follow error:', error);
     res.status(500).json({ error: 'Failed to follow wallet' });
@@ -341,12 +312,14 @@ router.delete('/follow/:walletAddress', verifyPrivyToken, async (req: Request, r
     const privyUserId = (req as any).privyUserId;
     const { walletAddress } = req.params;
 
+    // Get user ID
     const userResult = await query('SELECT id FROM users WHERE privy_id = $1', [privyUserId]);
     if (userResult.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
     const userId = userResult[0].id;
 
+    // Remove follow
     await query(
       'DELETE FROM wallet_follows WHERE user_id = $1 AND followed_wallet = $2',
       [userId, walletAddress]
@@ -387,32 +360,55 @@ router.get('/is-following/:walletAddress', verifyPrivyToken, async (req: Request
 router.get('/wallet/:address', async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
+    console.log('[Users] Getting wallet profile for:', address);
 
+    // Get user profile if they've registered
     const users = await query(`
-      SELECT u.wallet_address, u.twitter_handle, u.twitter_name, u.twitter_avatar,
-             u.display_name, u.avatar_url, u.created_at
-      FROM users u
-      WHERE u.wallet_address = $1
+      SELECT wallet_address, twitter_handle, twitter_name, twitter_avatar,
+             display_name, created_at
+      FROM users
+      WHERE wallet_address = $1
     `, [address]);
 
-    const statsResult = await query(
-      'SELECT total_trades as trade_count, total_volume, total_pnl, win_rate FROM traders WHERE wallet_address = $1',
-      [address]
-    );
+    console.log('[Users] User query result:', users.length > 0 ? 'Found' : 'Not found');
+
+    // Get wallet stats from traders table (without win_rate which may not exist)
+    let stats = null;
+    try {
+      const statsResult = await query(`
+        SELECT 
+          total_trades as trade_count, 
+          total_volume, 
+          total_pnl
+        FROM traders 
+        WHERE wallet_address = $1
+      `, [address]);
+      stats = statsResult[0] || null;
+      console.log('[Users] Stats query result:', stats ? 'Found' : 'Not found');
+    } catch (statsError) {
+      console.error('[Users] Stats query error (non-fatal):', statsError);
+      // Continue without stats
+    }
 
     if (users.length === 0) {
+      console.log('[Users] No user profile found, returning null profile with stats');
       return res.json({ 
         profile: null, 
-        stats: statsResult[0] || null 
+        stats: stats 
       });
     }
 
+    console.log('[Users] Returning profile:', {
+      wallet: users[0].wallet_address,
+      twitter: users[0].twitter_handle || 'none'
+    });
+
     res.json({ 
       profile: users[0],
-      stats: statsResult[0] || null
+      stats: stats
     });
   } catch (error) {
-    console.error('Get wallet profile error:', error);
+    console.error('[Users] Get wallet profile error:', error);
     res.status(500).json({ error: 'Failed to get wallet profile' });
   }
 });
