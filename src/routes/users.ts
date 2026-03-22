@@ -7,24 +7,53 @@ const router = Router();
 // Check if Privy credentials are configured
 const PRIVY_APP_ID = process.env.PRIVY_APP_ID || '';
 const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET || '';
+// Optional: Get verification key from dashboard to avoid API calls
+// Go to Privy Dashboard > Configuration > App Settings > Verification Key
+const PRIVY_VERIFICATION_KEY = process.env.PRIVY_VERIFICATION_KEY || '';
 
-console.log('[Privy] Initializing with App ID:', PRIVY_APP_ID ? `${PRIVY_APP_ID.slice(0, 8)}...` : 'NOT SET');
-console.log('[Privy] App Secret:', PRIVY_APP_SECRET ? 'SET' : 'NOT SET');
+console.log('[Privy] =========================================');
+console.log('[Privy] Initializing Privy Server Auth');
+console.log('[Privy] App ID:', PRIVY_APP_ID ? `${PRIVY_APP_ID.slice(0, 12)}...` : 'NOT SET');
+console.log('[Privy] App Secret:', PRIVY_APP_SECRET ? `SET (${PRIVY_APP_SECRET.length} chars)` : 'NOT SET');
+console.log('[Privy] Verification Key:', PRIVY_VERIFICATION_KEY ? 'SET' : 'NOT SET (will fetch from API)');
+console.log('[Privy] =========================================');
 
 // Initialize Privy client for server-side verification
 const privy = new PrivyClient(PRIVY_APP_ID, PRIVY_APP_SECRET);
 
 // Middleware to verify Privy token
 async function verifyPrivyToken(req: Request, res: Response, next: Function) {
+  const startTime = Date.now();
+  
   try {
     const authHeader = req.headers.authorization;
+    console.log('[Privy] Auth header present:', !!authHeader);
+    
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      console.log('[Privy] Missing authorization header');
+      console.log('[Privy] Missing or malformed authorization header');
       return res.status(401).json({ error: 'Missing authorization token' });
     }
 
-    const token = authHeader.substring(7);
-    console.log('[Privy] Verifying token:', token.slice(0, 20) + '...');
+    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+    console.log('[Privy] Token preview:', token.slice(0, 30) + '...' + token.slice(-10));
+    console.log('[Privy] Token length:', token.length);
+    
+    // Basic JWT structure check
+    const parts = token.split('.');
+    console.log('[Privy] Token parts:', parts.length, '(expected: 3 for JWT)');
+    
+    if (parts.length !== 3) {
+      console.error('[Privy] Invalid JWT structure - not a valid token');
+      return res.status(401).json({ error: 'Invalid token format' });
+    }
+    
+    // Try to decode header to see algorithm
+    try {
+      const header = JSON.parse(Buffer.from(parts[0], 'base64').toString());
+      console.log('[Privy] Token header:', JSON.stringify(header));
+    } catch (e) {
+      console.log('[Privy] Could not decode token header');
+    }
     
     // Check if Privy is configured
     if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
@@ -32,9 +61,31 @@ async function verifyPrivyToken(req: Request, res: Response, next: Function) {
       return res.status(500).json({ error: 'Privy not configured on server' });
     }
     
+    console.log('[Privy] Calling verifyAuthToken...');
+    
     // Verify token with Privy
-    const verifiedClaims = await privy.verifyAuthToken(token);
-    console.log('[Privy] Token verified successfully for user:', verifiedClaims.userId);
+    // If verification key is set, pass it to avoid API call
+    let verifiedClaims;
+    if (PRIVY_VERIFICATION_KEY) {
+      verifiedClaims = await privy.verifyAuthToken(token, PRIVY_VERIFICATION_KEY);
+    } else {
+      verifiedClaims = await privy.verifyAuthToken(token);
+    }
+    
+    const elapsed = Date.now() - startTime;
+    console.log('[Privy] ✓ Token verified successfully in', elapsed, 'ms');
+    console.log('[Privy] User ID:', verifiedClaims.userId);
+    console.log('[Privy] App ID:', verifiedClaims.appId);
+    console.log('[Privy] Session ID:', verifiedClaims.sessionId);
+    console.log('[Privy] Issued at:', new Date(verifiedClaims.issuedAt * 1000).toISOString());
+    console.log('[Privy] Expires at:', new Date(verifiedClaims.expiration * 1000).toISOString());
+    
+    // Check if token is expired
+    const now = Math.floor(Date.now() / 1000);
+    if (verifiedClaims.expiration < now) {
+      console.error('[Privy] Token is expired!');
+      return res.status(401).json({ error: 'Token expired, please reconnect' });
+    }
     
     // Attach user info to request
     (req as any).privyUserId = verifiedClaims.userId;
@@ -42,18 +93,26 @@ async function verifyPrivyToken(req: Request, res: Response, next: Function) {
     
     next();
   } catch (error: any) {
-    console.error('[Privy] Token verification failed:', {
-      message: error.message,
-      name: error.name,
-      code: error.code,
-    });
+    const elapsed = Date.now() - startTime;
+    console.error('[Privy] ✗ Token verification FAILED in', elapsed, 'ms');
+    console.error('[Privy] Error type:', error?.constructor?.name);
+    console.error('[Privy] Error message:', error?.message);
+    console.error('[Privy] Error code:', error?.code);
+    console.error('[Privy] Error status:', error?.status);
     
-    // Provide more specific error messages
-    if (error.message?.includes('expired')) {
+    // Log full error for debugging
+    console.error('[Privy] Full error:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+    
+    // Check for specific error types
+    if (error?.message?.includes('expired')) {
       return res.status(401).json({ error: 'Token expired, please reconnect' });
     }
-    if (error.message?.includes('invalid')) {
-      return res.status(401).json({ error: 'Invalid token format' });
+    if (error?.message?.includes('invalid') || error?.message?.includes('Invalid')) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    if (error?.message?.includes('network') || error?.code === 'ECONNREFUSED') {
+      console.error('[Privy] Network error connecting to Privy API');
+      return res.status(503).json({ error: 'Cannot reach authentication service' });
     }
     
     return res.status(401).json({ error: 'Invalid or expired token' });
@@ -256,7 +315,7 @@ router.post('/follow', verifyPrivyToken, async (req: Request, res: Response) => 
     const userResult = await query('SELECT id FROM users WHERE privy_id = $1', [privyUserId]);
     if (userResult.length === 0) {
       console.log('[Follow] User not found for privy_id:', privyUserId);
-      return res.status(404).json({ error: 'User not found' });
+      return res.status(404).json({ error: 'User not found. Please reconnect your wallet.' });
     }
     const userId = userResult[0].id;
 
@@ -356,6 +415,18 @@ router.get('/wallet/:address', async (req: Request, res: Response) => {
     console.error('Get wallet profile error:', error);
     res.status(500).json({ error: 'Failed to get wallet profile' });
   }
+});
+
+// GET /api/users/debug - Debug endpoint to check Privy config (remove in production)
+router.get('/debug', async (req: Request, res: Response) => {
+  res.json({
+    privy_app_id_set: !!PRIVY_APP_ID,
+    privy_app_id_preview: PRIVY_APP_ID ? PRIVY_APP_ID.slice(0, 8) + '...' : null,
+    privy_secret_set: !!PRIVY_APP_SECRET,
+    privy_secret_length: PRIVY_APP_SECRET?.length || 0,
+    privy_verification_key_set: !!PRIVY_VERIFICATION_KEY,
+    timestamp: new Date().toISOString()
+  });
 });
 
 export default router;
