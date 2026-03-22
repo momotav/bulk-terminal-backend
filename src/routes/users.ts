@@ -4,32 +4,58 @@ import { PrivyClient } from '@privy-io/server-auth';
 
 const router = Router();
 
+// Check if Privy credentials are configured
+const PRIVY_APP_ID = process.env.PRIVY_APP_ID || '';
+const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET || '';
+
+console.log('[Privy] Initializing with App ID:', PRIVY_APP_ID ? `${PRIVY_APP_ID.slice(0, 8)}...` : 'NOT SET');
+console.log('[Privy] App Secret:', PRIVY_APP_SECRET ? 'SET' : 'NOT SET');
+
 // Initialize Privy client for server-side verification
-const privy = new PrivyClient(
-  process.env.PRIVY_APP_ID || '',
-  process.env.PRIVY_APP_SECRET || ''
-);
+const privy = new PrivyClient(PRIVY_APP_ID, PRIVY_APP_SECRET);
 
 // Middleware to verify Privy token
 async function verifyPrivyToken(req: Request, res: Response, next: Function) {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      console.log('[Privy] Missing authorization header');
       return res.status(401).json({ error: 'Missing authorization token' });
     }
 
     const token = authHeader.substring(7);
+    console.log('[Privy] Verifying token:', token.slice(0, 20) + '...');
+    
+    // Check if Privy is configured
+    if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
+      console.error('[Privy] ERROR: Missing PRIVY_APP_ID or PRIVY_APP_SECRET environment variables');
+      return res.status(500).json({ error: 'Privy not configured on server' });
+    }
     
     // Verify token with Privy
     const verifiedClaims = await privy.verifyAuthToken(token);
+    console.log('[Privy] Token verified successfully for user:', verifiedClaims.userId);
     
     // Attach user info to request
     (req as any).privyUserId = verifiedClaims.userId;
     (req as any).privyUser = verifiedClaims;
     
     next();
-  } catch (error) {
-    console.error('Privy token verification failed:', error);
+  } catch (error: any) {
+    console.error('[Privy] Token verification failed:', {
+      message: error.message,
+      name: error.name,
+      code: error.code,
+    });
+    
+    // Provide more specific error messages
+    if (error.message?.includes('expired')) {
+      return res.status(401).json({ error: 'Token expired, please reconnect' });
+    }
+    if (error.message?.includes('invalid')) {
+      return res.status(401).json({ error: 'Invalid token format' });
+    }
+    
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
@@ -44,6 +70,8 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Wallet address required' });
     }
 
+    console.log('[Auth] Creating/updating user:', { privyUserId, walletAddress });
+
     // Upsert user
     const users = await query(`
       INSERT INTO users (wallet_address, privy_id, email, password_hash, last_login_at)
@@ -57,6 +85,7 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
     `, [walletAddress, privyUserId]);
 
     const user = users[0];
+    console.log('[Auth] User upserted:', user.id);
 
     // Get following count
     const followsResult = await query(
@@ -66,7 +95,7 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
 
     // Get trading stats
     const statsResult = await query(
-      'SELECT trade_count, total_volume, total_pnl, win_rate FROM traders WHERE wallet_address = $1',
+      'SELECT total_trades as trade_count, total_volume, total_pnl, win_rate FROM traders WHERE wallet_address = $1',
       [walletAddress]
     );
 
@@ -104,7 +133,7 @@ router.get('/me', verifyPrivyToken, async (req: Request, res: Response) => {
 
     // Get trading stats
     const statsResult = await query(
-      'SELECT trade_count, total_volume, total_pnl, win_rate FROM traders WHERE wallet_address = $1',
+      'SELECT total_trades as trade_count, total_volume, total_pnl, win_rate FROM traders WHERE wallet_address = $1',
       [users[0].wallet_address]
     );
 
@@ -194,11 +223,11 @@ router.get('/following', verifyPrivyToken, async (req: Request, res: Response) =
       SELECT wf.followed_wallet as wallet_address,
              wf.nickname,
              wf.created_at as followed_at,
-             t.trade_count,
+             t.total_trades as trade_count,
              t.total_volume,
              t.total_pnl,
              t.win_rate,
-             t.last_trade_time
+             t.last_seen as last_trade_time
       FROM wallet_follows wf
       LEFT JOIN traders t ON wf.followed_wallet = t.wallet_address
       WHERE wf.user_id = $1
@@ -218,12 +247,15 @@ router.post('/follow', verifyPrivyToken, async (req: Request, res: Response) => 
     const privyUserId = (req as any).privyUserId;
     const { walletAddress, nickname } = req.body;
 
+    console.log('[Follow] Request:', { privyUserId, walletAddress, nickname });
+
     if (!walletAddress) {
       return res.status(400).json({ error: 'Wallet address required' });
     }
 
     const userResult = await query('SELECT id FROM users WHERE privy_id = $1', [privyUserId]);
     if (userResult.length === 0) {
+      console.log('[Follow] User not found for privy_id:', privyUserId);
       return res.status(404).json({ error: 'User not found' });
     }
     const userId = userResult[0].id;
@@ -236,6 +268,7 @@ router.post('/follow', verifyPrivyToken, async (req: Request, res: Response) => 
       RETURNING *
     `, [userId, walletAddress, nickname || null]);
 
+    console.log('[Follow] Success:', result[0]);
     res.json({ follow: result[0], message: 'Wallet followed' });
   } catch (error) {
     console.error('Follow error:', error);
@@ -291,7 +324,7 @@ router.get('/is-following/:walletAddress', verifyPrivyToken, async (req: Request
   }
 });
 
-// GET /api/users/wallet/:address - Get public wallet profile
+// GET /api/users/wallet/:address - Get public wallet profile (NO AUTH REQUIRED)
 router.get('/wallet/:address', async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
@@ -304,7 +337,7 @@ router.get('/wallet/:address', async (req: Request, res: Response) => {
     `, [address]);
 
     const statsResult = await query(
-      'SELECT trade_count, total_volume, total_pnl, win_rate FROM traders WHERE wallet_address = $1',
+      'SELECT total_trades as trade_count, total_volume, total_pnl, win_rate FROM traders WHERE wallet_address = $1',
       [address]
     );
 
