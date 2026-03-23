@@ -47,7 +47,7 @@ async function fetchTickersForStats(): Promise<{ volume24h: number; openInterest
 
   const tickerPromises = MARKETS.map(symbol =>
     fetch(`${BULK_API_BASE}/ticker/${symbol}`)
-      .then(r => r.ok ? r.json() : null)
+      .then(r => r.ok ? r.json() as Promise<BulkTicker> : null)
       .catch(() => null)
   );
 
