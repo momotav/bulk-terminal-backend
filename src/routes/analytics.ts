@@ -6,6 +6,9 @@ const router = Router();
 // BULK API base URL
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
+// All supported markets
+const MARKETS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
+
 // Type for BULK ticker response
 interface BulkTicker {
   symbol: string;
@@ -36,6 +39,34 @@ interface BulkStatsResponse {
   }>;
 }
 
+// Helper: Fetch all tickers and sum volume/OI
+async function fetchTickersForStats(): Promise<{ volume24h: number; openInterest: number; timestamp: number }> {
+  let totalVolume = 0;
+  let totalOI = 0;
+  let timestamp = Date.now();
+
+  const tickerPromises = MARKETS.map(symbol =>
+    fetch(`${BULK_API_BASE}/ticker/${symbol}`)
+      .then(r => r.ok ? r.json() : null)
+      .catch(() => null)
+  );
+
+  const tickers = await Promise.all(tickerPromises);
+
+  for (const ticker of tickers) {
+    if (ticker) {
+      totalVolume += ticker.quoteVolume || 0;
+      totalOI += (ticker.openInterest || 0) * (ticker.markPrice || 0);
+      if (ticker.timestamp) {
+        timestamp = Math.max(timestamp, ticker.timestamp / 1000000); // Convert from nanoseconds
+      }
+    }
+  }
+
+  console.log(`📊 Fetched ${tickers.filter(t => t).length} tickers: Volume=$${totalVolume.toFixed(2)}, OI=$${totalOI.toFixed(2)}`);
+  return { volume24h: totalVolume, openInterest: totalOI, timestamp };
+}
+
 // ============ BULK API TICKER PROXY (for live OI) ============
 
 // Get ticker data (includes fundingRate and openInterest)
@@ -60,19 +91,19 @@ router.get('/ticker/:symbol', async (req: Request, res: Response) => {
 // Get exchange stats - transforms BULK API data for dashboard
 router.get('/exchange-stats', async (req: Request, res: Response) => {
   try {
-    // Fetch from BULK API /stats
     let totalVolume24h = 0;
     let totalOpenInterest = 0;
     let timestamp = Date.now();
     
+    // First try /stats endpoint
     try {
       const response = await fetch(`${BULK_API_BASE}/stats?period=1d`);
       if (response.ok) {
         const bulkStats = await response.json() as BulkStatsResponse;
         timestamp = bulkStats.timestamp || Date.now();
         
-        // Calculate from markets
-        if (bulkStats?.markets) {
+        // Calculate from markets if available
+        if (bulkStats?.markets && bulkStats.markets.length > 0) {
           for (const market of bulkStats.markets) {
             totalVolume24h += market.quoteVolume || 0;
             totalOpenInterest += (market.openInterest || 0) * (market.markPrice || 0);
@@ -80,15 +111,24 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
         }
         
         // Use totals if available
-        if (bulkStats?.volume?.totalUsd) {
+        if (bulkStats?.volume?.totalUsd && bulkStats.volume.totalUsd > 0) {
           totalVolume24h = bulkStats.volume.totalUsd;
         }
-        if (bulkStats?.openInterest?.totalUsd) {
+        if (bulkStats?.openInterest?.totalUsd && bulkStats.openInterest.totalUsd > 0) {
           totalOpenInterest = bulkStats.openInterest.totalUsd;
         }
       }
     } catch (e) {
       console.error('Failed to fetch BULK stats:', e);
+    }
+    
+    // FALLBACK: If /stats returned 0s, fetch from individual tickers
+    if (totalVolume24h === 0 && totalOpenInterest === 0) {
+      console.log('⚠️ /stats returned 0s, falling back to individual tickers...');
+      const tickerStats = await fetchTickersForStats();
+      totalVolume24h = tickerStats.volume24h;
+      totalOpenInterest = tickerStats.openInterest;
+      timestamp = tickerStats.timestamp;
     }
     
     // Get active traders from DB (last 24h)
@@ -133,18 +173,17 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
 // Exchange health endpoint - combines BULK API + DB data
 router.get('/exchange-health', async (req: Request, res: Response) => {
   try {
-    // Fetch from BULK API /stats for official 24h volume and OI
-    let bulkStats: BulkStatsResponse | null = null;
     let totalVolume24h = 0;
     let totalOI = 0;
     
+    // First try /stats endpoint
     try {
       const statsRes = await fetch(`${BULK_API_BASE}/stats?period=1d`);
       if (statsRes.ok) {
-        bulkStats = await statsRes.json() as BulkStatsResponse;
+        const bulkStats = await statsRes.json() as BulkStatsResponse;
         
-        // Calculate volume from markets if totalUsd is null
-        if (bulkStats?.markets) {
+        // Calculate volume from markets if available
+        if (bulkStats?.markets && bulkStats.markets.length > 0) {
           for (const market of bulkStats.markets) {
             totalVolume24h += market.quoteVolume || 0;
             totalOI += (market.openInterest || 0) * (market.markPrice || 0);
@@ -152,15 +191,23 @@ router.get('/exchange-health', async (req: Request, res: Response) => {
         }
         
         // Use provided totals if available
-        if (bulkStats?.volume?.totalUsd) {
+        if (bulkStats?.volume?.totalUsd && bulkStats.volume.totalUsd > 0) {
           totalVolume24h = bulkStats.volume.totalUsd;
         }
-        if (bulkStats?.openInterest?.totalUsd) {
+        if (bulkStats?.openInterest?.totalUsd && bulkStats.openInterest.totalUsd > 0) {
           totalOI = bulkStats.openInterest.totalUsd;
         }
       }
     } catch (e) {
       console.error('Failed to fetch BULK stats:', e);
+    }
+    
+    // FALLBACK: If /stats returned 0s, fetch from individual tickers
+    if (totalVolume24h === 0 && totalOI === 0) {
+      console.log('⚠️ /stats returned 0s for exchange-health, falling back to tickers...');
+      const tickerStats = await fetchTickersForStats();
+      totalVolume24h = tickerStats.volume24h;
+      totalOI = tickerStats.openInterest;
     }
     
     // Fetch from our DB for traders and liquidations
@@ -179,6 +226,56 @@ router.get('/exchange-health', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error fetching exchange health:', error);
     res.status(500).json({ error: 'Failed to fetch exchange health' });
+  }
+});
+
+// ============ RECENT ACTIVITY (Live Activity on Dashboard) ============
+
+router.get('/recent-activity', async (req: Request, res: Response) => {
+  const limit = parseInt(req.query.limit as string) || 20;
+  
+  try {
+    // Get recent trades from database
+    const trades = await query(`
+      SELECT 
+        'trade' as type,
+        wallet_address,
+        symbol,
+        side,
+        size,
+        price,
+        value,
+        timestamp
+      FROM trades
+      ORDER BY timestamp DESC
+      LIMIT $1
+    `, [limit]).catch(() => []);
+    
+    // Get recent liquidations from database
+    const liquidations = await query(`
+      SELECT 
+        'liquidation' as type,
+        wallet_address,
+        symbol,
+        side,
+        size,
+        price,
+        value,
+        timestamp
+      FROM liquidations
+      ORDER BY timestamp DESC
+      LIMIT $1
+    `, [limit]).catch(() => []);
+    
+    // Combine and sort by timestamp
+    const combined = [...trades, ...liquidations]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, limit);
+    
+    res.json({ data: combined });
+  } catch (error) {
+    console.error('Error fetching recent activity:', error);
+    res.status(500).json({ error: 'Failed to fetch recent activity' });
   }
 });
 
@@ -604,17 +701,24 @@ router.get('/stats', async (req: Request, res: Response) => {
       const statsRes = await fetch(`${BULK_API_BASE}/stats?period=all`);
       if (statsRes.ok) {
         const bulkStats = await statsRes.json() as BulkStatsResponse;
-        if (bulkStats?.markets) {
+        if (bulkStats?.markets && bulkStats.markets.length > 0) {
           for (const market of bulkStats.markets) {
             totalVolume += market.quoteVolume || 0;
           }
         }
-        if (bulkStats?.volume?.totalUsd) {
+        if (bulkStats?.volume?.totalUsd && bulkStats.volume.totalUsd > 0) {
           totalVolume = bulkStats.volume.totalUsd;
         }
       }
     } catch (e) {
       console.error('Failed to fetch BULK stats for volume:', e);
+    }
+    
+    // FALLBACK: If /stats returned 0, fetch from tickers
+    if (totalVolume === 0) {
+      console.log('⚠️ /stats returned 0 volume, falling back to tickers...');
+      const tickerStats = await fetchTickersForStats();
+      totalVolume = tickerStats.volume24h;
     }
 
     const [tradesResult, liqResult, tradersResult] = await Promise.all([
