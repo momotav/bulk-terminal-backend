@@ -30,13 +30,59 @@ interface BulkStatsResponse {
   timestamp?: number;
   volume?: { totalUsd?: number };
   openInterest?: { totalUsd?: number };
+  funding?: {
+    rates?: {
+      [symbol: string]: {
+        current?: number;
+        annualized?: number;
+      };
+    };
+  };
   markets?: Array<{
     symbol: string;
     quoteVolume?: number;
+    volume?: number;
     openInterest?: number;
     markPrice?: number;
     fundingRate?: number;
+    lastPrice?: number;
   }>;
+}
+
+// BULK API Kline response
+interface BulkKline {
+  t: number;    // Open time (timestamp ms)
+  T: number;    // Close time (timestamp ms)
+  o: number;    // Open price
+  h: number;    // High price
+  l: number;    // Low price
+  c: number;    // Close price
+  v: number;    // Volume (in base asset, e.g., BTC)
+  n: number;    // Number of trades
+}
+
+// Fetch klines from BULK API for a symbol
+async function fetchKlines(symbol: string, interval: string = '1h', limit: number = 100): Promise<BulkKline[]> {
+  try {
+    const url = `${BULK_API_BASE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const response = await fetch(url);
+    if (!response.ok) return [];
+    return await response.json() as BulkKline[];
+  } catch (error) {
+    console.error(`Failed to fetch klines for ${symbol}:`, error);
+    return [];
+  }
+}
+
+// Fetch klines for all markets and combine
+async function fetchAllKlines(interval: string = '1h', limit: number = 100): Promise<{ symbol: string; klines: BulkKline[] }[]> {
+  const results = await Promise.all(
+    MARKETS.map(async (symbol) => ({
+      symbol,
+      klines: await fetchKlines(symbol, interval, limit)
+    }))
+  );
+  return results;
 }
 
 // Helper: Fetch all tickers and sum volume/OI
@@ -770,6 +816,124 @@ router.get('/klines/:symbol', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error fetching klines:', error);
     res.status(500).json({ error: 'Failed to fetch klines' });
+  }
+});
+
+// ============ NEW: BULK API DIRECT ENDPOINTS ============
+
+// Volume chart from BULK API /klines (no PostgreSQL needed!)
+router.get('/volume-chart-bulk', async (req: Request, res: Response) => {
+  const interval = (req.query.interval as string) || '1h';
+  
+  try {
+    // Fetch klines for all markets
+    const allKlines = await fetchAllKlines(interval, 500);
+    
+    // Create a map of timestamp -> { total, BTC, ETH, SOL, ... }
+    const dataMap = new Map<number, { timestamp: string; total: number; BTC: number; ETH: number; SOL: number; XRP: number; GOLD: number }>();
+    
+    for (const { symbol, klines } of allKlines) {
+      for (const kline of klines) {
+        const timestamp = kline.t;
+        
+        if (!dataMap.has(timestamp)) {
+          dataMap.set(timestamp, {
+            timestamp: new Date(timestamp).toISOString(),
+            total: 0,
+            BTC: 0,
+            ETH: 0,
+            SOL: 0,
+            XRP: 0,
+            GOLD: 0
+          });
+        }
+        
+        const entry = dataMap.get(timestamp)!;
+        // Volume in quote (USD) = volume in base * close price
+        const volumeUsd = kline.v * kline.c;
+        
+        entry.total += volumeUsd;
+        
+        if (symbol === 'BTC-USD') entry.BTC = volumeUsd;
+        else if (symbol === 'ETH-USD') entry.ETH = volumeUsd;
+        else if (symbol === 'SOL-USD') entry.SOL = volumeUsd;
+        else if (symbol === 'XRP-USD') entry.XRP = volumeUsd;
+        else if (symbol === 'GOLD-USD') entry.GOLD = volumeUsd;
+      }
+    }
+    
+    // Sort by timestamp
+    const data = Array.from(dataMap.values()).sort((a, b) => 
+      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+    
+    res.json({ 
+      data,
+      source: 'bulk-api',
+      interval,
+      note: 'Data directly from BULK Exchange API /klines endpoint'
+    });
+  } catch (error) {
+    console.error('Error fetching volume chart from BULK API:', error);
+    res.status(500).json({ error: 'Failed to fetch volume chart' });
+  }
+});
+
+// OI & Funding from BULK API /stats (current snapshot only)
+router.get('/market-stats-bulk', async (req: Request, res: Response) => {
+  try {
+    const response = await fetch(`${BULK_API_BASE}/stats?period=1d`);
+    if (!response.ok) {
+      throw new Error(`BULK API returned ${response.status}`);
+    }
+    
+    const stats = await response.json() as BulkStatsResponse;
+    
+    // Format for frontend
+    const markets = (stats.markets || []).map(m => ({
+      symbol: m.symbol,
+      volume24h: m.quoteVolume || 0,
+      openInterest: (m.openInterest || 0) * (m.markPrice || m.lastPrice || 0),
+      openInterestCoins: m.openInterest || 0,
+      fundingRate: m.fundingRate || 0,
+      price: m.markPrice || m.lastPrice || 0
+    }));
+    
+    res.json({
+      timestamp: stats.timestamp,
+      totalVolume24h: stats.volume?.totalUsd || 0,
+      totalOpenInterest: stats.openInterest?.totalUsd || 0,
+      markets,
+      source: 'bulk-api'
+    });
+  } catch (error) {
+    console.error('Error fetching market stats from BULK API:', error);
+    res.status(500).json({ error: 'Failed to fetch market stats' });
+  }
+});
+
+// All tickers from BULK API
+router.get('/tickers-bulk', async (req: Request, res: Response) => {
+  try {
+    const tickers = await Promise.all(
+      MARKETS.map(async (symbol) => {
+        try {
+          const response = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
+          if (!response.ok) return null;
+          return await response.json() as BulkTicker;
+        } catch {
+          return null;
+        }
+      })
+    );
+    
+    res.json({
+      tickers: tickers.filter(t => t !== null),
+      source: 'bulk-api'
+    });
+  } catch (error) {
+    console.error('Error fetching tickers from BULK API:', error);
+    res.status(500).json({ error: 'Failed to fetch tickers' });
   }
 });
 
