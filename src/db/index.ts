@@ -30,16 +30,54 @@ export async function initializeDatabase(): Promise<void> {
   try {
     await client.query('BEGIN');
 
-    // Users table (for auth)
+    // Users table (for auth - supports both legacy email and Privy wallet auth)
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        password_hash VARCHAR(255) NOT NULL,
+        email VARCHAR(255) UNIQUE,
+        password_hash VARCHAR(255),
         username VARCHAR(50) UNIQUE,
+        wallet_address VARCHAR(64) UNIQUE,
+        privy_id VARCHAR(100) UNIQUE,
+        twitter_id VARCHAR(100),
+        twitter_handle VARCHAR(50),
+        twitter_name VARCHAR(100),
+        twitter_avatar TEXT,
+        display_name VARCHAR(100),
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
+    `);
+
+    // Add Privy columns if they don't exist (for existing databases)
+    await client.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='wallet_address') THEN
+          ALTER TABLE users ADD COLUMN wallet_address VARCHAR(64) UNIQUE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='privy_id') THEN
+          ALTER TABLE users ADD COLUMN privy_id VARCHAR(100) UNIQUE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='twitter_id') THEN
+          ALTER TABLE users ADD COLUMN twitter_id VARCHAR(100);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='twitter_handle') THEN
+          ALTER TABLE users ADD COLUMN twitter_handle VARCHAR(50);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='twitter_name') THEN
+          ALTER TABLE users ADD COLUMN twitter_name VARCHAR(100);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='twitter_avatar') THEN
+          ALTER TABLE users ADD COLUMN twitter_avatar TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='display_name') THEN
+          ALTER TABLE users ADD COLUMN display_name VARCHAR(100);
+        END IF;
+        -- Make email and password_hash nullable for Privy-only users
+        ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
+        ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+      END $$;
     `);
 
     // Traders table (tracked wallets)
@@ -177,7 +215,45 @@ export async function initializeDatabase(): Promise<void> {
       ON market_stats(symbol, timestamp DESC);
     `);
 
-    // Watchlist (users following wallets)
+    // Ticker snapshots (for OI/Funding charts - collected every minute by wsListener)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ticker_snapshots (
+        id SERIAL PRIMARY KEY,
+        symbol VARCHAR(20) NOT NULL,
+        open_interest_coins DECIMAL(20, 8),
+        open_interest_usd DECIMAL(20, 2),
+        funding_rate DECIMAL(20, 8),
+        mark_price DECIMAL(20, 2),
+        timestamp TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_ticker_snapshots_symbol_time 
+      ON ticker_snapshots(symbol, timestamp DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_ticker_snapshots_time 
+      ON ticker_snapshots(timestamp DESC);
+    `);
+
+    // Wallet follows (Privy auth - users following wallets)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS wallet_follows (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        followed_wallet VARCHAR(64) NOT NULL,
+        nickname VARCHAR(100),
+        created_at TIMESTAMP DEFAULT NOW(),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE(user_id, followed_wallet)
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_wallet_follows_user 
+      ON wallet_follows(user_id);
+      
+      CREATE INDEX IF NOT EXISTS idx_wallet_follows_wallet 
+      ON wallet_follows(followed_wallet);
+    `);
+
+    // Watchlist (legacy - users following wallets via email auth)
     await client.query(`
       CREATE TABLE IF NOT EXISTS watchlist (
         id SERIAL PRIMARY KEY,
