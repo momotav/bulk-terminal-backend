@@ -345,12 +345,118 @@ function processMessage(data: WebSocket.Data): void {
       return;
     }
     
-    // Log non-trade messages for debugging (limit to first 10)
-    if (stats.tradesReceived < 10) {
-      console.log(`📨 Raw message:`, JSON.stringify(message).slice(0, 500));
+    // Log all messages for first 20 to help debug format
+    if (stats.tradesReceived < 20) {
+      console.log(`📨 Raw message (type=${message.type}, topic=${message.topic}):`, JSON.stringify(message).slice(0, 800));
     }
 
-    // Handle BULK format: { type: 'trades', data: { trades: [...] } }
+    // Handle BULK trades format: { type: 'trades', topic: 'trades.BTC-USD', data: { trades: [...] } }
+    // OR: { type: 'trades', data: [...] } (array directly in data)
+    if (message.type === 'trades' || (message.topic && message.topic.startsWith('trades.'))) {
+      // Extract trades array - handle both formats
+      let trades: any[] = [];
+      
+      if (message.data?.trades && Array.isArray(message.data.trades)) {
+        trades = message.data.trades;
+      } else if (Array.isArray(message.data)) {
+        trades = message.data;
+      } else if (message.trades && Array.isArray(message.trades)) {
+        trades = message.trades;
+      } else if (message.data && typeof message.data === 'object' && !Array.isArray(message.data)) {
+        // Single trade object
+        trades = [message.data];
+      }
+      
+      // Get symbol from topic if not in trades
+      const topicSymbol = message.topic?.replace('trades.', '') || null;
+      
+      if (trades.length === 0) {
+        console.log(`⚠️ Trades message but no trades found:`, JSON.stringify(message).slice(0, 500));
+        return;
+      }
+      
+      console.log(`📊 Processing ${trades.length} trades from ${topicSymbol || 'unknown'}`);
+      
+      for (const trade of trades) {
+        // Skip if this is a resting order, not a fill
+        if (trade.status === 'resting' || trade.filledSize === 0) {
+          continue;
+        }
+        
+        // Extract data from BULK format
+        const symbol = trade.s || trade.symbol || topicSymbol || 'UNKNOWN';
+        const price = parseFloat(trade.px || trade.price || trade.p || 0);
+        const size = parseFloat(trade.sz || trade.size || trade.q || trade.qty || 0);
+        const time = trade.time || trade.T || trade.timestamp || Date.now();
+        
+        // Handle side - BULK might use boolean, string, or 'B'/'S'
+        let side = 'buy';
+        if (trade.side === false || trade.side === 'S' || trade.side === 'sell' || trade.side === 'short') {
+          side = 'sell';
+        }
+        
+        const maker = trade.maker || null;
+        const taker = trade.taker || null;
+        const walletAddress = taker || maker || null;
+        
+        // Check reason field (BULK API v1.0.12)
+        const reason = trade.reason || null;
+        
+        // Check for liquidation
+        const isLiquidation = reason === 'liquidation' || 
+                              trade.liquidation || trade.isLiquidation || 
+                              trade.orderType === 'liquidation' || 
+                              trade.type === 'liquidation' ||
+                              (trade.reduceOnly && trade.forcedLiquidation);
+        
+        // Check for ADL
+        const isADL = reason === 'adl' ||
+                      trade.adl || trade.isAdl || trade.isADL || 
+                      trade.orderType === 'adl' || trade.type === 'adl' ||
+                      trade.autoDeleverage || trade.auto_deleverage;
+        
+        if (price <= 0 || size <= 0) {
+          console.log(`⚠️ Invalid trade data: price=${price}, size=${size}`);
+          continue;
+        }
+        
+        if (isADL) {
+          console.log(`⚡ ADL detected: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
+          recordADL({
+            symbol,
+            price,
+            size,
+            side: side === 'buy' ? 'short' : 'long',
+            wallet: walletAddress,
+            counterparty: trade.counterparty || trade.reducer || (maker === walletAddress ? taker : maker),
+            time,
+          });
+        } else if (isLiquidation) {
+          console.log(`🔥 LIQUIDATION detected: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
+          recordLiquidation({
+            symbol,
+            price,
+            size,
+            side: side === 'buy' ? 'short' : 'long',
+            wallet: walletAddress,
+            time,
+          });
+        } else {
+          recordTrade({
+            symbol,
+            price,
+            size,
+            side,
+            maker,
+            taker: walletAddress,
+            time,
+          });
+        }
+      }
+      return;
+    }
+
+    // LEGACY: Handle BULK format: { type: 'trades', data: { trades: [...] } }
     if (message.type === 'trades' && message.data?.trades) {
       const trades = message.data.trades;
       
