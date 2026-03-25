@@ -81,7 +81,8 @@ router.get('/volume', async (req: Request, res: Response) => {
     const data = await withTimeout(leaderboardService.getTopVolume(timeframe, limit));
     res.json({ timeframe, data });
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Failed to fetch leaderboard' });
+    console.error('Leaderboard volume error:', error.message);
+    res.json({ timeframe: 'all', data: [], error: 'No volume data available yet' });
   }
 });
 
