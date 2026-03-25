@@ -8,11 +8,10 @@ export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
   // Connection pool settings
-  max: 10,                      // Maximum number of clients
-  idleTimeoutMillis: 30000,     // Close idle clients after 30 seconds
-  connectionTimeoutMillis: 5000, // Return error if can't connect in 5 seconds
-  query_timeout: 10000,         // Timeout queries after 10 seconds
-  statement_timeout: 10000,     // Statement timeout 10 seconds
+  max: 10,                       // Maximum number of clients
+  idleTimeoutMillis: 30000,      // Close idle clients after 30 seconds
+  connectionTimeoutMillis: 10000, // Return error if can't connect in 10 seconds
+  // NOTE: Don't set query_timeout here - it breaks CREATE INDEX on large tables
 });
 
 // Test connection
