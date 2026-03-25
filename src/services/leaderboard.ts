@@ -136,9 +136,11 @@ class LeaderboardService {
     
     // Known active wallets to seed data (can be expanded)
     const seedWallets = [
-      '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN', // @momotavrrr
+      '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN', // @momotavrrr - has SOL position
       '43FCw6GBmngMxPXSGXiAr1pQFyZ2D1BsAjYuim6W4pfE', // @quroolarc
       'BZSQTeUDnGX8CNNtgRPMQkL8GR1qLC95sJKwFLXG2kBV',
+      '6q3BqzWLn7NZrDa2CNEH7mKsZbYHqHUKSnNfn46zGLn6', // Active trader from fills
+      '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt', // Liquidation counterparty
     ];
     
     try {
@@ -156,28 +158,33 @@ class LeaderboardService {
         console.log('No wallets in traders table, using seed wallets');
       }
       
-      // If no wallets in DB, use seed wallets
-      if (wallets.length === 0) {
-        wallets = seedWallets;
-      }
+      // Always include seed wallets
+      const allWallets = [...new Set([...seedWallets, ...wallets])];
       
-      // Fetch current positions from BULK API for each wallet
+      // Fetch current positions from BULK API for each wallet using POST
       const results: LeaderboardEntry[] = [];
       
-      for (const wallet_address of wallets.slice(0, 20)) { // Limit API calls
+      for (const wallet_address of allWallets.slice(0, 30)) { // Limit API calls
         try {
           const controller = new AbortController();
           const timeoutId = setTimeout(() => controller.abort(), 3000);
           
-          const response = await fetch(`https://exchange-api.bulk.trade/api/v1/account/${wallet_address}`, {
+          // Use POST request with { type: 'fullAccount', user: wallet }
+          const response = await fetch('https://exchange-api.bulk.trade/api/v1/account', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'fullAccount', user: wallet_address }),
             signal: controller.signal
           });
           clearTimeout(timeoutId);
           
           if (!response.ok) continue;
           
-          const account = await response.json() as any;
-          if (!account?.positions || account.positions.length === 0) continue;
+          const data = await response.json() as any[];
+          if (!data || !data[0]?.fullAccount) continue;
+          
+          const account = data[0].fullAccount;
+          if (!account.positions || account.positions.length === 0) continue;
           
           // Calculate total notional
           let totalNotional = 0;
@@ -195,6 +202,7 @@ class LeaderboardService {
           }
         } catch (e) {
           // Skip failed wallet
+          console.log(`Failed to fetch wallet ${wallet_address.slice(0,8)}...`);
         }
       }
       
