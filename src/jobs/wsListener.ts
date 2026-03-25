@@ -134,6 +134,19 @@ function stopTickerSnapshots(): void {
   }
 }
 
+// Start ticker polling via REST API (primary mode when WebSocket is unstable)
+function startTickerPolling(): void {
+  console.log('📊 Starting REST API ticker polling (every 30 seconds)');
+  
+  // Take initial snapshot immediately
+  snapshotTickersFallback();
+  
+  // Poll every 30 seconds (more frequent than fallback since it's primary)
+  if (!tickerSnapshotInterval) {
+    tickerSnapshotInterval = setInterval(snapshotTickersFallback, 30 * 1000);
+  }
+}
+
 // Fetch wallet PnL from BULK API and store it
 async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
   // Check cache to avoid spamming API
@@ -905,43 +918,52 @@ function connect(): void {
       // All available BULK markets
       const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
       
+      // Try multiple subscription formats to find what works
+      console.log('🧪 Testing WebSocket subscription formats...');
+      
+      // Start REST API polling as backup
+      startTickerPolling();
+      
       try {
-        // BULK API now uses Hyperliquid-style format:
-        // { "method": "subscribe", "subscription": { "type": "trades", "coin": "BTC" } }
-        // One subscription per message, use "coin" instead of "symbol"
+        // Format 1: Original array format with symbol
+        ws?.send(JSON.stringify({
+          method: 'subscribe',
+          subscription: symbols.map(symbol => ({ type: 'trades', symbol }))
+        }));
+        console.log('📡 Sent format 1: array with symbol field');
         
-        // Subscribe to TRADES for all symbols
-        for (const symbol of symbols) {
-          const coin = symbol.replace('-USD', ''); // BTC-USD -> BTC
+        // Wait a bit between attempts
+        await new Promise(r => setTimeout(r, 500));
+        
+        // Format 2: Single object per symbol (Hyperliquid style)
+        for (const symbol of symbols.slice(0, 1)) { // Just try BTC first
+          ws?.send(JSON.stringify({
+            method: 'subscribe',
+            subscription: { type: 'trades', symbol }
+          }));
+        }
+        console.log('📡 Sent format 2: single object with symbol');
+        
+        await new Promise(r => setTimeout(r, 500));
+        
+        // Format 3: With coin instead of symbol
+        for (const symbol of symbols.slice(0, 1)) {
+          const coin = symbol.replace('-USD', '');
           ws?.send(JSON.stringify({
             method: 'subscribe',
             subscription: { type: 'trades', coin }
           }));
         }
-        console.log('📡 Subscribed to TRADES:', symbols.join(', '));
+        console.log('📡 Sent format 3: single object with coin');
         
-        // Subscribe to TICKER (allMids gives all prices at once)
+        await new Promise(r => setTimeout(r, 500));
+        
+        // Format 4: Array with coin
         ws?.send(JSON.stringify({
           method: 'subscribe',
-          subscription: { type: 'allMids' }
+          subscription: symbols.map(s => ({ type: 'trades', coin: s.replace('-USD', '') }))
         }));
-        console.log('📡 Subscribed to allMids (all prices)');
-        
-        // Also try individual ticker subscriptions
-        for (const symbol of symbols) {
-          const coin = symbol.replace('-USD', '');
-          ws?.send(JSON.stringify({
-            method: 'subscribe',
-            subscription: { type: 'ticker', coin }
-          }));
-        }
-        console.log('📡 Subscribed to TICKER:', symbols.join(', '));
-        console.log('📡 (OI & Funding updates now come via WebSocket in real-time!)');
-        
-        // Subscribe to tracked wallets' account channels for additional liquidation events
-        setTimeout(() => {
-          subscribeToTrackedWallets();
-        }, 2000);
+        console.log('📡 Sent format 4: array with coin field');
         
       } catch (e) {
         console.error('Failed to subscribe:', e);
@@ -997,33 +1019,21 @@ const subscribedWallets = new Set<string>();
 
 // Subscribe to a wallet's account channel to receive liquidation events
 export function subscribeToWalletAccount(walletAddress: string): void {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    console.log(`⚠️ Cannot subscribe to ${walletAddress.slice(0,8)}... - WebSocket not connected`);
-    return;
-  }
+  // TODO: BULK API changed - need to figure out correct format for account subscriptions
+  // The "user" field error suggests account subscriptions need different format
+  // Disabling for now to prevent WebSocket errors
   
-  if (subscribedWallets.has(walletAddress)) {
-    return; // Already subscribed
-  }
+  // if (!ws || ws.readyState !== WebSocket.OPEN) {
+  //   console.log(`⚠️ Cannot subscribe to ${walletAddress.slice(0,8)}... - WebSocket not connected`);
+  //   return;
+  // }
   
-  try {
-    // BULK API now uses Hyperliquid-style format with "user" field for account subscriptions
-    ws.send(JSON.stringify({
-      method: 'subscribe',
-      subscription: { type: 'userEvents', user: walletAddress }
-    }));
-    
-    // Also try userFills format
-    ws.send(JSON.stringify({
-      method: 'subscribe',
-      subscription: { type: 'userFills', user: walletAddress }
-    }));
-    
-    subscribedWallets.add(walletAddress);
-    console.log(`📡 Subscribed to account channel: ${walletAddress.slice(0,8)}...`);
-  } catch (e) {
-    console.error(`Failed to subscribe to wallet ${walletAddress}:`, e);
-  }
+  // if (subscribedWallets.has(walletAddress)) {
+  //   return; // Already subscribed
+  // }
+  
+  // subscribedWallets.add(walletAddress);
+  // console.log(`📡 Subscribed to account channel: ${walletAddress.slice(0,8)}...`);
 }
 
 // Subscribe to all tracked wallets on connection
