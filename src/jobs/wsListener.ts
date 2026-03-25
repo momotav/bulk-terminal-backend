@@ -219,10 +219,10 @@ async function recordTrade(trade: {
   const walletAddress = trade.taker || trade.maker || null;
   
   try {
-    // Insert trade
+    // Insert trade with explicit type casts
     await query(
       `INSERT INTO trades (wallet_address, symbol, side, size, price, value, timestamp)
-       VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0))`,
+       VALUES ($1::varchar, $2::varchar, $3::varchar, $4, $5, $6, to_timestamp($7/1000.0))`,
       [walletAddress, trade.symbol, trade.side, Math.abs(trade.size), trade.price, value, trade.time]
     );
 
@@ -230,7 +230,7 @@ async function recordTrade(trade: {
     if (walletAddress) {
       await query(
         `INSERT INTO traders (wallet_address, total_trades, total_volume, last_seen)
-         VALUES ($1, 1, $2, NOW())
+         VALUES ($1::varchar, 1, $2, NOW())
          ON CONFLICT (wallet_address) DO UPDATE SET
            total_trades = traders.total_trades + 1,
            total_volume = traders.total_volume + $2,
@@ -238,12 +238,12 @@ async function recordTrade(trade: {
         [walletAddress, value]
       );
       
-      // Create notifications for users following this wallet
+      // Create notifications for users following this wallet (use separate params to avoid type confusion)
       await query(
         `INSERT INTO notifications (user_id, wallet_address, type, symbol, side, size, price, value)
-         SELECT user_id, $1, 'trade', $2, $3, $4, $5, $6
-         FROM watchlist WHERE wallet_address = $1`,
-        [walletAddress, trade.symbol, trade.side, Math.abs(trade.size), trade.price, value]
+         SELECT user_id, $1::varchar, 'trade', $2::varchar, $3::varchar, $4, $5, $6
+         FROM watchlist WHERE wallet_address = $7::varchar`,
+        [walletAddress, trade.symbol, trade.side, Math.abs(trade.size), trade.price, value, walletAddress]
       );
       
       // Fetch full wallet PnL from BULK API (async, don't wait)
@@ -278,7 +278,7 @@ async function recordLiquidation(liq: {
     // Insert liquidation
     await query(
       `INSERT INTO liquidations (wallet_address, symbol, side, size, price, value, timestamp)
-       VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0))
+       VALUES ($1::varchar, $2::varchar, $3::varchar, $4, $5, $6, to_timestamp($7/1000.0))
        ON CONFLICT DO NOTHING`,
       [walletAddress, liq.symbol, liq.side, Math.abs(liq.size), liq.price, value, liq.time]
     );
@@ -287,7 +287,7 @@ async function recordLiquidation(liq: {
     if (walletAddress) {
       await query(
         `INSERT INTO traders (wallet_address, total_liquidations, liquidation_value, last_seen)
-         VALUES ($1, 1, $2, NOW())
+         VALUES ($1::varchar, 1, $2, NOW())
          ON CONFLICT (wallet_address) DO UPDATE SET
            total_liquidations = traders.total_liquidations + 1,
            liquidation_value = traders.liquidation_value + $2,
@@ -295,12 +295,12 @@ async function recordLiquidation(liq: {
         [walletAddress, value]
       );
       
-      // Create notifications for users following this wallet
+      // Create notifications for users following this wallet (use separate params)
       await query(
         `INSERT INTO notifications (user_id, wallet_address, type, symbol, side, size, price, value)
-         SELECT user_id, $1, 'liquidation', $2, $3, $4, $5, $6
-         FROM watchlist WHERE wallet_address = $1`,
-        [walletAddress, liq.symbol, liq.side, Math.abs(liq.size), liq.price, value]
+         SELECT user_id, $1::varchar, 'liquidation', $2::varchar, $3::varchar, $4, $5, $6
+         FROM watchlist WHERE wallet_address = $7::varchar`,
+        [walletAddress, liq.symbol, liq.side, Math.abs(liq.size), liq.price, value, walletAddress]
       );
       
       // Auto-track liquidated wallets
@@ -334,7 +334,7 @@ async function recordADL(adl: {
     // Insert ADL event
     await query(
       `INSERT INTO adl_events (wallet_address, counterparty, symbol, side, size, price, value, timestamp)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, to_timestamp($8/1000.0))
+       VALUES ($1::varchar, $2::varchar, $3::varchar, $4::varchar, $5, $6, $7, to_timestamp($8/1000.0))
        ON CONFLICT DO NOTHING`,
       [walletAddress, counterparty, adl.symbol, adl.side, Math.abs(adl.size), adl.price, value, adl.time]
     );
@@ -343,7 +343,7 @@ async function recordADL(adl: {
     if (walletAddress) {
       await query(
         `INSERT INTO traders (wallet_address, total_adl, adl_value, last_seen)
-         VALUES ($1, 1, $2, NOW())
+         VALUES ($1::varchar, 1, $2, NOW())
          ON CONFLICT (wallet_address) DO UPDATE SET
            total_adl = COALESCE(traders.total_adl, 0) + 1,
            adl_value = COALESCE(traders.adl_value, 0) + $2,
@@ -351,12 +351,12 @@ async function recordADL(adl: {
         [walletAddress, value]
       );
       
-      // Create notifications for users following this wallet
+      // Create notifications for users following this wallet (use separate params)
       await query(
         `INSERT INTO notifications (user_id, wallet_address, type, symbol, side, size, price, value)
-         SELECT user_id, $1, 'adl', $2, $3, $4, $5, $6
-         FROM watchlist WHERE wallet_address = $1`,
-        [walletAddress, adl.symbol, adl.side, Math.abs(adl.size), adl.price, value]
+         SELECT user_id, $1::varchar, 'adl', $2::varchar, $3::varchar, $4, $5, $6
+         FROM watchlist WHERE wallet_address = $7::varchar`,
+        [walletAddress, adl.symbol, adl.side, Math.abs(adl.size), adl.price, value, walletAddress]
       );
     }
 
