@@ -177,6 +177,14 @@ export async function initializeDatabase(): Promise<void> {
       
       CREATE INDEX IF NOT EXISTS idx_trades_symbol 
       ON trades(symbol);
+      
+      -- Composite index for time-based wallet aggregations (FAST leaderboards)
+      CREATE INDEX IF NOT EXISTS idx_trades_wallet_time 
+      ON trades(wallet_address, timestamp DESC);
+      
+      -- Composite index for symbol + time queries
+      CREATE INDEX IF NOT EXISTS idx_trades_symbol_time 
+      ON trades(symbol, timestamp DESC);
     `);
 
     // ADL (Auto-Deleveraging) events table
