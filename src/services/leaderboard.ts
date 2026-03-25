@@ -211,23 +211,9 @@ class LeaderboardService {
     const timeFilter = this.getTimeFilter(timeframe);
     const excludeFilter = this.getExcludedFilter();
     
-    if (timeframe === 'all') {
-      const rows = await query<{ wallet_address: string; total_volume: number; total_trades: number }>(
-        `SELECT wallet_address, total_volume as value, total_trades as trades
-         FROM traders
-         WHERE total_volume > 0 ${excludeFilter}
-         ORDER BY total_volume DESC
-         LIMIT $1`,
-        [limit]
-      );
-      
-      return rows.map((row, index) => ({
-        rank: index + 1,
-        wallet_address: row.wallet_address,
-        value: parseFloat(row.total_volume as any) || 0,
-        trades: row.total_trades,
-      }));
-    }
+    // Always calculate from trades table for accuracy
+    // The traders.total_volume may be stale or 0 from before fixes
+    const timeCondition = timeframe === 'all' ? '' : timeFilter;
     
     const rows = await query<{ wallet_address: string; total_volume: number; trade_count: number }>(
       `SELECT 
@@ -235,7 +221,7 @@ class LeaderboardService {
         SUM(value) as total_volume,
         COUNT(*) as trade_count
        FROM trades
-       WHERE wallet_address IS NOT NULL ${timeFilter} ${excludeFilter}
+       WHERE wallet_address IS NOT NULL ${timeCondition} ${excludeFilter}
        GROUP BY wallet_address
        ORDER BY total_volume DESC
        LIMIT $1`,
