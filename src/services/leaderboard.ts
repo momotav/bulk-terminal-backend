@@ -318,48 +318,20 @@ class LeaderboardService {
 
   // Top Volume Traders - fetch from BULK API fills for seed wallets
   async getTopVolume(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
-    const excludeFilter = this.getExcludedFilter();
+    // Skip database query - it's slow/empty. Go straight to BULK API.
     
-    // First try database
-    try {
-      const rows = await query<{ wallet_address: string; total_volume: number; trade_count: number }>(
-        `SELECT 
-          wallet_address,
-          SUM(value) as total_volume,
-          COUNT(*) as trade_count
-         FROM trades
-         WHERE wallet_address IS NOT NULL ${excludeFilter}
-         GROUP BY wallet_address
-         HAVING SUM(value) > 0
-         ORDER BY total_volume DESC
-         LIMIT $1`,
-        [limit]
-      );
-      
-      if (rows.length > 0) {
-        return rows.map((row, index) => ({
-          rank: index + 1,
-          wallet_address: row.wallet_address,
-          value: parseFloat(row.total_volume as any) || 0,
-          trades: parseInt(row.trade_count as any) || 0,
-        }));
-      }
-    } catch (e) {
-      console.log('No volume data in trades table');
-    }
-    
-    // Fallback: Fetch fills from BULK API for seed wallets IN PARALLEL
+    // Fetch fills from BULK API for seed wallets IN PARALLEL
     const seedWallets = [
       '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN',
       '6q3BqzWLn7NZrDa2CNEH7mKsZbYHqHUKSnNfn46zGLn6',
       '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt',
     ];
     
-    // Fetch all wallets in parallel with 2 second timeout
+    // Fetch all wallets in parallel with 3 second timeout
     const fetchWalletVolume = async (wallet: string): Promise<LeaderboardEntry | null> => {
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 2000);
+        const timeoutId = setTimeout(() => controller.abort(), 3000);
         
         const response = await fetch('https://exchange-api.bulk.trade/api/v1/account', {
           method: 'POST',
@@ -393,6 +365,7 @@ class LeaderboardService {
         }
         return null;
       } catch (e) {
+        console.log(`Volume fetch failed for ${wallet.slice(0,8)}:`, e);
         return null;
       }
     };
