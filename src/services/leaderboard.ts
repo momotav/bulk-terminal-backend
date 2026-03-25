@@ -16,6 +16,21 @@ const EXCLUDED_WALLETS = [
   '7DHvrCZMMLZ2ovNfKaGpvJZXAQyydbTz6dM7w7qXtzX5', // BULK MM
 ];
 
+// Simple in-memory cache
+const cache: Map<string, { data: any; expiry: number }> = new Map();
+
+function getCached<T>(key: string): T | null {
+  const cached = cache.get(key);
+  if (cached && cached.expiry > Date.now()) {
+    return cached.data as T;
+  }
+  return null;
+}
+
+function setCache(key: string, data: any, ttlSeconds: number = 60): void {
+  cache.set(key, { data, expiry: Date.now() + ttlSeconds * 1000 });
+}
+
 class LeaderboardService {
   // Get timeframe filter for SQL
   private getTimeFilter(timeframe: TimeFrame): string {
@@ -41,49 +56,64 @@ class LeaderboardService {
 
   // Top Traders by PnL
   async getTopTradersByPnL(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
+    const cacheKey = `pnl_${timeframe}_${limit}`;
+    const cached = getCached<LeaderboardEntry[]>(cacheKey);
+    if (cached) return cached;
+    
     const timeFilter = this.getTimeFilter(timeframe);
     const excludeFilter = this.getExcludedFilter();
     
-    // If timeframe is 'all', use aggregated data from traders table
-    if (timeframe === 'all') {
-      const rows = await query<{ wallet_address: string; value: number; trades: number }>(
-        `SELECT wallet_address, total_pnl as value, total_trades as trades
-         FROM traders
-         WHERE total_pnl != 0 ${excludeFilter}
-         ORDER BY total_pnl DESC
-         LIMIT $1`,
-        [limit]
+    try {
+      // If timeframe is 'all', use aggregated data from traders table
+      if (timeframe === 'all') {
+        const rows = await query<{ wallet_address: string; value: number; trades: number }>(
+          `SELECT wallet_address, total_pnl as value, total_trades as trades
+           FROM traders
+           WHERE total_pnl != 0 ${excludeFilter}
+           ORDER BY total_pnl DESC
+           LIMIT $1`,
+          [limit]
+        );
+        
+        const result = rows.map((row, index) => ({
+          rank: index + 1,
+          wallet_address: row.wallet_address,
+          value: parseFloat(row.value as any) || 0,
+          trades: row.trades,
+        }));
+        
+        setCache(cacheKey, result, 30);
+        return result;
+      }
+      
+      // For time-based, use latest snapshot for each wallet
+      const rows = await query<{ wallet_address: string; pnl: number }>(
+        `SELECT DISTINCT ON (wallet_address)
+          wallet_address,
+          pnl + unrealized_pnl as pnl
+         FROM trader_snapshots
+         WHERE 1=1 ${timeFilter} ${excludeFilter}
+         ORDER BY wallet_address, timestamp DESC`,
+        []
       );
       
-      return rows.map((row, index) => ({
+      // Sort by PnL and limit
+      const sorted = rows
+        .sort((a, b) => (parseFloat(b.pnl as any) || 0) - (parseFloat(a.pnl as any) || 0))
+        .slice(0, limit);
+      
+      const result = sorted.map((row, index) => ({
         rank: index + 1,
         wallet_address: row.wallet_address,
-        value: parseFloat(row.value as any) || 0,
-        trades: row.trades,
+        value: parseFloat(row.pnl as any) || 0,
       }));
+      
+      setCache(cacheKey, result, 30);
+      return result;
+    } catch (e) {
+      console.error('getTopTradersByPnL error:', e);
+      return [];
     }
-    
-    // For time-based, use latest snapshot for each wallet
-    const rows = await query<{ wallet_address: string; pnl: number }>(
-      `SELECT DISTINCT ON (wallet_address)
-        wallet_address,
-        pnl + unrealized_pnl as pnl
-       FROM trader_snapshots
-       WHERE 1=1 ${timeFilter} ${excludeFilter}
-       ORDER BY wallet_address, timestamp DESC`,
-      []
-    );
-    
-    // Sort by PnL and limit
-    const sorted = rows
-      .sort((a, b) => (parseFloat(b.pnl as any) || 0) - (parseFloat(a.pnl as any) || 0))
-      .slice(0, limit);
-    
-    return sorted.map((row, index) => ({
-      rank: index + 1,
-      wallet_address: row.wallet_address,
-      value: parseFloat(row.pnl as any) || 0,
-    }));
   }
 
   // Most Liquidated (Hall of Shame)
@@ -130,46 +160,45 @@ class LeaderboardService {
     }));
   }
 
-  // Biggest Positions (Whale Watch) - fetch from BULK API directly
+  // Biggest Positions (Whale Watch) - fetch from BULK API directly with caching
   async getBiggestPositions(limit: number = 50): Promise<LeaderboardEntry[]> {
+    const cacheKey = `whales_${limit}`;
+    const cached = getCached<LeaderboardEntry[]>(cacheKey);
+    if (cached) return cached;
+    
     const excludeFilter = this.getExcludedFilter();
     
-    // Known active wallets to seed data (can be expanded)
+    // Known active wallets to seed data
     const seedWallets = [
-      '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN', // @momotavrrr - has SOL position
-      '43FCw6GBmngMxPXSGXiAr1pQFyZ2D1BsAjYuim6W4pfE', // @quroolarc
-      'BZSQTeUDnGX8CNNtgRPMQkL8GR1qLC95sJKwFLXG2kBV',
-      '6q3BqzWLn7NZrDa2CNEH7mKsZbYHqHUKSnNfn46zGLn6', // Active trader from fills
-      '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt', // Liquidation counterparty
+      '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN',
+      '6q3BqzWLn7NZrDa2CNEH7mKsZbYHqHUKSnNfn46zGLn6',
+      '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt',
     ];
     
     try {
-      // Get wallets from our traders table
+      // Get recent wallets from traders table
       let wallets: string[] = [];
       try {
         const dbWallets = await query<{ wallet_address: string }>(
           `SELECT wallet_address FROM traders 
            WHERE wallet_address IS NOT NULL ${excludeFilter}
            ORDER BY last_seen DESC 
-           LIMIT 100`
+           LIMIT 50`
         );
         wallets = dbWallets.map(w => w.wallet_address);
       } catch (e) {
-        console.log('No wallets in traders table, using seed wallets');
+        console.log('Using seed wallets only');
       }
       
-      // Always include seed wallets
-      const allWallets = [...new Set([...seedWallets, ...wallets])];
+      // Combine and dedupe, limit to 20 for speed
+      const allWallets = [...new Set([...seedWallets, ...wallets])].slice(0, 20);
       
-      // Fetch current positions from BULK API for each wallet using POST
-      const results: LeaderboardEntry[] = [];
-      
-      for (const wallet_address of allWallets.slice(0, 30)) { // Limit API calls
+      // Fetch ALL wallets in PARALLEL (much faster!)
+      const fetchWallet = async (wallet_address: string): Promise<LeaderboardEntry | null> => {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 3000);
+          const timeoutId = setTimeout(() => controller.abort(), 2000);
           
-          // Use POST request with { type: 'fullAccount', user: wallet }
           const response = await fetch('https://exchange-api.bulk.trade/api/v1/account', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -178,37 +207,44 @@ class LeaderboardService {
           });
           clearTimeout(timeoutId);
           
-          if (!response.ok) continue;
+          if (!response.ok) return null;
           
           const data = await response.json() as any[];
-          if (!data || !data[0]?.fullAccount) continue;
+          if (!data || !data[0]?.fullAccount) return null;
           
           const account = data[0].fullAccount;
-          if (!account.positions || account.positions.length === 0) continue;
+          if (!account.positions || account.positions.length === 0) return null;
           
-          // Calculate total notional
           let totalNotional = 0;
           for (const pos of account.positions) {
             totalNotional += Math.abs(pos.notional || 0);
           }
           
           if (totalNotional > 0) {
-            results.push({
+            return {
               rank: 0,
               wallet_address,
               value: totalNotional,
               positions: account.positions.length
-            });
+            };
           }
+          return null;
         } catch (e) {
-          // Skip failed wallet
-          console.log(`Failed to fetch wallet ${wallet_address.slice(0,8)}...`);
+          return null;
         }
-      }
+      };
+      
+      // Parallel fetch
+      const results = await Promise.all(allWallets.map(fetchWallet));
+      const validResults = results.filter((r): r is LeaderboardEntry => r !== null);
       
       // Sort by value and assign ranks
-      results.sort((a, b) => b.value - a.value);
-      return results.slice(0, limit).map((r, i) => ({ ...r, rank: i + 1 }));
+      validResults.sort((a, b) => b.value - a.value);
+      const finalResults = validResults.slice(0, limit).map((r, i) => ({ ...r, rank: i + 1 }));
+      
+      // Cache for 60 seconds
+      setCache(cacheKey, finalResults, 60);
+      return finalResults;
       
     } catch (error) {
       console.error('getBiggestPositions error:', error);
@@ -216,62 +252,67 @@ class LeaderboardService {
     }
   }
 
-  // Most Active Traders
   async getMostActive(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
-    const timeFilter = timeframe === 'all' ? '' : this.getTimeFilter(timeframe);
+    const cacheKey = `active_${timeframe}_${limit}`;
+    const cached = getCached<LeaderboardEntry[]>(cacheKey);
+    if (cached) return cached;
+    
     const excludeFilter = this.getExcludedFilter();
     
     try {
-      const rows = await query<{ wallet_address: string; trade_count: number; total_value: number }>(
-        `SELECT 
-          COALESCE(wallet_address, 'unknown') as wallet_address,
-          COUNT(*) as trade_count,
-          SUM(value) as total_value
-         FROM trades
-         WHERE 1=1 ${timeFilter} ${excludeFilter}
-         GROUP BY wallet_address
-         ORDER BY trade_count DESC
+      // Use pre-aggregated traders table - FAST!
+      const rows = await query<{ wallet_address: string; total_trades: number; total_volume: number }>(
+        `SELECT wallet_address, total_trades, total_volume
+         FROM traders
+         WHERE total_trades > 0 ${excludeFilter}
+         ORDER BY total_trades DESC
          LIMIT $1`,
         [limit]
       );
       
-      return rows.map((row, index) => ({
+      const result = rows.map((row, index) => ({
         rank: index + 1,
         wallet_address: row.wallet_address,
-        value: parseFloat(row.total_value as any) || 0,
-        trades: parseInt(row.trade_count as any) || 0,
+        value: parseFloat(row.total_volume as any) || 0,
+        trades: parseInt(row.total_trades as any) || 0,
       }));
+      
+      setCache(cacheKey, result, 30);
+      return result;
     } catch (e) {
       console.error('getMostActive error:', e);
       return [];
     }
   }
 
-  // Top Volume Traders - query from trades table
+  // Top Volume Traders - use pre-aggregated traders table
   async getTopVolume(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
-    const timeFilter = timeframe === 'all' ? '' : this.getTimeFilter(timeframe);
+    const cacheKey = `volume_${timeframe}_${limit}`;
+    const cached = getCached<LeaderboardEntry[]>(cacheKey);
+    if (cached) return cached;
+    
     const excludeFilter = this.getExcludedFilter();
     
     try {
-      const rows = await query<{ wallet_address: string; total_volume: number; trade_count: number }>(
-        `SELECT 
-          wallet_address,
-          SUM(value) as total_volume,
-          COUNT(*) as trade_count
-         FROM trades
-         WHERE wallet_address IS NOT NULL ${timeFilter} ${excludeFilter}
-         GROUP BY wallet_address
+      // Use pre-aggregated traders table - FAST!
+      const rows = await query<{ wallet_address: string; total_volume: number; total_trades: number }>(
+        `SELECT wallet_address, total_volume, total_trades
+         FROM traders
+         WHERE total_volume > 0 ${excludeFilter}
          ORDER BY total_volume DESC
          LIMIT $1`,
         [limit]
       );
       
-      return rows.map((row, index) => ({
+      const result = rows.map((row, index) => ({
         rank: index + 1,
         wallet_address: row.wallet_address,
         value: parseFloat(row.total_volume as any) || 0,
-        trades: parseInt(row.trade_count as any) || 0,
+        trades: parseInt(row.total_trades as any) || 0,
       }));
+      
+      setCache(cacheKey, result, 30);
+      return result;
     } catch (e) {
       console.error('getTopVolume error:', e);
       return [];
