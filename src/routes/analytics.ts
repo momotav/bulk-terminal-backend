@@ -827,6 +827,31 @@ router.get('/stats', async (req: Request, res: Response) => {
   }
 });
 
+// DEBUG: Check trades table data
+router.get('/debug/trades', async (req: Request, res: Response) => {
+  try {
+    const [countResult, sampleResult, volumeResult] = await Promise.all([
+      query(`SELECT COUNT(*) as count FROM trades`),
+      query(`SELECT wallet_address, symbol, side, size, price, value, timestamp FROM trades ORDER BY timestamp DESC LIMIT 5`),
+      query(`SELECT 
+        COUNT(*) as total_trades,
+        SUM(value) as total_volume,
+        COUNT(DISTINCT wallet_address) as unique_wallets,
+        MIN(timestamp) as oldest_trade,
+        MAX(timestamp) as newest_trade
+      FROM trades WHERE value > 0`)
+    ]);
+    
+    res.json({
+      totalCount: countResult[0]?.count,
+      sampleTrades: sampleResult,
+      volumeStats: volumeResult[0]
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ============ KLINES PROXY ============
 
 router.get('/klines/:symbol', async (req: Request, res: Response) => {
