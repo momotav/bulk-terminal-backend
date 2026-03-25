@@ -161,8 +161,29 @@ class LeaderboardService {
 
   // Most Active Traders
   async getMostActive(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
-    const timeFilter = timeframe === 'all' ? '' : this.getTimeFilter(timeframe);
     const excludeFilter = this.getExcludedFilter();
+    
+    // For 'all' timeframe, use pre-aggregated data from traders table (FAST!)
+    if (timeframe === 'all') {
+      const rows = await query<{ wallet_address: string; total_trades: number; total_volume: number }>(
+        `SELECT wallet_address, total_trades as trade_count, total_volume as total_value
+         FROM traders
+         WHERE total_trades > 0 ${excludeFilter}
+         ORDER BY total_trades DESC
+         LIMIT $1`,
+        [limit]
+      );
+      
+      return rows.map((row, index) => ({
+        rank: index + 1,
+        wallet_address: row.wallet_address,
+        value: parseFloat(row.total_volume as any) || 0,
+        trades: parseInt(row.total_trades as any) || 0,
+      }));
+    }
+    
+    // For time-based queries, use trades table with time filter
+    const timeFilter = this.getTimeFilter(timeframe);
     
     const rows = await query<{ wallet_address: string; trade_count: number; total_value: number }>(
       `SELECT 
