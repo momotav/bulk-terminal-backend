@@ -9,6 +9,22 @@ const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 // All supported markets
 const MARKETS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
 
+// ============ SIMPLE IN-MEMORY CACHE ============
+const analyticsCache: Map<string, { data: any; expiry: number }> = new Map();
+
+function getCached<T>(key: string): T | null {
+  const cached = analyticsCache.get(key);
+  if (cached && cached.expiry > Date.now()) {
+    return cached.data as T;
+  }
+  return null;
+}
+
+function setCache(key: string, data: any, ttlSeconds: number = 60): void {
+  analyticsCache.set(key, { data, expiry: Date.now() + ttlSeconds * 1000 });
+}
+// ============ END CACHE ============
+
 // Type for BULK ticker response
 interface BulkTicker {
   symbol: string;
@@ -136,6 +152,14 @@ router.get('/ticker/:symbol', async (req: Request, res: Response) => {
 
 // Get exchange stats - transforms BULK API data for dashboard
 router.get('/exchange-stats', async (req: Request, res: Response) => {
+  const cacheKey = 'exchange_stats';
+  
+  // Check cache first (cache for 30 seconds)
+  const cached = getCached<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
   try {
     let totalVolume24h = 0;
     let totalOpenInterest = 0;
@@ -234,13 +258,18 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       liquidations24h = 0;
     }
     
-    res.json({
+    const result = {
       timestamp,
       volume24h: totalVolume24h,
       openInterest: totalOpenInterest,
       activeTraders,
       liquidations24h,
-    });
+    };
+    
+    // Cache for 30 seconds
+    setCache(cacheKey, result, 30);
+    
+    res.json(result);
   } catch (error) {
     console.error('Error fetching exchange stats:', error);
     res.status(500).json({ error: 'Failed to fetch exchange stats' });
@@ -559,6 +588,13 @@ router.get('/funding-rate-history/:symbol', async (req: Request, res: Response) 
 // Combined OI chart data for all symbols
 router.get('/oi-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
+  const cacheKey = `oi_chart_${hours}`;
+  
+  // Check cache first
+  const cached = getCached<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
   
   try {
     const result = await Promise.race([
@@ -595,7 +631,12 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
       total: values.BTC + values.ETH + values.SOL
     }));
     
-    res.json({ hours, dataPoints: data.length, data });
+    const response = { hours, dataPoints: data.length, data };
+    
+    // Cache for 60 seconds
+    setCache(cacheKey, response, 60);
+    
+    res.json(response);
   } catch (error) {
     console.error('Error fetching OI chart:', error);
     res.json({ hours, dataPoints: 0, data: [], error: 'No OI data available yet' });
@@ -605,6 +646,13 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
 // Combined Funding Rate chart data for all symbols
 router.get('/funding-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
+  const cacheKey = `funding_chart_${hours}`;
+  
+  // Check cache first
+  const cached = getCached<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
   
   try {
     const result = await Promise.race([
@@ -639,7 +687,12 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
       ...values
     }));
     
-    res.json({ hours, dataPoints: data.length, data });
+    const response = { hours, dataPoints: data.length, data };
+    
+    // Cache for 60 seconds
+    setCache(cacheKey, response, 60);
+    
+    res.json(response);
   } catch (error) {
     console.error('Error fetching funding chart:', error);
     res.json({ hours, dataPoints: 0, data: [], error: 'No funding data available yet' });
@@ -700,6 +753,13 @@ router.get('/volume-chart', async (req: Request, res: Response) => {
 // Get trades chart data from database
 router.get('/trades-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
+  const cacheKey = `trades_chart_${hours}`;
+  
+  // Check cache first
+  const cached = getCached<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
   
   try {
     // Use Promise.race with timeout to prevent hanging
@@ -715,11 +775,16 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
         GROUP BY date_trunc('day', timestamp), symbol
         ORDER BY day ASC
       `),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 8000))
     ]) as any[];
     
     const data = transformToChartData(rows);
-    res.json({ data });
+    const result = { data };
+    
+    // Cache for 60 seconds
+    setCache(cacheKey, result, 60);
+    
+    res.json(result);
   } catch (error) {
     console.error('Error fetching trades chart:', error);
     // Return empty data instead of 500 error
@@ -730,6 +795,13 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
 // Get liquidations chart data from database
 router.get('/liquidations-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
+  const cacheKey = `liquidations_chart_${hours}`;
+  
+  // Check cache first
+  const cached = getCached<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
   
   try {
     const rows = await Promise.race([
@@ -748,7 +820,12 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
     ]) as any[];
     
     const data = transformToChartData(rows);
-    res.json({ data });
+    const result = { data };
+    
+    // Cache for 60 seconds
+    setCache(cacheKey, result, 60);
+    
+    res.json(result);
   } catch (error) {
     console.error('Error fetching liquidations chart:', error);
     res.json({ data: [], error: 'No liquidation data available yet' });
