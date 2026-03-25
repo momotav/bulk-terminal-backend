@@ -39,11 +39,53 @@ interface TickerData {
   fundingRate?: string | number;
 }
 
-async function snapshotTickers(): Promise<void> {
+// Track last ticker snapshot time per symbol to avoid duplicates
+const lastTickerSnapshotTime: Map<string, number> = new Map();
+const TICKER_SNAPSHOT_INTERVAL = 60000; // Save max 1 snapshot per minute per symbol
+
+// Record ticker snapshot from WebSocket (real-time)
+async function recordTickerSnapshot(
+  symbol: string, 
+  openInterestCoins: number, 
+  openInterestUsd: number, 
+  fundingRate: number, 
+  markPrice: number
+): Promise<void> {
+  // Rate limit: only save 1 snapshot per minute per symbol
+  const lastTime = lastTickerSnapshotTime.get(symbol) || 0;
+  if (Date.now() - lastTime < TICKER_SNAPSHOT_INTERVAL) {
+    return; // Skip, too recent
+  }
+  
+  try {
+    await query(
+      `INSERT INTO ticker_snapshots (symbol, open_interest_coins, open_interest_usd, funding_rate, mark_price, timestamp)
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice]
+    );
+    
+    lastTickerSnapshotTime.set(symbol, Date.now());
+    stats.tickerSnapshots++;
+    stats.lastTickerSnapshot = new Date();
+    
+    console.log(`📊 Ticker (WS): ${symbol} | OI: $${openInterestUsd.toFixed(0)} | Funding: ${(fundingRate * 100).toFixed(4)}%`);
+  } catch (error) {
+    console.error(`Failed to save ticker snapshot for ${symbol}:`, error);
+  }
+}
+
+// FALLBACK: Fetch tickers via REST API (used if WebSocket ticker subscription fails)
+async function snapshotTickersFallback(): Promise<void> {
   // All available BULK markets
   const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
   
   for (const symbol of symbols) {
+    // Skip if we got a recent WebSocket update
+    const lastTime = lastTickerSnapshotTime.get(symbol) || 0;
+    if (Date.now() - lastTime < TICKER_SNAPSHOT_INTERVAL) {
+      continue; // Already have recent data from WebSocket
+    }
+    
     try {
       const res = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
       if (!res.ok) continue;
@@ -62,24 +104,26 @@ async function snapshotTickers(): Promise<void> {
         [symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice]
       );
       
-      console.log(`📊 Ticker snapshot: ${symbol} | OI: $${openInterestUsd.toFixed(0)} | Funding: ${(fundingRate * 100).toFixed(4)}%`);
+      lastTickerSnapshotTime.set(symbol, Date.now());
+      stats.tickerSnapshots++;
+      stats.lastTickerSnapshot = new Date();
+      
+      console.log(`📊 Ticker (REST fallback): ${symbol} | OI: $${openInterestUsd.toFixed(0)} | Funding: ${(fundingRate * 100).toFixed(4)}%`);
     } catch (error) {
       console.error(`Failed to snapshot ticker for ${symbol}:`, error);
     }
   }
-  
-  stats.tickerSnapshots++;
-  stats.lastTickerSnapshot = new Date();
 }
 
-// Start ticker snapshot collection (every 1 minute)
+// Start ticker snapshot collection (fallback for when WebSocket is down)
 function startTickerSnapshots(): void {
-  // Take initial snapshot
-  snapshotTickers();
+  // Take initial snapshot via REST API
+  snapshotTickersFallback();
   
-  // Then every minute
-  tickerSnapshotInterval = setInterval(snapshotTickers, 60 * 1000);
-  console.log('📊 Started ticker snapshot collection (every 1 minute)');
+  // Then every minute as fallback (WebSocket should provide real-time updates)
+  tickerSnapshotInterval = setInterval(snapshotTickersFallback, 60 * 1000);
+  console.log('📊 Started ticker snapshot fallback (REST API every 1 minute)');
+  console.log('📊 Primary source: WebSocket ticker subscription (real-time)');
 }
 
 // Stop ticker snapshot collection
@@ -346,10 +390,29 @@ function processMessage(data: WebSocket.Data): void {
     }
     
     // Log all messages for first 20 to help debug format
-    if (stats.tradesReceived < 20) {
+    if (stats.tradesReceived + stats.tickerSnapshots < 20) {
       console.log(`📨 Raw message (type=${message.type}, topic=${message.topic}):`, JSON.stringify(message).slice(0, 800));
     }
 
+    // ============ HANDLE TICKER MESSAGES (Real-time OI, Funding, Price) ============
+    // Format: { type: 'ticker', topic: 'ticker.BTC-USD', data: { ticker: {...} } }
+    if (message.type === 'ticker' || (message.topic && message.topic.startsWith('ticker.'))) {
+      const tickerData = message.data?.ticker || message.data || message;
+      const symbol = tickerData.symbol || message.topic?.replace('ticker.', '') || 'UNKNOWN';
+      
+      const openInterestCoins = parseFloat(String(tickerData.openInterest || 0));
+      const markPrice = parseFloat(String(tickerData.markPrice || tickerData.lastPrice || 0));
+      const openInterestUsd = openInterestCoins * markPrice;
+      const fundingRate = parseFloat(String(tickerData.fundingRate || 0));
+      
+      if (markPrice > 0) {
+        // Save to ticker_snapshots (same as before, but now real-time!)
+        recordTickerSnapshot(symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice);
+      }
+      return;
+    }
+
+    // ============ HANDLE TRADES MESSAGES ============
     // Handle BULK trades format: { type: 'trades', topic: 'trades.BTC-USD', data: { trades: [...] } }
     // OR: { type: 'trades', data: [...] } (array directly in data)
     if (message.type === 'trades' || (message.topic && message.topic.startsWith('trades.'))) {
@@ -843,18 +906,23 @@ function connect(): void {
       const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
       
       try {
-        // Subscribe to trades for all symbols
-        // Liquidations and ADL come through trades with reason: "liquidation" or "adl"
+        // Subscribe to TRADES for all symbols (includes liquidations/ADL via "reason" field)
         ws?.send(JSON.stringify({
           method: 'subscribe',
           subscription: symbols.map(symbol => ({ type: 'trades', symbol }))
         }));
+        console.log('📡 Subscribed to TRADES:', symbols.join(', '));
         
-        console.log('📡 Subscribed to trades:', symbols.join(', '));
-        console.log('📡 (Liquidations & ADL come via trades with reason field)');
+        // Subscribe to TICKER for all symbols (real-time OI, funding rate, price)
+        // This replaces the REST API polling every 60 seconds!
+        ws?.send(JSON.stringify({
+          method: 'subscribe',
+          subscription: symbols.map(symbol => ({ type: 'ticker', symbol }))
+        }));
+        console.log('📡 Subscribed to TICKER:', symbols.join(', '));
+        console.log('📡 (OI & Funding updates now come via WebSocket in real-time!)');
         
         // Subscribe to tracked wallets' account channels for additional liquidation events
-        // Do this after a short delay to ensure connection is stable
         setTimeout(() => {
           subscribeToTrackedWallets();
         }, 2000);
