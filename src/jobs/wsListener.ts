@@ -906,19 +906,35 @@ function connect(): void {
       const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
       
       try {
-        // Subscribe to TRADES for all symbols (includes liquidations/ADL via "reason" field)
-        ws?.send(JSON.stringify({
-          method: 'subscribe',
-          subscription: symbols.map(symbol => ({ type: 'trades', symbol }))
-        }));
+        // BULK API now uses Hyperliquid-style format:
+        // { "method": "subscribe", "subscription": { "type": "trades", "coin": "BTC" } }
+        // One subscription per message, use "coin" instead of "symbol"
+        
+        // Subscribe to TRADES for all symbols
+        for (const symbol of symbols) {
+          const coin = symbol.replace('-USD', ''); // BTC-USD -> BTC
+          ws?.send(JSON.stringify({
+            method: 'subscribe',
+            subscription: { type: 'trades', coin }
+          }));
+        }
         console.log('📡 Subscribed to TRADES:', symbols.join(', '));
         
-        // Subscribe to TICKER for all symbols (real-time OI, funding rate, price)
-        // This replaces the REST API polling every 60 seconds!
+        // Subscribe to TICKER (allMids gives all prices at once)
         ws?.send(JSON.stringify({
           method: 'subscribe',
-          subscription: symbols.map(symbol => ({ type: 'ticker', symbol }))
+          subscription: { type: 'allMids' }
         }));
+        console.log('📡 Subscribed to allMids (all prices)');
+        
+        // Also try individual ticker subscriptions
+        for (const symbol of symbols) {
+          const coin = symbol.replace('-USD', '');
+          ws?.send(JSON.stringify({
+            method: 'subscribe',
+            subscription: { type: 'ticker', coin }
+          }));
+        }
         console.log('📡 Subscribed to TICKER:', symbols.join(', '));
         console.log('📡 (OI & Funding updates now come via WebSocket in real-time!)');
         
@@ -991,15 +1007,16 @@ export function subscribeToWalletAccount(walletAddress: string): void {
   }
   
   try {
+    // BULK API now uses Hyperliquid-style format with "user" field for account subscriptions
     ws.send(JSON.stringify({
       method: 'subscribe',
-      subscription: [{ type: 'account', wallet: walletAddress }]
+      subscription: { type: 'userEvents', user: walletAddress }
     }));
     
-    // Also try topic format
+    // Also try userFills format
     ws.send(JSON.stringify({
       method: 'subscribe',
-      subscription: [{ type: 'account', topic: `account.${walletAddress}` }]
+      subscription: { type: 'userFills', user: walletAddress }
     }));
     
     subscribedWallets.add(walletAddress);
