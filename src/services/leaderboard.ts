@@ -130,33 +130,62 @@ class LeaderboardService {
     }));
   }
 
-  // Biggest Positions (Whale Watch)
+  // Biggest Positions (Whale Watch) - fetch from BULK API directly
   async getBiggestPositions(limit: number = 50): Promise<LeaderboardEntry[]> {
     const excludeFilter = this.getExcludedFilter();
     
-    // Get latest snapshot for each wallet with notional > 0
-    const rows = await query<{ wallet_address: string; value: number; positions: number }>(
-      `SELECT DISTINCT ON (wallet_address)
-        wallet_address,
-        total_notional as value,
-        positions_count as positions
-       FROM trader_snapshots
-       WHERE total_notional > 0 ${excludeFilter}
-       ORDER BY wallet_address, timestamp DESC`,
-      []
-    );
-    
-    // Sort by value (notional) and limit
-    const sorted = rows
-      .sort((a, b) => (parseFloat(b.value as any) || 0) - (parseFloat(a.value as any) || 0))
-      .slice(0, limit);
-    
-    return sorted.map((row, index) => ({
-      rank: index + 1,
-      wallet_address: row.wallet_address,
-      value: parseFloat(row.value as any) || 0,
-      positions: row.positions,
-    }));
+    // First try: Get wallets from our traders table (fast)
+    try {
+      const wallets = await query<{ wallet_address: string }>(
+        `SELECT wallet_address FROM traders 
+         WHERE wallet_address IS NOT NULL ${excludeFilter}
+         ORDER BY last_seen DESC 
+         LIMIT 100`
+      );
+      
+      if (wallets.length === 0) {
+        // No tracked wallets yet
+        return [];
+      }
+      
+      // Fetch current positions from BULK API for each wallet
+      const results: LeaderboardEntry[] = [];
+      
+      for (const { wallet_address } of wallets.slice(0, 20)) { // Limit API calls
+        try {
+          const response = await fetch(`https://exchange-api.bulk.trade/api/v1/account/${wallet_address}`);
+          if (!response.ok) continue;
+          
+          const account = await response.json() as any;
+          if (!account?.positions || account.positions.length === 0) continue;
+          
+          // Calculate total notional
+          let totalNotional = 0;
+          for (const pos of account.positions) {
+            totalNotional += Math.abs(pos.notional || 0);
+          }
+          
+          if (totalNotional > 0) {
+            results.push({
+              rank: 0,
+              wallet_address,
+              value: totalNotional,
+              positions: account.positions.length
+            });
+          }
+        } catch (e) {
+          // Skip failed wallet
+        }
+      }
+      
+      // Sort by value and assign ranks
+      results.sort((a, b) => b.value - a.value);
+      return results.slice(0, limit).map((r, i) => ({ ...r, rank: i + 1 }));
+      
+    } catch (error) {
+      console.error('getBiggestPositions error:', error);
+      return [];
+    }
   }
 
   // Most Active Traders
