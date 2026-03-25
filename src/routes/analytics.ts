@@ -141,9 +141,16 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     let totalOpenInterest = 0;
     let timestamp = Date.now();
     
-    // First try /stats endpoint
+    // First try /stats endpoint (with timeout)
     try {
-      const response = await fetch(`${BULK_API_BASE}/stats?period=1d`);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+      
+      const response = await fetch(`${BULK_API_BASE}/stats?period=1d`, {
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      
       if (response.ok) {
         const bulkStats = await response.json() as BulkStatsResponse;
         timestamp = bulkStats.timestamp || Date.now();
@@ -171,36 +178,48 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     // FALLBACK: If /stats returned 0s, fetch from individual tickers
     if (totalVolume24h === 0 && totalOpenInterest === 0) {
       console.log('⚠️ /stats returned 0s, falling back to individual tickers...');
-      const tickerStats = await fetchTickersForStats();
-      totalVolume24h = tickerStats.volume24h;
-      totalOpenInterest = tickerStats.openInterest;
-      timestamp = tickerStats.timestamp;
+      try {
+        const tickerStats = await fetchTickersForStats();
+        totalVolume24h = tickerStats.volume24h;
+        totalOpenInterest = tickerStats.openInterest;
+        timestamp = tickerStats.timestamp;
+      } catch (e) {
+        console.error('Failed to fetch tickers fallback:', e);
+      }
     }
     
-    // Get active traders from DB (last 24h)
+    // Get active traders from DB (last 24h) - with timeout
     let activeTraders = 0;
     try {
-      const tradersResult = await query(`
-        SELECT COUNT(DISTINCT wallet_address) as count 
-        FROM trades 
-        WHERE timestamp > NOW() - INTERVAL '24 hours'
-      `);
+      const tradersResult = await Promise.race([
+        query(`
+          SELECT COUNT(DISTINCT wallet_address) as count 
+          FROM trades 
+          WHERE timestamp > NOW() - INTERVAL '24 hours'
+        `),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('DB timeout')), 3000))
+      ]) as any[];
       activeTraders = parseInt(tradersResult[0]?.count || '0');
     } catch (e) {
-      console.error('Failed to get active traders:', e);
+      console.error('Failed to get active traders (timeout or error):', e);
+      activeTraders = 0;
     }
     
-    // Get liquidations from DB (last 24h)
+    // Get liquidations from DB (last 24h) - with timeout
     let liquidations24h = 0;
     try {
-      const liqResult = await query(`
-        SELECT COALESCE(SUM(value), 0) as total
-        FROM liquidations 
-        WHERE timestamp > NOW() - INTERVAL '24 hours'
-      `);
+      const liqResult = await Promise.race([
+        query(`
+          SELECT COALESCE(SUM(value), 0) as total
+          FROM liquidations 
+          WHERE timestamp > NOW() - INTERVAL '24 hours'
+        `),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('DB timeout')), 3000))
+      ]) as any[];
       liquidations24h = parseFloat(liqResult[0]?.total || '0');
     } catch (e) {
-      console.error('Failed to get liquidations:', e);
+      console.error('Failed to get liquidations (timeout or error):', e);
+      liquidations24h = 0;
     }
     
     res.json({
