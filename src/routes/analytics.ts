@@ -188,21 +188,33 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       }
     }
     
-    // Get active traders from DB (last 24h) - with timeout
+    // Get active traders from traders table (much faster than COUNT DISTINCT on trades)
     let activeTraders = 0;
     try {
       const tradersResult = await Promise.race([
         query(`
-          SELECT COUNT(DISTINCT wallet_address) as count 
-          FROM trades 
-          WHERE timestamp > NOW() - INTERVAL '24 hours'
+          SELECT COUNT(*) as count 
+          FROM traders 
+          WHERE last_seen > NOW() - INTERVAL '24 hours'
         `),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('DB timeout')), 3000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('DB timeout')), 2000))
       ]) as any[];
       activeTraders = parseInt(tradersResult[0]?.count || '0');
+      
+      // Fallback: if no recent activity, show total unique traders
+      if (activeTraders === 0) {
+        const totalResult = await query(`SELECT COUNT(*) as count FROM traders`);
+        activeTraders = parseInt(totalResult[0]?.count || '0');
+      }
     } catch (e) {
-      console.error('Failed to get active traders (timeout or error):', e);
-      activeTraders = 0;
+      console.error('Failed to get active traders:', e);
+      // Fallback to total traders count
+      try {
+        const totalResult = await query(`SELECT COUNT(*) as count FROM traders`);
+        activeTraders = parseInt(totalResult[0]?.count || '0');
+      } catch (e2) {
+        activeTraders = 0;
+      }
     }
     
     // Get liquidations from DB (last 24h) - with timeout
@@ -827,25 +839,27 @@ router.get('/stats', async (req: Request, res: Response) => {
   }
 });
 
-// DEBUG: Check trades table data
+// DEBUG: Check trades table data (fast version)
 router.get('/debug/trades', async (req: Request, res: Response) => {
   try {
-    const [countResult, sampleResult, volumeResult] = await Promise.all([
+    const [countResult, sampleResult, tradersResult] = await Promise.all([
       query(`SELECT COUNT(*) as count FROM trades`),
       query(`SELECT wallet_address, symbol, side, size, price, value, timestamp FROM trades ORDER BY timestamp DESC LIMIT 5`),
       query(`SELECT 
-        COUNT(*) as total_trades,
-        SUM(value) as total_volume,
-        COUNT(DISTINCT wallet_address) as unique_wallets,
-        MIN(timestamp) as oldest_trade,
-        MAX(timestamp) as newest_trade
-      FROM trades WHERE value > 0`)
+        COUNT(*) as unique_wallets,
+        SUM(total_volume) as total_volume,
+        SUM(total_trades) as total_trades
+      FROM traders`)
     ]);
     
     res.json({
       totalCount: countResult[0]?.count,
       sampleTrades: sampleResult,
-      volumeStats: volumeResult[0]
+      volumeStats: {
+        total_trades: tradersResult[0]?.total_trades || countResult[0]?.count,
+        total_volume: tradersResult[0]?.total_volume || 0,
+        unique_wallets: tradersResult[0]?.unique_wallets || 0
+      }
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
