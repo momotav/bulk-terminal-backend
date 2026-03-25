@@ -218,164 +218,64 @@ class LeaderboardService {
 
   // Most Active Traders
   async getMostActive(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
+    const timeFilter = timeframe === 'all' ? '' : this.getTimeFilter(timeframe);
     const excludeFilter = this.getExcludedFilter();
     
-    // For 'all' timeframe, use pre-aggregated data from traders table (FAST!)
-    if (timeframe === 'all') {
-      try {
-        const rows = await query<{ wallet_address: string; total_trades: number; total_volume: number }>(
-          `SELECT wallet_address, total_trades as trade_count, total_volume as total_value
-           FROM traders
-           WHERE total_trades > 0 ${excludeFilter}
-           ORDER BY total_trades DESC
-           LIMIT $1`,
-          [limit]
-        );
-        
-        if (rows.length > 0 && rows[0].total_trades > 0) {
-          return rows.map((row, index) => ({
-            rank: index + 1,
-            wallet_address: row.wallet_address,
-            value: parseFloat(row.total_volume as any) || 0,
-            trades: parseInt(row.total_trades as any) || 0,
-          }));
-        }
-      } catch (e) {
-        console.log('Failed to query traders table');
-      }
+    try {
+      const rows = await query<{ wallet_address: string; trade_count: number; total_value: number }>(
+        `SELECT 
+          COALESCE(wallet_address, 'unknown') as wallet_address,
+          COUNT(*) as trade_count,
+          SUM(value) as total_value
+         FROM trades
+         WHERE 1=1 ${timeFilter} ${excludeFilter}
+         GROUP BY wallet_address
+         ORDER BY trade_count DESC
+         LIMIT $1`,
+        [limit]
+      );
       
-      // Fallback: fetch fills from BULK API for seed wallets
-      const seedWallets = [
-        '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN',
-        '6q3BqzWLn7NZrDa2CNEH7mKsZbYHqHUKSnNfn46zGLn6',
-        '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt',
-      ];
-      
-      const results: LeaderboardEntry[] = [];
-      
-      for (const wallet of seedWallets) {
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 2000);
-          
-          const response = await fetch('https://exchange-api.bulk.trade/api/v1/account', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type: 'fills', user: wallet }),
-            signal: controller.signal
-          });
-          clearTimeout(timeoutId);
-          
-          if (!response.ok) continue;
-          
-          const fills = await response.json() as any[];
-          if (!fills || fills.length === 0) continue;
-          
-          let totalVolume = 0;
-          for (const fill of fills) {
-            const f = fill.fills || fill;
-            totalVolume += Math.abs(f.amount || 0) * (f.price || 0);
-          }
-          
-          results.push({
-            rank: 0,
-            wallet_address: wallet,
-            value: totalVolume,
-            trades: fills.length,
-          });
-        } catch (e) {
-          // Skip
-        }
-      }
-      
-      results.sort((a, b) => (b.trades || 0) - (a.trades || 0));
-      return results.map((r, i) => ({ ...r, rank: i + 1 }));
+      return rows.map((row, index) => ({
+        rank: index + 1,
+        wallet_address: row.wallet_address,
+        value: parseFloat(row.total_value as any) || 0,
+        trades: parseInt(row.trade_count as any) || 0,
+      }));
+    } catch (e) {
+      console.error('getMostActive error:', e);
+      return [];
     }
-    
-    // For time-based queries, use trades table with time filter
-    const timeFilter = this.getTimeFilter(timeframe);
-    
-    const rows = await query<{ wallet_address: string; trade_count: number; total_value: number }>(
-      `SELECT 
-        COALESCE(wallet_address, 'unknown') as wallet_address,
-        COUNT(*) as trade_count,
-        SUM(value) as total_value
-       FROM trades
-       WHERE 1=1 ${timeFilter} ${excludeFilter}
-       GROUP BY wallet_address
-       ORDER BY trade_count DESC
-       LIMIT $1`,
-      [limit]
-    );
-    
-    return rows.map((row, index) => ({
-      rank: index + 1,
-      wallet_address: row.wallet_address,
-      value: parseFloat(row.total_value as any) || 0,
-      trades: parseInt(row.trade_count as any) || 0,
-    }));
   }
 
-  // Top Volume Traders - fetch from BULK API fills for seed wallets
+  // Top Volume Traders - query from trades table
   async getTopVolume(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
-    // Skip database query - it's slow/empty. Go straight to BULK API.
+    const timeFilter = timeframe === 'all' ? '' : this.getTimeFilter(timeframe);
+    const excludeFilter = this.getExcludedFilter();
     
-    // Fetch fills from BULK API for seed wallets IN PARALLEL
-    const seedWallets = [
-      '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN',
-      '6q3BqzWLn7NZrDa2CNEH7mKsZbYHqHUKSnNfn46zGLn6',
-      '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt',
-    ];
-    
-    // Fetch all wallets in parallel with 3 second timeout
-    const fetchWalletVolume = async (wallet: string): Promise<LeaderboardEntry | null> => {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 3000);
-        
-        const response = await fetch('https://exchange-api.bulk.trade/api/v1/account', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'fills', user: wallet }),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-        
-        if (!response.ok) return null;
-        
-        const fills = await response.json() as any[];
-        if (!fills || fills.length === 0) return null;
-        
-        // Calculate total volume from fills
-        let totalVolume = 0;
-        for (const fill of fills) {
-          const f = fill.fills || fill;
-          const amount = Math.abs(f.amount || 0);
-          const price = f.price || 0;
-          totalVolume += amount * price;
-        }
-        
-        if (totalVolume > 0) {
-          return {
-            rank: 0,
-            wallet_address: wallet,
-            value: totalVolume,
-            trades: fills.length,
-          };
-        }
-        return null;
-      } catch (e) {
-        console.log(`Volume fetch failed for ${wallet.slice(0,8)}:`, e);
-        return null;
-      }
-    };
-    
-    const results = await Promise.all(seedWallets.map(fetchWalletVolume));
-    const validResults = results.filter((r): r is LeaderboardEntry => r !== null);
-    
-    // Sort by volume and assign ranks
-    validResults.sort((a, b) => b.value - a.value);
-    return validResults.slice(0, limit).map((r, i) => ({ ...r, rank: i + 1 }));
+    try {
+      const rows = await query<{ wallet_address: string; total_volume: number; trade_count: number }>(
+        `SELECT 
+          wallet_address,
+          SUM(value) as total_volume,
+          COUNT(*) as trade_count
+         FROM trades
+         WHERE wallet_address IS NOT NULL ${timeFilter} ${excludeFilter}
+         GROUP BY wallet_address
+         ORDER BY total_volume DESC
+         LIMIT $1`,
+        [limit]
+      );
+      
+      return rows.map((row, index) => ({
+        rank: index + 1,
+        wallet_address: row.wallet_address,
+        value: parseFloat(row.total_volume as any) || 0,
+        trades: parseInt(row.trade_count as any) || 0,
+      }));
+    } catch (e) {
+      console.error('getTopVolume error:', e);
+      return [];
+    }
   }
 
   // Get recent liquidations
