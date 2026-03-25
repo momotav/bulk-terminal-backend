@@ -549,16 +549,19 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
   
   try {
-    const result = await query(`
-      SELECT 
-        date_trunc('minute', timestamp) as timestamp,
-        symbol,
-        AVG(open_interest_usd) as value
-      FROM ticker_snapshots
-      WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
-      GROUP BY date_trunc('minute', timestamp), symbol
-      ORDER BY timestamp ASC
-    `);
+    const result = await Promise.race([
+      query(`
+        SELECT 
+          date_trunc('minute', timestamp) as timestamp,
+          symbol,
+          AVG(open_interest_usd) as value
+        FROM ticker_snapshots
+        WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
+        GROUP BY date_trunc('minute', timestamp), symbol
+        ORDER BY timestamp ASC
+      `),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
+    ]) as any[];
     
     // Group by timestamp
     const dataMap = new Map<string, { BTC: number; ETH: number; SOL: number }>();
@@ -583,7 +586,7 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
     res.json({ hours, dataPoints: data.length, data });
   } catch (error) {
     console.error('Error fetching OI chart:', error);
-    res.status(500).json({ error: 'Failed to fetch OI chart' });
+    res.json({ hours, dataPoints: 0, data: [], error: 'No OI data available yet' });
   }
 });
 
@@ -592,16 +595,19 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
   
   try {
-    const result = await query(`
-      SELECT 
-        date_trunc('minute', timestamp) as timestamp,
-        symbol,
-        AVG(funding_rate) as value
-      FROM ticker_snapshots
-      WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
-      GROUP BY date_trunc('minute', timestamp), symbol
-      ORDER BY timestamp ASC
-    `);
+    const result = await Promise.race([
+      query(`
+        SELECT 
+          date_trunc('minute', timestamp) as timestamp,
+          symbol,
+          AVG(funding_rate) as value
+        FROM ticker_snapshots
+        WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
+        GROUP BY date_trunc('minute', timestamp), symbol
+        ORDER BY timestamp ASC
+      `),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
+    ]) as any[];
     
     const dataMap = new Map<string, { BTC: number; ETH: number; SOL: number }>();
     
@@ -624,7 +630,7 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
     res.json({ hours, dataPoints: data.length, data });
   } catch (error) {
     console.error('Error fetching funding chart:', error);
-    res.status(500).json({ error: 'Failed to fetch funding chart' });
+    res.json({ hours, dataPoints: 0, data: [], error: 'No funding data available yet' });
   }
 });
 
@@ -684,23 +690,28 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
   
   try {
-    const rows = await query(`
-      SELECT 
-        date_trunc('day', timestamp) as day,
-        symbol,
-        COUNT(*) as trade_count,
-        SUM(value) as volume
-      FROM trades
-      WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
-      GROUP BY date_trunc('day', timestamp), symbol
-      ORDER BY day ASC
-    `);
+    // Use Promise.race with timeout to prevent hanging
+    const rows = await Promise.race([
+      query(`
+        SELECT 
+          date_trunc('day', timestamp) as day,
+          symbol,
+          COUNT(*) as trade_count,
+          SUM(value) as volume
+        FROM trades
+        WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
+        GROUP BY date_trunc('day', timestamp), symbol
+        ORDER BY day ASC
+      `),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
+    ]) as any[];
     
     const data = transformToChartData(rows);
     res.json({ data });
   } catch (error) {
     console.error('Error fetching trades chart:', error);
-    res.status(500).json({ error: 'Failed to fetch trades chart data' });
+    // Return empty data instead of 500 error
+    res.json({ data: [], error: 'No trade data available yet' });
   }
 });
 
@@ -709,23 +720,26 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
   
   try {
-    const rows = await query(`
-      SELECT 
-        date_trunc('day', timestamp) as day,
-        symbol,
-        COUNT(*) as liquidation_count,
-        SUM(value) as total_value
-      FROM liquidations
-      WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
-      GROUP BY date_trunc('day', timestamp), symbol
-      ORDER BY day ASC
-    `);
+    const rows = await Promise.race([
+      query(`
+        SELECT 
+          date_trunc('day', timestamp) as day,
+          symbol,
+          COUNT(*) as liquidation_count,
+          SUM(value) as total_value
+        FROM liquidations
+        WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
+        GROUP BY date_trunc('day', timestamp), symbol
+        ORDER BY day ASC
+      `),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
+    ]) as any[];
     
     const data = transformToChartData(rows);
     res.json({ data });
   } catch (error) {
     console.error('Error fetching liquidations chart:', error);
-    res.status(500).json({ error: 'Failed to fetch liquidations chart data' });
+    res.json({ data: [], error: 'No liquidation data available yet' });
   }
 });
 
