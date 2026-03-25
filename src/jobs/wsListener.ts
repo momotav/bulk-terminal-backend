@@ -932,38 +932,38 @@ function connect(): void {
         }));
         console.log('📡 Sent format 1: array with symbol field');
         
-        // Wait a bit between attempts
-        await new Promise(r => setTimeout(r, 500));
+        // Send other formats with delays using setTimeout
+        setTimeout(() => {
+          // Format 2: Single object per symbol (Hyperliquid style)
+          for (const symbol of symbols.slice(0, 1)) { // Just try BTC first
+            ws?.send(JSON.stringify({
+              method: 'subscribe',
+              subscription: { type: 'trades', symbol }
+            }));
+          }
+          console.log('📡 Sent format 2: single object with symbol');
+        }, 500);
         
-        // Format 2: Single object per symbol (Hyperliquid style)
-        for (const symbol of symbols.slice(0, 1)) { // Just try BTC first
+        setTimeout(() => {
+          // Format 3: With coin instead of symbol
+          for (const symbol of symbols.slice(0, 1)) {
+            const coin = symbol.replace('-USD', '');
+            ws?.send(JSON.stringify({
+              method: 'subscribe',
+              subscription: { type: 'trades', coin }
+            }));
+          }
+          console.log('📡 Sent format 3: single object with coin');
+        }, 1000);
+        
+        setTimeout(() => {
+          // Format 4: Array with coin
           ws?.send(JSON.stringify({
             method: 'subscribe',
-            subscription: { type: 'trades', symbol }
+            subscription: symbols.map(s => ({ type: 'trades', coin: s.replace('-USD', '') }))
           }));
-        }
-        console.log('📡 Sent format 2: single object with symbol');
-        
-        await new Promise(r => setTimeout(r, 500));
-        
-        // Format 3: With coin instead of symbol
-        for (const symbol of symbols.slice(0, 1)) {
-          const coin = symbol.replace('-USD', '');
-          ws?.send(JSON.stringify({
-            method: 'subscribe',
-            subscription: { type: 'trades', coin }
-          }));
-        }
-        console.log('📡 Sent format 3: single object with coin');
-        
-        await new Promise(r => setTimeout(r, 500));
-        
-        // Format 4: Array with coin
-        ws?.send(JSON.stringify({
-          method: 'subscribe',
-          subscription: symbols.map(s => ({ type: 'trades', coin: s.replace('-USD', '') }))
-        }));
-        console.log('📡 Sent format 4: array with coin field');
+          console.log('📡 Sent format 4: array with coin field');
+        }, 1500);
         
       } catch (e) {
         console.error('Failed to subscribe:', e);
