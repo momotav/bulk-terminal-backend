@@ -288,7 +288,7 @@ class LeaderboardService {
         }
       }
       
-      results.sort((a, b) => b.trades - a.trades);
+      results.sort((a, b) => (b.trades || 0) - (a.trades || 0));
       return results.map((r, i) => ({ ...r, rank: i + 1 }));
     }
     
