@@ -134,26 +134,46 @@ class LeaderboardService {
   async getBiggestPositions(limit: number = 50): Promise<LeaderboardEntry[]> {
     const excludeFilter = this.getExcludedFilter();
     
-    // First try: Get wallets from our traders table (fast)
+    // Known active wallets to seed data (can be expanded)
+    const seedWallets = [
+      '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN', // @momotavrrr
+      '43FCw6GBmngMxPXSGXiAr1pQFyZ2D1BsAjYuim6W4pfE', // @quroolarc
+      'BZSQTeUDnGX8CNNtgRPMQkL8GR1qLC95sJKwFLXG2kBV',
+    ];
+    
     try {
-      const wallets = await query<{ wallet_address: string }>(
-        `SELECT wallet_address FROM traders 
-         WHERE wallet_address IS NOT NULL ${excludeFilter}
-         ORDER BY last_seen DESC 
-         LIMIT 100`
-      );
+      // Get wallets from our traders table
+      let wallets: string[] = [];
+      try {
+        const dbWallets = await query<{ wallet_address: string }>(
+          `SELECT wallet_address FROM traders 
+           WHERE wallet_address IS NOT NULL ${excludeFilter}
+           ORDER BY last_seen DESC 
+           LIMIT 100`
+        );
+        wallets = dbWallets.map(w => w.wallet_address);
+      } catch (e) {
+        console.log('No wallets in traders table, using seed wallets');
+      }
       
+      // If no wallets in DB, use seed wallets
       if (wallets.length === 0) {
-        // No tracked wallets yet
-        return [];
+        wallets = seedWallets;
       }
       
       // Fetch current positions from BULK API for each wallet
       const results: LeaderboardEntry[] = [];
       
-      for (const { wallet_address } of wallets.slice(0, 20)) { // Limit API calls
+      for (const wallet_address of wallets.slice(0, 20)) { // Limit API calls
         try {
-          const response = await fetch(`https://exchange-api.bulk.trade/api/v1/account/${wallet_address}`);
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 3000);
+          
+          const response = await fetch(`https://exchange-api.bulk.trade/api/v1/account/${wallet_address}`, {
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          
           if (!response.ok) continue;
           
           const account = await response.json() as any;
