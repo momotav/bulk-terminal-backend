@@ -222,21 +222,74 @@ class LeaderboardService {
     
     // For 'all' timeframe, use pre-aggregated data from traders table (FAST!)
     if (timeframe === 'all') {
-      const rows = await query<{ wallet_address: string; total_trades: number; total_volume: number }>(
-        `SELECT wallet_address, total_trades as trade_count, total_volume as total_value
-         FROM traders
-         WHERE total_trades > 0 ${excludeFilter}
-         ORDER BY total_trades DESC
-         LIMIT $1`,
-        [limit]
-      );
+      try {
+        const rows = await query<{ wallet_address: string; total_trades: number; total_volume: number }>(
+          `SELECT wallet_address, total_trades as trade_count, total_volume as total_value
+           FROM traders
+           WHERE total_trades > 0 ${excludeFilter}
+           ORDER BY total_trades DESC
+           LIMIT $1`,
+          [limit]
+        );
+        
+        if (rows.length > 0 && rows[0].total_trades > 0) {
+          return rows.map((row, index) => ({
+            rank: index + 1,
+            wallet_address: row.wallet_address,
+            value: parseFloat(row.total_volume as any) || 0,
+            trades: parseInt(row.total_trades as any) || 0,
+          }));
+        }
+      } catch (e) {
+        console.log('Failed to query traders table');
+      }
       
-      return rows.map((row, index) => ({
-        rank: index + 1,
-        wallet_address: row.wallet_address,
-        value: parseFloat(row.total_volume as any) || 0,
-        trades: parseInt(row.total_trades as any) || 0,
-      }));
+      // Fallback: fetch fills from BULK API for seed wallets
+      const seedWallets = [
+        '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN',
+        '6q3BqzWLn7NZrDa2CNEH7mKsZbYHqHUKSnNfn46zGLn6',
+        '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt',
+      ];
+      
+      const results: LeaderboardEntry[] = [];
+      
+      for (const wallet of seedWallets) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 2000);
+          
+          const response = await fetch('https://exchange-api.bulk.trade/api/v1/account', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'fills', user: wallet }),
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          
+          if (!response.ok) continue;
+          
+          const fills = await response.json() as any[];
+          if (!fills || fills.length === 0) continue;
+          
+          let totalVolume = 0;
+          for (const fill of fills) {
+            const f = fill.fills || fill;
+            totalVolume += Math.abs(f.amount || 0) * (f.price || 0);
+          }
+          
+          results.push({
+            rank: 0,
+            wallet_address: wallet,
+            value: totalVolume,
+            trades: fills.length,
+          });
+        } catch (e) {
+          // Skip
+        }
+      }
+      
+      results.sort((a, b) => b.trades - a.trades);
+      return results.map((r, i) => ({ ...r, rank: i + 1 }));
     }
     
     // For time-based queries, use trades table with time filter
@@ -295,27 +348,31 @@ class LeaderboardService {
       console.log('No volume data in trades table');
     }
     
-    // Fallback: Fetch fills from BULK API for seed wallets
+    // Fallback: Fetch fills from BULK API for seed wallets IN PARALLEL
     const seedWallets = [
       '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN',
       '6q3BqzWLn7NZrDa2CNEH7mKsZbYHqHUKSnNfn46zGLn6',
       '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt',
     ];
     
-    const results: LeaderboardEntry[] = [];
-    
-    for (const wallet of seedWallets) {
+    // Fetch all wallets in parallel with 2 second timeout
+    const fetchWalletVolume = async (wallet: string): Promise<LeaderboardEntry | null> => {
       try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000);
+        
         const response = await fetch('https://exchange-api.bulk.trade/api/v1/account', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ type: 'fills', user: wallet }),
+          signal: controller.signal
         });
+        clearTimeout(timeoutId);
         
-        if (!response.ok) continue;
+        if (!response.ok) return null;
         
         const fills = await response.json() as any[];
-        if (!fills || fills.length === 0) continue;
+        if (!fills || fills.length === 0) return null;
         
         // Calculate total volume from fills
         let totalVolume = 0;
@@ -327,21 +384,25 @@ class LeaderboardService {
         }
         
         if (totalVolume > 0) {
-          results.push({
+          return {
             rank: 0,
             wallet_address: wallet,
             value: totalVolume,
             trades: fills.length,
-          });
+          };
         }
+        return null;
       } catch (e) {
-        // Skip failed wallet
+        return null;
       }
-    }
+    };
+    
+    const results = await Promise.all(seedWallets.map(fetchWalletVolume));
+    const validResults = results.filter((r): r is LeaderboardEntry => r !== null);
     
     // Sort by volume and assign ranks
-    results.sort((a, b) => b.value - a.value);
-    return results.slice(0, limit).map((r, i) => ({ ...r, rank: i + 1 }));
+    validResults.sort((a, b) => b.value - a.value);
+    return validResults.slice(0, limit).map((r, i) => ({ ...r, rank: i + 1 }));
   }
 
   // Get recent liquidations
