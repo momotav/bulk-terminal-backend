@@ -111,4 +111,21 @@ router.get('/trades/recent', async (req: Request, res: Response) => {
   }
 });
 
+// GET /leaderboard/rank/:wallet - Get wallet's rank across all leaderboards
+router.get('/rank/:wallet', async (req: Request, res: Response) => {
+  try {
+    const wallet = req.params.wallet;
+    
+    if (!wallet || wallet.length < 32) {
+      return res.status(400).json({ error: 'Invalid wallet address' });
+    }
+    
+    const data = await leaderboardService.getWalletRank(wallet);
+    res.json(data);
+  } catch (error: any) {
+    console.error('Wallet rank error:', error.message);
+    res.status(500).json({ error: error.message || 'Failed to fetch wallet rank' });
+  }
+});
+
 export default router;
