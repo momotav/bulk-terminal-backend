@@ -1,18 +1,37 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Database connection pool with proper settings
+// Database connection pool with production settings
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  // Connection pool settings - increased for high throughput
-  max: 20,                        // Maximum number of clients (was 10)
-  idleTimeoutMillis: 30000,       // Close idle clients after 30 seconds
-  connectionTimeoutMillis: 15000, // Return error if can't connect in 15 seconds (was 10)
-  // NOTE: Don't set query_timeout here - it breaks CREATE INDEX on large tables
+  // Connection pool settings - optimized for high throughput
+  max: 15,                        // Reduced from 20 - fewer but healthier connections
+  min: 2,                         // Keep minimum connections alive
+  idleTimeoutMillis: 60000,       // Close idle clients after 60 seconds (was 30)
+  connectionTimeoutMillis: 10000, // 10 second timeout to get connection
+  allowExitOnIdle: false,         // Keep pool alive
 });
+
+// Monitor pool health
+pool.on('error', (err) => {
+  console.error('❌ Unexpected pool error:', err.message);
+});
+
+pool.on('connect', () => {
+  console.log('🔗 New database connection established');
+});
+
+pool.on('remove', () => {
+  console.log('🔌 Database connection removed from pool');
+});
+
+// Log pool stats periodically
+setInterval(() => {
+  console.log(`📊 Pool stats: total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`);
+}, 60000);
 
 // Test connection
 export async function testConnection(): Promise<boolean> {
