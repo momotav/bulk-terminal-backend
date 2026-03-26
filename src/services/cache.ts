@@ -1,7 +1,7 @@
-import { createClient, RedisClientType } from 'redis';
+import Redis from 'ioredis';
 
 // Redis client singleton
-let redisClient: RedisClientType | null = null;
+let redisClient: Redis | null = null;
 let isConnected = false;
 
 // Fallback in-memory cache when Redis is unavailable
@@ -16,17 +16,15 @@ export async function initRedis(): Promise<boolean> {
   }
 
   try {
-    redisClient = createClient({
-      url: redisUrl,
-      socket: {
-        connectTimeout: 5000,
-        reconnectStrategy: (retries: number) => {
-          if (retries > 10) {
-            console.error('❌ Redis max retries reached, falling back to memory cache');
-            return false;
-          }
-          return Math.min(retries * 100, 3000);
+    redisClient = new Redis(redisUrl, {
+      connectTimeout: 5000,
+      maxRetriesPerRequest: 3,
+      retryStrategy: (times: number) => {
+        if (times > 10) {
+          console.error('❌ Redis max retries reached, falling back to memory cache');
+          return null;
         }
+        return Math.min(times * 100, 3000);
       }
     });
 
@@ -44,12 +42,13 @@ export async function initRedis(): Promise<boolean> {
       isConnected = true;
     });
 
-    redisClient.on('end', () => {
+    redisClient.on('close', () => {
       console.log('🔌 Redis connection closed');
       isConnected = false;
     });
 
-    await redisClient.connect();
+    // Test connection
+    await redisClient.ping();
     isConnected = true;
     return true;
   } catch (error) {
@@ -85,12 +84,12 @@ export async function getCache<T>(key: string): Promise<T | null> {
   }
 }
 
-export async function setCache(key: string, data: any, ttlSeconds: number = 60): Promise<void> {
+export async function setCache(key: string, data: unknown, ttlSeconds: number = 60): Promise<void> {
   try {
     const serialized = JSON.stringify(data);
     
     if (isConnected && redisClient) {
-      await redisClient.setEx(key, ttlSeconds, serialized);
+      await redisClient.setex(key, ttlSeconds, serialized);
     } else {
       // Fallback to memory cache
       memoryCache.set(key, { 
@@ -124,7 +123,7 @@ export async function deleteCachePattern(pattern: string): Promise<void> {
     if (isConnected && redisClient) {
       const keys = await redisClient.keys(pattern);
       if (keys.length > 0) {
-        await redisClient.del(keys);
+        await redisClient.del(...keys);
       }
     }
     
@@ -144,23 +143,23 @@ export async function getCacheStats(): Promise<{
   type: 'redis' | 'memory';
   connected: boolean;
   memoryKeys: number;
-  redisInfo?: any;
+  redisInfo?: { dbSize: number };
 }> {
-  const stats = {
-    type: (isConnected ? 'redis' : 'memory') as 'redis' | 'memory',
+  const stats: {
+    type: 'redis' | 'memory';
+    connected: boolean;
+    memoryKeys: number;
+    redisInfo?: { dbSize: number };
+  } = {
+    type: isConnected ? 'redis' : 'memory',
     connected: isConnected,
     memoryKeys: memoryCache.size,
-    redisInfo: null as any
   };
 
   if (isConnected && redisClient) {
     try {
-      const info = await redisClient.info('memory');
-      const dbSize = await redisClient.dbSize();
-      stats.redisInfo = {
-        dbSize,
-        memorySnippet: info.slice(0, 500)
-      };
+      const dbSize = await redisClient.dbsize();
+      stats.redisInfo = { dbSize };
     } catch (e) {
       // ignore
     }
