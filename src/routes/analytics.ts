@@ -862,6 +862,14 @@ router.get('/adl-chart', async (req: Request, res: Response) => {
 
 // Get overall stats
 router.get('/stats', async (req: Request, res: Response) => {
+  const cacheKey = 'overall_stats';
+  
+  // Check cache first (60 second TTL)
+  const cached = getCached<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
   try {
     // Get BULK API stats for volume
     let totalVolume = 0;
@@ -892,10 +900,10 @@ router.get('/stats', async (req: Request, res: Response) => {
     const [tradesResult, liqResult, tradersResult] = await Promise.all([
       query(`SELECT COUNT(*) as count FROM trades`).catch(() => [{ count: 0 }]),
       query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM liquidations`).catch(() => [{ count: 0, volume: 0 }]),
-      query(`SELECT COUNT(DISTINCT wallet_address) as count FROM traders`).catch(() => [{ count: 0 }])
+      query(`SELECT COUNT(*) as count FROM traders`).catch(() => [{ count: 0 }])
     ]);
     
-    res.json({
+    const result = {
       trades: {
         count: parseInt(tradesResult[0]?.count || '0'),
         volume: totalVolume
@@ -909,7 +917,12 @@ router.get('/stats', async (req: Request, res: Response) => {
         volume: 0
       },
       uniqueTraders: parseInt(tradersResult[0]?.count || '0')
-    });
+    };
+    
+    // Cache for 60 seconds
+    setCache(cacheKey, result, 60);
+    
+    res.json(result);
   } catch (error) {
     console.error('Error fetching stats:', error);
     res.status(500).json({ error: 'Failed to fetch stats' });
