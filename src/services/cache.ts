@@ -20,7 +20,7 @@ export async function initRedis(): Promise<boolean> {
       url: redisUrl,
       socket: {
         connectTimeout: 5000,
-        reconnectStrategy: (retries) => {
+        reconnectStrategy: (retries: number) => {
           if (retries > 10) {
             console.error('❌ Redis max retries reached, falling back to memory cache');
             return false;
@@ -30,7 +30,7 @@ export async function initRedis(): Promise<boolean> {
       }
     });
 
-    redisClient.on('error', (err) => {
+    redisClient.on('error', (err: Error) => {
       console.error('❌ Redis error:', err.message);
       isConnected = false;
     });
