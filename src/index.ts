@@ -146,6 +146,119 @@ app.get('/debug/collect', async (req, res) => {
   }
 });
 
+// Debug endpoint to run arbitrary SELECT queries with timing
+app.post('/debug/sql', async (req, res) => {
+  try {
+    const { sql } = req.body;
+    
+    if (!sql) {
+      return res.status(400).json({ error: 'Missing sql parameter' });
+    }
+    
+    // Security: Only allow SELECT statements
+    const trimmedSql = sql.trim().toLowerCase();
+    if (!trimmedSql.startsWith('select')) {
+      return res.status(400).json({ error: 'Only SELECT queries allowed' });
+    }
+    
+    // Disallow dangerous patterns
+    const dangerous = ['insert', 'update', 'delete', 'drop', 'truncate', 'alter', 'create', 'grant', 'revoke', ';'];
+    for (const pattern of dangerous) {
+      if (trimmedSql.includes(pattern) && pattern !== ';') {
+        return res.status(400).json({ error: `Query contains forbidden keyword: ${pattern}` });
+      }
+    }
+    
+    // Remove trailing semicolon if present
+    const cleanSql = sql.trim().replace(/;$/, '');
+    
+    const startTime = process.hrtime.bigint();
+    const result = await query(cleanSql);
+    const endTime = process.hrtime.bigint();
+    
+    const durationMs = Number(endTime - startTime) / 1_000_000;
+    
+    res.json({
+      success: true,
+      query: cleanSql,
+      rows: result.rows || result,
+      rowCount: Array.isArray(result) ? result.length : (result.rows?.length || 0),
+      durationMs: Math.round(durationMs * 100) / 100,
+      durationFormatted: durationMs < 1000 
+        ? `${Math.round(durationMs)}ms` 
+        : `${(durationMs / 1000).toFixed(2)}s`
+    });
+  } catch (error: any) {
+    res.status(500).json({ 
+      success: false,
+      error: error.message || String(error),
+      hint: error.hint || null,
+      position: error.position || null
+    });
+  }
+});
+
+// GET version for simple queries via URL
+app.get('/debug/sql', async (req, res) => {
+  try {
+    const sql = req.query.q as string;
+    
+    if (!sql) {
+      return res.status(400).json({ 
+        error: 'Missing q parameter',
+        usage: '/debug/sql?q=SELECT COUNT(*) FROM trades',
+        examples: [
+          '/debug/sql?q=SELECT COUNT(*) FROM trades',
+          '/debug/sql?q=SELECT COUNT(*) FROM traders',
+          '/debug/sql?q=SELECT * FROM trades ORDER BY timestamp DESC LIMIT 5',
+          '/debug/sql?q=SELECT wallet_address, total_volume, total_pnl FROM traders ORDER BY total_volume DESC LIMIT 10',
+        ]
+      });
+    }
+    
+    // Security: Only allow SELECT statements
+    const trimmedSql = sql.trim().toLowerCase();
+    if (!trimmedSql.startsWith('select')) {
+      return res.status(400).json({ error: 'Only SELECT queries allowed' });
+    }
+    
+    // Disallow dangerous patterns
+    const dangerous = ['insert', 'update', 'delete', 'drop', 'truncate', 'alter', 'create', 'grant', 'revoke'];
+    for (const pattern of dangerous) {
+      if (trimmedSql.includes(pattern)) {
+        return res.status(400).json({ error: `Query contains forbidden keyword: ${pattern}` });
+      }
+    }
+    
+    // Remove trailing semicolon if present
+    const cleanSql = sql.trim().replace(/;$/, '');
+    
+    const startTime = process.hrtime.bigint();
+    const result = await query(cleanSql);
+    const endTime = process.hrtime.bigint();
+    
+    const durationMs = Number(endTime - startTime) / 1_000_000;
+    
+    res.json({
+      success: true,
+      query: cleanSql,
+      rows: result.rows || result,
+      rowCount: Array.isArray(result) ? result.length : (result.rows?.length || 0),
+      durationMs: Math.round(durationMs * 100) / 100,
+      durationFormatted: durationMs < 1000 
+        ? `${Math.round(durationMs)}ms` 
+        : `${(durationMs / 1000).toFixed(2)}s`
+    });
+  } catch (error: any) {
+    res.status(500).json({ 
+      success: false,
+      error: error.message || String(error),
+      hint: error.hint || null,
+      position: error.position || null
+    });
+  }
+});
+
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/leaderboard', leaderboardRoutes);
