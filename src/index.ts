@@ -8,6 +8,7 @@ dotenv.config();
 import { testConnection, initializeDatabase, query } from './db';
 import { startDataCollector } from './jobs/dataCollector';
 import { startWebSocketListener, getWebSocketStats } from './jobs/wsListener';
+import { initRedis, getCacheStats } from './services/cache';
 
 // Import routes
 import authRoutes from './routes/auth';
@@ -266,6 +267,16 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/wallet', walletRoutes);
 app.use('/api/users', userRoutes);
 
+// Debug endpoint to check cache status
+app.get('/debug/cache', async (req, res) => {
+  try {
+    const stats = await getCacheStats();
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: String(error) });
+  }
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
@@ -290,6 +301,10 @@ async function start() {
   
   // Initialize database schema
   await initializeDatabase();
+  
+  // Initialize Redis cache (optional - falls back to memory if unavailable)
+  const redisConnected = await initRedis();
+  console.log(`📦 Cache: ${redisConnected ? 'Redis' : 'In-Memory (REDIS_URL not set)'}`);
   
   // Start data collector cron jobs
   startDataCollector();
