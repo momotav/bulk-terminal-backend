@@ -1,9 +1,13 @@
 import cron from 'node-cron';
-import { query, queryOne } from '../db';
+import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
 
-// List of known active wallets to track (will grow over time)
-let trackedWallets: string[] = [];
+// ============================================
+// OPTIMIZED DATA COLLECTOR
+// - Market stats: every 1 minute
+// - Trader snapshots: every 5 minutes, but only TOP 20 active wallets
+// - Cleanup: daily
+// ============================================
 
 // Collect market stats every minute
 async function collectMarketStats(): Promise<void> {
@@ -16,9 +20,6 @@ async function collectMarketStats(): Promise<void> {
     }
     
     for (const ticker of tickers) {
-      // Log first few times to debug
-      console.log(`📊 Ticker ${ticker.symbol}:`, JSON.stringify(ticker));
-      
       const price = ticker.markPrice || ticker.lastPrice || 0;
       const openInterest = ticker.openInterest || 0;
       const volume = ticker.quoteVolume || ticker.volume || 0;
@@ -36,7 +37,6 @@ async function collectMarketStats(): Promise<void> {
             openInterest,
             volume,
             fundingRate,
-            // Estimate long/short OI (50/50 split as placeholder)
             openInterest * 0.5,
             openInterest * 0.5,
           ]
@@ -50,30 +50,27 @@ async function collectMarketStats(): Promise<void> {
   }
 }
 
-// Update trader snapshots every 5 minutes
+// Update trader snapshots - ONLY top active wallets, with rate limiting
 async function updateTraderSnapshots(): Promise<void> {
   try {
-    // Also load wallets from recent trades that aren't being tracked yet
-    const newWallets = await query<{ wallet_address: string }>(
-      `SELECT DISTINCT wallet_address FROM trades 
-       WHERE wallet_address IS NOT NULL 
-       AND wallet_address NOT IN (SELECT wallet_address FROM traders)
-       LIMIT 50`
+    // Only fetch TOP 20 most recently active wallets (not all 1000!)
+    const activeWallets = await query<{ wallet_address: string }>(
+      `SELECT wallet_address FROM traders 
+       WHERE last_seen > NOW() - INTERVAL '1 hour'
+       ORDER BY last_seen DESC 
+       LIMIT 20`
     );
     
-    for (const row of newWallets) {
-      if (!trackedWallets.includes(row.wallet_address)) {
-        trackedWallets.push(row.wallet_address);
-        await query(
-          `INSERT INTO traders (wallet_address) VALUES ($1) ON CONFLICT DO NOTHING`,
-          [row.wallet_address]
-        );
-      }
+    if (activeWallets.length === 0) {
+      console.log('👤 No recently active wallets to update');
+      return;
     }
     
     let updated = 0;
     
-    for (const wallet of trackedWallets) {
+    for (const row of activeWallets) {
+      const wallet = row.wallet_address;
+      
       try {
         const account = await bulkApi.getFullAccount(wallet);
         if (!account) continue;
@@ -86,7 +83,7 @@ async function updateTraderSnapshots(): Promise<void> {
         const unrealizedPnl = account.margin.unrealizedPnl || 0;
         const totalPnl = realizedPnl + unrealizedPnl;
         
-        // Update trader with current PnL and notional
+        // Update trader with current PnL
         await query(
           `UPDATE traders SET 
              last_seen = NOW(),
@@ -95,87 +92,28 @@ async function updateTraderSnapshots(): Promise<void> {
           [wallet, totalPnl]
         );
         
-        // Create snapshot
-        await query(
-          `INSERT INTO trader_snapshots 
-           (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [
-            wallet,
-            realizedPnl,
-            unrealizedPnl,
-            account.positions.length,
-            totalNotional,
-          ]
-        );
+        // Create snapshot only if they have positions
+        if (account.positions.length > 0) {
+          await query(
+            `INSERT INTO trader_snapshots 
+             (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [wallet, realizedPnl, unrealizedPnl, account.positions.length, totalNotional]
+          );
+        }
         
         updated++;
         
-        // Small delay to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 200));
+        // Rate limit: 500ms between requests
+        await new Promise(resolve => setTimeout(resolve, 500));
       } catch (err) {
-        // Skip wallets that fail (might not exist on BULK)
-        console.error(`Failed to update wallet ${wallet.slice(0, 8)}:`, err);
+        // Skip wallets that fail
       }
     }
     
-    console.log(`👤 Updated snapshots for ${updated} traders`);
+    console.log(`👤 Updated snapshots for ${updated}/${activeWallets.length} active traders`);
   } catch (error) {
     console.error('❌ Failed to update trader snapshots:', error);
-  }
-}
-
-// Discover new wallets from recent trades (placeholder - needs WebSocket in production)
-async function discoverNewWallets(): Promise<void> {
-  // In production, this would listen to WebSocket trades
-  // For now, we can manually add wallets or import from a source
-  
-  // Example: Add some test wallets if list is empty
-  if (trackedWallets.length === 0) {
-    // These would be real wallets discovered from trading activity
-    console.log('📍 No wallets to track yet. Add wallets via API or WebSocket discovery.');
-  }
-}
-
-// Load tracked wallets from database
-async function loadTrackedWallets(): Promise<void> {
-  try {
-    const rows = await query<{ wallet_address: string }>(
-      'SELECT wallet_address FROM traders ORDER BY last_seen DESC LIMIT 1000'
-    );
-    trackedWallets = rows.map(r => r.wallet_address);
-    console.log(`📋 Loaded ${trackedWallets.length} wallets to track`);
-  } catch (error) {
-    console.error('❌ Failed to load tracked wallets:', error);
-  }
-}
-
-// Add a wallet to track
-export async function addWalletToTrack(wallet: string): Promise<boolean> {
-  try {
-    // Verify wallet has activity
-    const account = await bulkApi.getFullAccount(wallet);
-    if (!account) {
-      return false;
-    }
-    
-    // Add to database
-    await query(
-      `INSERT INTO traders (wallet_address)
-       VALUES ($1)
-       ON CONFLICT (wallet_address) DO NOTHING`,
-      [wallet]
-    );
-    
-    // Add to in-memory list
-    if (!trackedWallets.includes(wallet)) {
-      trackedWallets.push(wallet);
-    }
-    
-    return true;
-  } catch (error) {
-    console.error(`Failed to add wallet ${wallet}:`, error);
-    return false;
   }
 }
 
@@ -195,7 +133,6 @@ export async function recordLiquidation(
     [wallet, symbol, side, size, price, value]
   );
   
-  // Update trader stats if wallet known
   if (wallet) {
     await query(
       `UPDATE traders 
@@ -217,7 +154,6 @@ export async function recordTrade(
 ): Promise<void> {
   const value = size * price;
   
-  // Only record significant trades (>$1000)
   if (value < 1000) return;
   
   await query(
@@ -226,7 +162,6 @@ export async function recordTrade(
     [wallet, symbol, side, size, price, value]
   );
   
-  // Update trader stats if wallet known
   if (wallet) {
     await query(
       `UPDATE traders 
@@ -238,22 +173,11 @@ export async function recordTrade(
   }
 }
 
-// Clean up old data (keep 30 days of detailed data)
+// Clean up old data
 async function cleanupOldData(): Promise<void> {
   try {
-    // Keep market stats for 30 days
-    await query(
-      `DELETE FROM market_stats WHERE timestamp < NOW() - INTERVAL '30 days'`
-    );
-    
-    // Keep snapshots for 30 days
-    await query(
-      `DELETE FROM trader_snapshots WHERE timestamp < NOW() - INTERVAL '30 days'`
-    );
-    
-    // Keep liquidations forever (or limit to 90 days if needed)
-    // await query(`DELETE FROM liquidations WHERE timestamp < NOW() - INTERVAL '90 days'`);
-    
+    await query(`DELETE FROM market_stats WHERE timestamp < NOW() - INTERVAL '30 days'`);
+    await query(`DELETE FROM trader_snapshots WHERE timestamp < NOW() - INTERVAL '30 days'`);
     console.log('🧹 Cleaned up old data');
   } catch (error) {
     console.error('❌ Failed to cleanup old data:', error);
@@ -264,22 +188,14 @@ async function cleanupOldData(): Promise<void> {
 export function startDataCollector(): void {
   console.log('🚀 Starting data collector...');
   
-  // Load existing wallets
-  loadTrackedWallets();
-  
   // Collect market stats every minute
   cron.schedule('* * * * *', () => {
     collectMarketStats();
   });
   
-  // Update trader snapshots every 5 minutes
+  // Update trader snapshots every 5 minutes (only top 20 active)
   cron.schedule('*/5 * * * *', () => {
     updateTraderSnapshots();
-  });
-  
-  // Discover new wallets every 10 minutes
-  cron.schedule('*/10 * * * *', () => {
-    discoverNewWallets();
   });
   
   // Clean up old data daily at 3am
@@ -290,5 +206,5 @@ export function startDataCollector(): void {
   // Run initial collection
   collectMarketStats();
   
-  console.log('✅ Data collector started');
+  console.log('✅ Data collector started (optimized: max 20 wallet fetches per 5 min)');
 }
