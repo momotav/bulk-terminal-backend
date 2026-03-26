@@ -215,6 +215,70 @@ export function addWalletToTrack(wallet: string): Promise<void> {
 }
 
 // Record a trade to database
+// Trade queue for batching inserts
+const tradeQueue: Array<{
+  symbol: string;
+  price: number;
+  size: number;
+  side: string;
+  walletAddress: string | null;
+  value: number;
+  time: number;
+}> = [];
+
+// Flush trade queue every 2 seconds
+setInterval(async () => {
+  if (tradeQueue.length === 0) return;
+  
+  const trades = tradeQueue.splice(0, tradeQueue.length); // Take all trades
+  
+  try {
+    // Batch insert all trades at once
+    const values = trades.map((t, i) => {
+      const offset = i * 7;
+      return `($${offset + 1}::varchar, $${offset + 2}::varchar, $${offset + 3}::varchar, $${offset + 4}, $${offset + 5}, $${offset + 6}, to_timestamp($${offset + 7}/1000.0))`;
+    }).join(', ');
+    
+    const params = trades.flatMap(t => [
+      t.walletAddress, t.symbol, t.side, Math.abs(t.size), t.price, t.value, t.time
+    ]);
+    
+    await query(
+      `INSERT INTO trades (wallet_address, symbol, side, size, price, value, timestamp) VALUES ${values}`,
+      params
+    );
+    
+    // Batch update trader stats
+    const walletUpdates = new Map<string, { trades: number; volume: number }>();
+    for (const t of trades) {
+      if (t.walletAddress) {
+        const existing = walletUpdates.get(t.walletAddress) || { trades: 0, volume: 0 };
+        existing.trades++;
+        existing.volume += t.value;
+        walletUpdates.set(t.walletAddress, existing);
+      }
+    }
+    
+    // Update traders table in batch
+    for (const [wallet, data] of walletUpdates) {
+      await query(
+        `INSERT INTO traders (wallet_address, total_trades, total_volume, last_seen)
+         VALUES ($1::varchar, $2, $3, NOW())
+         ON CONFLICT (wallet_address) DO UPDATE SET
+           total_trades = traders.total_trades + $2,
+           total_volume = traders.total_volume + $3,
+           last_seen = NOW()`,
+        [wallet, data.trades, data.volume]
+      );
+    }
+    
+    console.log(`💾 Batch inserted ${trades.length} trades, updated ${walletUpdates.size} traders`);
+  } catch (error) {
+    console.error('Failed to batch insert trades:', error);
+    // Don't re-queue - just log and move on to prevent memory leak
+  }
+}, 2000);
+
 async function recordTrade(trade: {
   symbol: string;
   price: number;
@@ -231,47 +295,23 @@ async function recordTrade(trade: {
 
   const walletAddress = trade.taker || trade.maker || null;
   
-  try {
-    // Insert trade with explicit type casts
-    await query(
-      `INSERT INTO trades (wallet_address, symbol, side, size, price, value, timestamp)
-       VALUES ($1::varchar, $2::varchar, $3::varchar, $4, $5, $6, to_timestamp($7/1000.0))`,
-      [walletAddress, trade.symbol, trade.side, Math.abs(trade.size), trade.price, value, trade.time]
-    );
+  // Add to queue instead of immediate insert
+  tradeQueue.push({
+    symbol: trade.symbol,
+    price: trade.price,
+    size: trade.size,
+    side: trade.side,
+    walletAddress,
+    value,
+    time: trade.time
+  });
 
-    // Update trader stats if wallet known
-    if (walletAddress) {
-      await query(
-        `INSERT INTO traders (wallet_address, total_trades, total_volume, last_seen)
-         VALUES ($1::varchar, 1, $2, NOW())
-         ON CONFLICT (wallet_address) DO UPDATE SET
-           total_trades = traders.total_trades + 1,
-           total_volume = traders.total_volume + $2,
-           last_seen = NOW()`,
-        [walletAddress, value]
-      );
-      
-      // Create notifications for users following this wallet (use separate params to avoid type confusion)
-      await query(
-        `INSERT INTO notifications (user_id, wallet_address, type, symbol, side, size, price, value)
-         SELECT user_id, $1::varchar, 'trade', $2::varchar, $3::varchar, $4, $5, $6
-         FROM watchlist WHERE wallet_address = $7::varchar`,
-        [walletAddress, trade.symbol, trade.side, Math.abs(trade.size), trade.price, value, walletAddress]
-      );
-      
-      // Fetch full wallet PnL from BULK API (async, don't wait)
-      fetchAndStoreWalletData(walletAddress).catch(() => {});
-      
-      // Subscribe to wallet's account channel for liquidation events
-      subscribeToWalletAccount(walletAddress);
-    }
-
-    stats.tradesReceived++;
-    stats.lastTradeTime = new Date();
-
+  stats.tradesReceived++;
+  stats.lastTradeTime = new Date();
+  
+  // Only log significant trades to reduce console spam
+  if (value > 10000) {
     console.log(`📈 Trade: ${trade.side.toUpperCase()} ${trade.symbol} | $${value.toFixed(2)}`);
-  } catch (error) {
-    console.error('Failed to record trade:', error);
   }
 }
 
@@ -296,7 +336,7 @@ async function recordLiquidation(liq: {
       [walletAddress, liq.symbol, liq.side, Math.abs(liq.size), liq.price, value, liq.time]
     );
 
-    // Update trader stats if wallet known
+    // Update trader stats if wallet known (single query, no notifications to save connections)
     if (walletAddress) {
       await query(
         `INSERT INTO traders (wallet_address, total_liquidations, liquidation_value, last_seen)
@@ -307,17 +347,6 @@ async function recordLiquidation(liq: {
            last_seen = NOW()`,
         [walletAddress, value]
       );
-      
-      // Create notifications for users following this wallet (use separate params)
-      await query(
-        `INSERT INTO notifications (user_id, wallet_address, type, symbol, side, size, price, value)
-         SELECT user_id, $1::varchar, 'liquidation', $2::varchar, $3::varchar, $4, $5, $6
-         FROM watchlist WHERE wallet_address = $7::varchar`,
-        [walletAddress, liq.symbol, liq.side, Math.abs(liq.size), liq.price, value, walletAddress]
-      );
-      
-      // Auto-track liquidated wallets
-      addWalletToTrack(walletAddress).catch(() => {});
     }
 
     stats.liquidationsReceived++;
