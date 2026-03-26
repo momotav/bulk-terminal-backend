@@ -184,6 +184,23 @@ async function cleanupOldData(): Promise<void> {
   }
 }
 
+// Add a wallet to track (called from wallet routes)
+export async function addWalletToTrack(wallet: string): Promise<boolean> {
+  try {
+    // Just add to database, don't fetch from API immediately
+    await query(
+      `INSERT INTO traders (wallet_address, last_seen)
+       VALUES ($1, NOW())
+       ON CONFLICT (wallet_address) DO UPDATE SET last_seen = NOW()`,
+      [wallet]
+    );
+    return true;
+  } catch (error) {
+    console.error(`Failed to add wallet ${wallet}:`, error);
+    return false;
+  }
+}
+
 // Start all cron jobs
 export function startDataCollector(): void {
   console.log('🚀 Starting data collector...');
