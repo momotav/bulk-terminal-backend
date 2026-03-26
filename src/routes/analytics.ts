@@ -158,11 +158,12 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
   const cached = getCached<any>(cacheKey);
   if (cached) {
     return res.json(cached);
-  }
-  
+  }  
+
   try {
     let totalVolume24h = 0;
     let totalOpenInterest = 0;
+    let activeTraders = 0;
     let timestamp = Date.now();
     
     // First try /stats endpoint (with timeout)
@@ -179,21 +180,22 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
         const bulkStats = await response.json() as BulkStatsResponse;
         timestamp = bulkStats.timestamp || Date.now();
         
-        // Calculate from markets if available
-        if (bulkStats?.markets && bulkStats.markets.length > 0) {
-          for (const market of bulkStats.markets) {
-            totalVolume24h += market.quoteVolume || 0;
-            totalOpenInterest += (market.openInterest || 0) * (market.markPrice || 0);
-          }
-        }
-        
-        // Use totals if available
         if (bulkStats?.volume?.totalUsd && bulkStats.volume.totalUsd > 0) {
           totalVolume24h = bulkStats.volume.totalUsd;
         }
         if (bulkStats?.openInterest?.totalUsd && bulkStats.openInterest.totalUsd > 0) {
           totalOpenInterest = bulkStats.openInterest.totalUsd;
         }
+        // Calculate from markets if available
+        if (bulkStats?.markets && bulkStats.markets.length > 0) {
+          if (totalVolume24h == 0 || totalOpenInterest == 0){
+            for (const market of bulkStats.markets) {
+              totalVolume24h += market.quoteVolume || 0;
+              totalOpenInterest += (market.openInterest || 0) * (market.markPrice || 0);
+            }
+          }
+        }
+        // Use totals if available
       }
     } catch (e) {
       console.error('Failed to fetch BULK stats:', e);
@@ -213,7 +215,6 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     }
     
     // Get active traders from traders table (much faster than COUNT DISTINCT on trades)
-    let activeTraders = 0;
     try {
       const tradersResult = await Promise.race([
         query(`
@@ -225,20 +226,8 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       ]) as any[];
       activeTraders = parseInt(tradersResult[0]?.count || '0');
       
-      // Fallback: if no recent activity, show total unique traders
-      if (activeTraders === 0) {
-        const totalResult = await query(`SELECT COUNT(*) as count FROM traders`);
-        activeTraders = parseInt(totalResult[0]?.count || '0');
-      }
     } catch (e) {
       console.error('Failed to get active traders:', e);
-      // Fallback to total traders count
-      try {
-        const totalResult = await query(`SELECT COUNT(*) as count FROM traders`);
-        activeTraders = parseInt(totalResult[0]?.count || '0');
-      } catch (e2) {
-        activeTraders = 0;
-      }
     }
     
     // Get liquidations from DB (last 24h) - with timeout
