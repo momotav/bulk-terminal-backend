@@ -7,10 +7,10 @@ dotenv.config();
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  // Connection pool settings
-  max: 10,                       // Maximum number of clients
-  idleTimeoutMillis: 30000,      // Close idle clients after 30 seconds
-  connectionTimeoutMillis: 10000, // Return error if can't connect in 10 seconds
+  // Connection pool settings - increased for high throughput
+  max: 20,                        // Maximum number of clients (was 10)
+  idleTimeoutMillis: 30000,       // Close idle clients after 30 seconds
+  connectionTimeoutMillis: 15000, // Return error if can't connect in 15 seconds (was 10)
   // NOTE: Don't set query_timeout here - it breaks CREATE INDEX on large tables
 });
 
