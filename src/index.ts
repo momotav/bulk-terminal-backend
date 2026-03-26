@@ -181,8 +181,8 @@ app.post('/debug/sql', async (req, res) => {
     res.json({
       success: true,
       query: cleanSql,
-      rows: result.rows || result,
-      rowCount: Array.isArray(result) ? result.length : (result.rows?.length || 0),
+      rows: result,
+      rowCount: result.length,
       durationMs: Math.round(durationMs * 100) / 100,
       durationFormatted: durationMs < 1000 
         ? `${Math.round(durationMs)}ms` 
@@ -242,8 +242,8 @@ app.get('/debug/sql', async (req, res) => {
     res.json({
       success: true,
       query: cleanSql,
-      rows: result.rows || result,
-      rowCount: Array.isArray(result) ? result.length : (result.rows?.length || 0),
+      rows: result,
+      rowCount: result.length,
       durationMs: Math.round(durationMs * 100) / 100,
       durationFormatted: durationMs < 1000 
         ? `${Math.round(durationMs)}ms` 
