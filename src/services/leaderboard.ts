@@ -340,6 +340,162 @@ class LeaderboardService {
       [limit]
     );
   }
+
+  // Get wallet's rank across all leaderboard types
+  async getWalletRank(walletAddress: string): Promise<{
+    wallet_address: string;
+    found: boolean;
+    rankings: {
+      volume: { rank: number; total: number; value: number } | null;
+      pnl: { rank: number; total: number; value: number } | null;
+      trades: { rank: number; total: number; value: number } | null;
+      liquidations: { rank: number; total: number; value: number } | null;
+    };
+    stats: {
+      total_volume: number;
+      total_trades: number;
+      total_pnl: number;
+      total_liquidations: number;
+      liquidation_value: number;
+    } | null;
+  }> {
+    const cacheKey = `wallet_rank_${walletAddress}`;
+    const cached = getCached<any>(cacheKey);
+    if (cached) return cached;
+
+    try {
+      // First, check if wallet exists and get their stats
+      const walletStats = await query<{
+        wallet_address: string;
+        total_volume: number;
+        total_trades: number;
+        total_pnl: number;
+        total_liquidations: number;
+        liquidation_value: number;
+      }>(
+        `SELECT wallet_address, total_volume, total_trades, total_pnl, total_liquidations, liquidation_value
+         FROM traders
+         WHERE wallet_address = $1`,
+        [walletAddress]
+      );
+
+      if (walletStats.length === 0) {
+        return {
+          wallet_address: walletAddress,
+          found: false,
+          rankings: {
+            volume: null,
+            pnl: null,
+            trades: null,
+            liquidations: null,
+          },
+          stats: null,
+        };
+      }
+
+      const stats = walletStats[0];
+
+      // Get total count of traders for context
+      const totalCountResult = await query<{ count: number }>(
+        `SELECT COUNT(*) as count FROM traders WHERE total_volume > 0`
+      );
+      const totalTraders = parseInt(totalCountResult[0]?.count as any) || 0;
+
+      // Get rank by volume
+      const volumeRankResult = await query<{ rank: number }>(
+        `SELECT COUNT(*) + 1 as rank 
+         FROM traders 
+         WHERE total_volume > $1`,
+        [stats.total_volume]
+      );
+      const volumeRank = parseInt(volumeRankResult[0]?.rank as any) || 0;
+
+      // Get rank by PnL
+      const pnlRankResult = await query<{ rank: number }>(
+        `SELECT COUNT(*) + 1 as rank 
+         FROM traders 
+         WHERE total_pnl > $1`,
+        [stats.total_pnl]
+      );
+      const pnlRank = parseInt(pnlRankResult[0]?.rank as any) || 0;
+
+      // Get rank by trades count
+      const tradesRankResult = await query<{ rank: number }>(
+        `SELECT COUNT(*) + 1 as rank 
+         FROM traders 
+         WHERE total_trades > $1`,
+        [stats.total_trades]
+      );
+      const tradesRank = parseInt(tradesRankResult[0]?.rank as any) || 0;
+
+      // Get rank by liquidation value
+      const liqRankResult = await query<{ rank: number }>(
+        `SELECT COUNT(*) + 1 as rank 
+         FROM traders 
+         WHERE liquidation_value > $1`,
+        [stats.liquidation_value]
+      );
+      const liqRank = parseInt(liqRankResult[0]?.rank as any) || 0;
+
+      // Count traders with liquidations for context
+      const totalLiquidatedResult = await query<{ count: number }>(
+        `SELECT COUNT(*) as count FROM traders WHERE liquidation_value > 0`
+      );
+      const totalLiquidated = parseInt(totalLiquidatedResult[0]?.count as any) || 0;
+
+      const result = {
+        wallet_address: walletAddress,
+        found: true,
+        rankings: {
+          volume: {
+            rank: volumeRank,
+            total: totalTraders,
+            value: parseFloat(stats.total_volume as any) || 0,
+          },
+          pnl: {
+            rank: pnlRank,
+            total: totalTraders,
+            value: parseFloat(stats.total_pnl as any) || 0,
+          },
+          trades: {
+            rank: tradesRank,
+            total: totalTraders,
+            value: parseInt(stats.total_trades as any) || 0,
+          },
+          liquidations: stats.liquidation_value > 0 ? {
+            rank: liqRank,
+            total: totalLiquidated,
+            value: parseFloat(stats.liquidation_value as any) || 0,
+          } : null,
+        },
+        stats: {
+          total_volume: parseFloat(stats.total_volume as any) || 0,
+          total_trades: parseInt(stats.total_trades as any) || 0,
+          total_pnl: parseFloat(stats.total_pnl as any) || 0,
+          total_liquidations: parseInt(stats.total_liquidations as any) || 0,
+          liquidation_value: parseFloat(stats.liquidation_value as any) || 0,
+        },
+      };
+
+      // Cache for 60 seconds
+      setCache(cacheKey, result, 60);
+
+      return result;
+    } catch (error) {
+      console.error('getWalletRank error:', error);
+      return {
+        wallet_address: walletAddress,
+        found: false,
+        rankings: {
+          volume: null,
+          pnl: null,
+          trades: null,
+          liquidations: null,
+        },
+        stats: null,
+      };
+    }
+  }
 }
 
 export const leaderboardService = new LeaderboardService();
