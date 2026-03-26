@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { query } from '../db';
+import { getCache, setCache } from '../services/cache';
 
 const router = Router();
 
@@ -8,22 +9,6 @@ const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
 // All supported markets
 const MARKETS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
-
-// ============ SIMPLE IN-MEMORY CACHE ============
-const analyticsCache: Map<string, { data: any; expiry: number }> = new Map();
-
-function getCached<T>(key: string): T | null {
-  const cached = analyticsCache.get(key);
-  if (cached && cached.expiry > Date.now()) {
-    return cached.data as T;
-  }
-  return null;
-}
-
-function setCache(key: string, data: any, ttlSeconds: number = 60): void {
-  analyticsCache.set(key, { data, expiry: Date.now() + ttlSeconds * 1000 });
-}
-// ============ END CACHE ============
 
 // Type for BULK ticker response
 interface BulkTicker {
@@ -152,18 +137,17 @@ router.get('/ticker/:symbol', async (req: Request, res: Response) => {
 
 // Get exchange stats - transforms BULK API data for dashboard
 router.get('/exchange-stats', async (req: Request, res: Response) => {
-  const cacheKey = 'exchange_stats';
+  const cacheKey = 'analytics:exchange_stats';
   
   // Check cache first (cache for 30 seconds)
-  const cached = getCached<any>(cacheKey);
+  const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
-  }  
-
+  }
+  
   try {
     let totalVolume24h = 0;
     let totalOpenInterest = 0;
-    let activeTraders = 0;
     let timestamp = Date.now();
     
     // First try /stats endpoint (with timeout)
@@ -180,22 +164,21 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
         const bulkStats = await response.json() as BulkStatsResponse;
         timestamp = bulkStats.timestamp || Date.now();
         
+        // Calculate from markets if available
+        if (bulkStats?.markets && bulkStats.markets.length > 0) {
+          for (const market of bulkStats.markets) {
+            totalVolume24h += market.quoteVolume || 0;
+            totalOpenInterest += (market.openInterest || 0) * (market.markPrice || 0);
+          }
+        }
+        
+        // Use totals if available
         if (bulkStats?.volume?.totalUsd && bulkStats.volume.totalUsd > 0) {
           totalVolume24h = bulkStats.volume.totalUsd;
         }
         if (bulkStats?.openInterest?.totalUsd && bulkStats.openInterest.totalUsd > 0) {
           totalOpenInterest = bulkStats.openInterest.totalUsd;
         }
-        // Calculate from markets if available
-        if (bulkStats?.markets && bulkStats.markets.length > 0) {
-          if (totalVolume24h == 0 || totalOpenInterest == 0){
-            for (const market of bulkStats.markets) {
-              totalVolume24h += market.quoteVolume || 0;
-              totalOpenInterest += (market.openInterest || 0) * (market.markPrice || 0);
-            }
-          }
-        }
-        // Use totals if available
       }
     } catch (e) {
       console.error('Failed to fetch BULK stats:', e);
@@ -215,6 +198,7 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     }
     
     // Get active traders from traders table (much faster than COUNT DISTINCT on trades)
+    let activeTraders = 0;
     try {
       const tradersResult = await Promise.race([
         query(`
@@ -226,8 +210,20 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       ]) as any[];
       activeTraders = parseInt(tradersResult[0]?.count || '0');
       
+      // Fallback: if no recent activity, show total unique traders
+      if (activeTraders === 0) {
+        const totalResult = await query(`SELECT COUNT(*) as count FROM traders`);
+        activeTraders = parseInt(totalResult[0]?.count || '0');
+      }
     } catch (e) {
       console.error('Failed to get active traders:', e);
+      // Fallback to total traders count
+      try {
+        const totalResult = await query(`SELECT COUNT(*) as count FROM traders`);
+        activeTraders = parseInt(totalResult[0]?.count || '0');
+      } catch (e2) {
+        activeTraders = 0;
+      }
     }
     
     // Get liquidations from DB (last 24h) - with timeout
@@ -256,7 +252,7 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     };
     
     // Cache for 30 seconds
-    setCache(cacheKey, result, 30);
+    await setCache(cacheKey, result, 30);
     
     res.json(result);
   } catch (error) {
@@ -577,10 +573,10 @@ router.get('/funding-rate-history/:symbol', async (req: Request, res: Response) 
 // Combined OI chart data for all symbols
 router.get('/oi-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
-  const cacheKey = `oi_chart_${hours}`;
+  const cacheKey = `analytics:oi_chart:${hours}`;
   
   // Check cache first
-  const cached = getCached<any>(cacheKey);
+  const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
@@ -623,7 +619,7 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
     const response = { hours, dataPoints: data.length, data };
     
     // Cache for 60 seconds
-    setCache(cacheKey, response, 60);
+    await setCache(cacheKey, response, 60);
     
     res.json(response);
   } catch (error) {
@@ -635,10 +631,10 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
 // Combined Funding Rate chart data for all symbols
 router.get('/funding-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
-  const cacheKey = `funding_chart_${hours}`;
+  const cacheKey = `analytics:funding_chart:${hours}`;
   
   // Check cache first
-  const cached = getCached<any>(cacheKey);
+  const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
@@ -679,7 +675,7 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
     const response = { hours, dataPoints: data.length, data };
     
     // Cache for 60 seconds
-    setCache(cacheKey, response, 60);
+    await setCache(cacheKey, response, 60);
     
     res.json(response);
   } catch (error) {
@@ -742,10 +738,10 @@ router.get('/volume-chart', async (req: Request, res: Response) => {
 // Get trades chart data from database
 router.get('/trades-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
-  const cacheKey = `trades_chart_${hours}`;
+  const cacheKey = `analytics:trades_chart:${hours}`;
   
   // Check cache first
-  const cached = getCached<any>(cacheKey);
+  const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
@@ -771,7 +767,7 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
     const result = { data };
     
     // Cache for 60 seconds
-    setCache(cacheKey, result, 60);
+    await setCache(cacheKey, result, 60);
     
     res.json(result);
   } catch (error) {
@@ -784,10 +780,10 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
 // Get liquidations chart data from database
 router.get('/liquidations-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
-  const cacheKey = `liquidations_chart_${hours}`;
+  const cacheKey = `analytics:liquidations_chart:${hours}`;
   
   // Check cache first
-  const cached = getCached<any>(cacheKey);
+  const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
@@ -812,7 +808,7 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
     const result = { data };
     
     // Cache for 60 seconds
-    setCache(cacheKey, result, 60);
+    await setCache(cacheKey, result, 60);
     
     res.json(result);
   } catch (error) {
@@ -851,10 +847,10 @@ router.get('/adl-chart', async (req: Request, res: Response) => {
 
 // Get overall stats
 router.get('/stats', async (req: Request, res: Response) => {
-  const cacheKey = 'overall_stats';
+  const cacheKey = 'analytics:overall_stats';
   
   // Check cache first (60 second TTL)
-  const cached = getCached<any>(cacheKey);
+  const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
@@ -909,7 +905,7 @@ router.get('/stats', async (req: Request, res: Response) => {
     };
     
     // Cache for 60 seconds
-    setCache(cacheKey, result, 60);
+    await setCache(cacheKey, result, 60);
     
     res.json(result);
   } catch (error) {
