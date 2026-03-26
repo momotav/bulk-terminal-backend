@@ -3,6 +3,7 @@ import { query, queryOne } from '../db';
 import { bulkApi } from '../services/bulkApi';
 import { addWalletToTrack } from '../jobs/dataCollector';
 import { requireAuth } from '../middleware/auth';
+import { getCache, setCache } from '../services/cache';
 
 const router = Router();
 
@@ -10,6 +11,13 @@ const router = Router();
 router.get('/:address', async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
+    
+    // Check cache first (30 second TTL)
+    const cacheKey = `wallet:profile:${address}`;
+    const cached = await getCache<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
     
     // Get live account data from BULK
     const account = await bulkApi.getFullAccount(address);
@@ -20,8 +28,6 @@ router.get('/:address', async (req: Request, res: Response) => {
     for (const ticker of tickers) {
       markPrices[ticker.symbol] = ticker.markPrice;
     }
-    
-    console.log(`🔍 Wallet API for ${address.slice(0,8)}:`, JSON.stringify(account));
     
     // Get our tracked data
     const trader = await queryOne(
@@ -39,13 +45,18 @@ router.get('/:address', async (req: Request, res: Response) => {
       [address]
     );
     
-    res.json({
+    const result = {
       address,
       live: account,
-      markPrices,  // Include current mark prices
+      markPrices,
       tracked: trader,
       history: snapshots.reverse(),
-    });
+    };
+    
+    // Cache for 30 seconds
+    await setCache(cacheKey, result, 30);
+    
+    res.json(result);
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch wallet data' });
   }
