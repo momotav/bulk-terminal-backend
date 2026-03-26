@@ -156,7 +156,7 @@ class LeaderboardService {
     return result;
   }
 
-  // Biggest Positions (Whale Watch) - fetch from BULK API directly with caching
+  // Biggest Positions (Whale Watch) - use database snapshots instead of API
   async getBiggestPositions(limit: number = 50): Promise<LeaderboardEntry[]> {
     const cacheKey = `leaderboard:whales:${limit}`;
     const cached = await getCache<LeaderboardEntry[]>(cacheKey);
@@ -164,84 +164,40 @@ class LeaderboardService {
     
     const excludeFilter = this.getExcludedFilter();
     
-    // Known active wallets to seed data
-    const seedWallets = [
-      '8cbNvb2Drc2m9CgosPKP8pWNWkbwbWCCQrqZ4h9MoFFN',
-      '6q3BqzWLn7NZrDa2CNEH7mKsZbYHqHUKSnNfn46zGLn6',
-      '9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt',
-    ];
-    
     try {
-      // Get recent wallets from traders table
-      let wallets: string[] = [];
-      try {
-        const dbWallets = await query<{ wallet_address: string }>(
-          `SELECT wallet_address FROM traders 
-           WHERE wallet_address IS NOT NULL ${excludeFilter}
-           ORDER BY last_seen DESC 
-           LIMIT 50`
-        );
-        wallets = dbWallets.map(w => w.wallet_address);
-      } catch (e) {
-        console.log('Using seed wallets only');
-      }
+      // Get latest snapshot for each wallet with positions
+      const rows = await query<{ 
+        wallet_address: string; 
+        total_notional: number; 
+        positions_count: number;
+      }>(
+        `SELECT DISTINCT ON (wallet_address)
+          wallet_address,
+          total_notional,
+          positions_count
+         FROM trader_snapshots
+         WHERE total_notional > 0 
+           AND timestamp > NOW() - INTERVAL '24 hours'
+           ${excludeFilter}
+         ORDER BY wallet_address, timestamp DESC`
+      );
       
-      // Combine and dedupe, limit to 20 for speed
-      const allWallets = [...new Set([...seedWallets, ...wallets])].slice(0, 20);
+      // Sort by notional and limit
+      const sorted = rows
+        .sort((a, b) => (parseFloat(b.total_notional as any) || 0) - (parseFloat(a.total_notional as any) || 0))
+        .slice(0, limit);
       
-      // Fetch ALL wallets in PARALLEL (much faster!)
-      const fetchWallet = async (wallet_address: string): Promise<LeaderboardEntry | null> => {
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 2000);
-          
-          const response = await fetch('https://exchange-api.bulk.trade/api/v1/account', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type: 'fullAccount', user: wallet_address }),
-            signal: controller.signal
-          });
-          clearTimeout(timeoutId);
-          
-          if (!response.ok) return null;
-          
-          const data = await response.json() as any[];
-          if (!data || !data[0]?.fullAccount) return null;
-          
-          const account = data[0].fullAccount;
-          if (!account.positions || account.positions.length === 0) return null;
-          
-          let totalNotional = 0;
-          for (const pos of account.positions) {
-            totalNotional += Math.abs(pos.notional || 0);
-          }
-          
-          if (totalNotional > 0) {
-            return {
-              rank: 0,
-              wallet_address,
-              value: totalNotional,
-              positions: account.positions.length
-            };
-          }
-          return null;
-        } catch (e) {
-          return null;
-        }
-      };
-      
-      // Parallel fetch
-      const results = await Promise.all(allWallets.map(fetchWallet));
-      const validResults = results.filter((r): r is LeaderboardEntry => r !== null);
-      
-      // Sort by value and assign ranks
-      validResults.sort((a, b) => b.value - a.value);
-      const finalResults = validResults.slice(0, limit).map((r, i) => ({ ...r, rank: i + 1 }));
+      const result = sorted.map((row, index) => ({
+        rank: index + 1,
+        wallet_address: row.wallet_address,
+        value: parseFloat(row.total_notional as any) || 0,
+        positions: parseInt(row.positions_count as any) || 0,
+      }));
       
       // Cache for 60 seconds
-      await setCache(cacheKey, finalResults, 60);
+      await setCache(cacheKey, result, 60);
       
-      return finalResults;
+      return result;
     } catch (e) {
       console.error('getBiggestPositions error:', e);
       return [];
