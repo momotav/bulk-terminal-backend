@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { query } from '../db';
 import { PrivyClient } from '@privy-io/server-auth';
+import { getCache, setCache } from '../services/cache';
 
 const router = Router();
 
@@ -441,7 +442,6 @@ router.get('/search', async (req: Request, res: Response) => {
 router.get('/wallet/:address', async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
-    console.log('[Users] Getting wallet profile for:', address);
 
     // Get user profile if they've registered
     const users = await query(`
@@ -451,9 +451,7 @@ router.get('/wallet/:address', async (req: Request, res: Response) => {
       WHERE wallet_address = $1
     `, [address]);
 
-    console.log('[Users] User query result:', users.length > 0 ? 'Found' : 'Not found');
-
-    // Get wallet stats from traders table (without win_rate which may not exist)
+    // Get wallet stats from traders table
     let stats = null;
     try {
       const statsResult = await query(`
@@ -465,24 +463,16 @@ router.get('/wallet/:address', async (req: Request, res: Response) => {
         WHERE wallet_address = $1
       `, [address]);
       stats = statsResult[0] || null;
-      console.log('[Users] Stats query result:', stats ? 'Found' : 'Not found');
     } catch (statsError) {
-      console.error('[Users] Stats query error (non-fatal):', statsError);
       // Continue without stats
     }
 
     if (users.length === 0) {
-      console.log('[Users] No user profile found, returning null profile with stats');
       return res.json({ 
         profile: null, 
         stats: stats 
       });
     }
-
-    console.log('[Users] Returning profile:', {
-      wallet: users[0].wallet_address,
-      twitter: users[0].twitter_handle || 'none'
-    });
 
     res.json({ 
       profile: users[0],
@@ -491,6 +481,57 @@ router.get('/wallet/:address', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('[Users] Get wallet profile error:', error);
     res.status(500).json({ error: 'Failed to get wallet profile' });
+  }
+});
+
+// POST /api/users/wallets/batch - Get multiple wallet profiles in one request
+router.post('/wallets/batch', async (req: Request, res: Response) => {
+  try {
+    const { addresses } = req.body;
+    
+    if (!addresses || !Array.isArray(addresses) || addresses.length === 0) {
+      return res.json({ profiles: {} });
+    }
+    
+    // Limit to 50 addresses per request
+    const limitedAddresses = addresses.slice(0, 50);
+    
+    // Get all profiles in one query
+    const users = await query(`
+      SELECT wallet_address, twitter_handle, twitter_name, twitter_avatar,
+             display_name, created_at
+      FROM users
+      WHERE wallet_address = ANY($1)
+    `, [limitedAddresses]);
+    
+    // Get all stats in one query
+    const stats = await query(`
+      SELECT 
+        wallet_address,
+        total_trades as trade_count, 
+        total_volume, 
+        total_pnl
+      FROM traders 
+      WHERE wallet_address = ANY($1)
+    `, [limitedAddresses]);
+    
+    // Build response map
+    const profiles: Record<string, any> = {};
+    
+    for (const addr of limitedAddresses) {
+      const user = users.find(u => u.wallet_address === addr);
+      const stat = stats.find(s => s.wallet_address === addr);
+      
+      profiles[addr] = {
+        profile: user || null,
+        stats: stat || null,
+      };
+    }
+    
+    res.json({ profiles });
+  } catch (error) {
+    console.error('[Users] Batch wallet profiles error:', error);
+    res.status(500).json({ error: 'Failed to get wallet profiles' });
   }
 });
 
