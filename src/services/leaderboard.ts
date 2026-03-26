@@ -1,4 +1,5 @@
 import { query } from '../db';
+import { getCache, setCache } from './cache';
 
 export interface LeaderboardEntry {
   rank: number;
@@ -15,21 +16,6 @@ export type TimeFrame = '24h' | '7d' | '30d' | 'all';
 const EXCLUDED_WALLETS = [
   '7DHvrCZMMLZ2ovNfKaGpvJZXAQyydbTz6dM7w7qXtzX5', // BULK MM
 ];
-
-// Simple in-memory cache
-const cache: Map<string, { data: any; expiry: number }> = new Map();
-
-function getCached<T>(key: string): T | null {
-  const cached = cache.get(key);
-  if (cached && cached.expiry > Date.now()) {
-    return cached.data as T;
-  }
-  return null;
-}
-
-function setCache(key: string, data: any, ttlSeconds: number = 60): void {
-  cache.set(key, { data, expiry: Date.now() + ttlSeconds * 1000 });
-}
 
 class LeaderboardService {
   // Get timeframe filter for SQL
@@ -56,8 +42,8 @@ class LeaderboardService {
 
   // Top Traders by PnL
   async getTopTradersByPnL(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
-    const cacheKey = `pnl_${timeframe}_${limit}`;
-    const cached = getCached<LeaderboardEntry[]>(cacheKey);
+    const cacheKey = `leaderboard:pnl:${timeframe}:${limit}`;
+    const cached = await getCache<LeaderboardEntry[]>(cacheKey);
     if (cached) return cached;
     
     const timeFilter = this.getTimeFilter(timeframe);
@@ -82,7 +68,7 @@ class LeaderboardService {
           trades: row.trades,
         }));
         
-        setCache(cacheKey, result, 30);
+        await setCache(cacheKey, result, 30);
         return result;
       }
       
@@ -108,7 +94,7 @@ class LeaderboardService {
         value: parseFloat(row.pnl as any) || 0,
       }));
       
-      setCache(cacheKey, result, 30);
+      await setCache(cacheKey, result, 30);
       return result;
     } catch (e) {
       console.error('getTopTradersByPnL error:', e);
@@ -118,6 +104,10 @@ class LeaderboardService {
 
   // Most Liquidated (Hall of Shame)
   async getMostLiquidated(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
+    const cacheKey = `leaderboard:liquidated:${timeframe}:${limit}`;
+    const cached = await getCache<LeaderboardEntry[]>(cacheKey);
+    if (cached) return cached;
+
     const timeFilter = this.getTimeFilter(timeframe);
     const excludeFilter = this.getExcludedFilter();
     
@@ -131,12 +121,15 @@ class LeaderboardService {
         [limit]
       );
       
-      return rows.map((row, index) => ({
+      const result = rows.map((row, index) => ({
         rank: index + 1,
         wallet_address: row.wallet_address,
         value: parseFloat(row.value as any) || 0,
         trades: row.trades,
       }));
+
+      await setCache(cacheKey, result, 30);
+      return result;
     }
     
     const rows = await query<{ wallet_address: string; total_value: number; liq_count: number }>(
@@ -152,18 +145,21 @@ class LeaderboardService {
       [limit]
     );
     
-    return rows.map((row, index) => ({
+    const result = rows.map((row, index) => ({
       rank: index + 1,
       wallet_address: row.wallet_address,
       value: parseFloat(row.total_value as any) || 0,
       trades: parseInt(row.liq_count as any) || 0,
     }));
+
+    await setCache(cacheKey, result, 30);
+    return result;
   }
 
   // Biggest Positions (Whale Watch) - fetch from BULK API directly with caching
   async getBiggestPositions(limit: number = 50): Promise<LeaderboardEntry[]> {
-    const cacheKey = `whales_${limit}`;
-    const cached = getCached<LeaderboardEntry[]>(cacheKey);
+    const cacheKey = `leaderboard:whales:${limit}`;
+    const cached = await getCache<LeaderboardEntry[]>(cacheKey);
     if (cached) return cached;
     
     const excludeFilter = this.getExcludedFilter();
@@ -243,18 +239,19 @@ class LeaderboardService {
       const finalResults = validResults.slice(0, limit).map((r, i) => ({ ...r, rank: i + 1 }));
       
       // Cache for 60 seconds
-      setCache(cacheKey, finalResults, 60);
-      return finalResults;
+      await setCache(cacheKey, finalResults, 60);
       
-    } catch (error) {
-      console.error('getBiggestPositions error:', error);
+      return finalResults;
+    } catch (e) {
+      console.error('getBiggestPositions error:', e);
       return [];
     }
   }
 
+  // Most Active Traders (by trade count)
   async getMostActive(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
-    const cacheKey = `active_${timeframe}_${limit}`;
-    const cached = getCached<LeaderboardEntry[]>(cacheKey);
+    const cacheKey = `leaderboard:active:${timeframe}:${limit}`;
+    const cached = await getCache<LeaderboardEntry[]>(cacheKey);
     if (cached) return cached;
     
     const excludeFilter = this.getExcludedFilter();
@@ -277,7 +274,7 @@ class LeaderboardService {
         trades: parseInt(row.total_trades as any) || 0,
       }));
       
-      setCache(cacheKey, result, 30);
+      await setCache(cacheKey, result, 30);
       return result;
     } catch (e) {
       console.error('getMostActive error:', e);
@@ -287,8 +284,8 @@ class LeaderboardService {
 
   // Top Volume Traders - use pre-aggregated traders table
   async getTopVolume(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
-    const cacheKey = `volume_${timeframe}_${limit}`;
-    const cached = getCached<LeaderboardEntry[]>(cacheKey);
+    const cacheKey = `leaderboard:volume:${timeframe}:${limit}`;
+    const cached = await getCache<LeaderboardEntry[]>(cacheKey);
     if (cached) return cached;
     
     const excludeFilter = this.getExcludedFilter();
@@ -311,7 +308,7 @@ class LeaderboardService {
         trades: parseInt(row.total_trades as any) || 0,
       }));
       
-      setCache(cacheKey, result, 30);
+      await setCache(cacheKey, result, 30);
       return result;
     } catch (e) {
       console.error('getTopVolume error:', e);
@@ -359,8 +356,8 @@ class LeaderboardService {
       liquidation_value: number;
     } | null;
   }> {
-    const cacheKey = `wallet_rank_${walletAddress}`;
-    const cached = getCached<any>(cacheKey);
+    const cacheKey = `leaderboard:wallet_rank:${walletAddress}`;
+    const cached = await getCache<any>(cacheKey);
     if (cached) return cached;
 
     try {
@@ -478,7 +475,7 @@ class LeaderboardService {
       };
 
       // Cache for 60 seconds
-      setCache(cacheKey, result, 60);
+      await setCache(cacheKey, result, 60);
 
       return result;
     } catch (error) {
