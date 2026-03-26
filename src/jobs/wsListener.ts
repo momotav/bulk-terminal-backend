@@ -215,6 +215,10 @@ export function addWalletToTrack(wallet: string): Promise<void> {
 }
 
 // Record a trade to database
+// ============================================
+// PRODUCTION-GRADE TRADE BATCHING SYSTEM
+// ============================================
+
 // Trade queue for batching inserts
 const tradeQueue: Array<{
   symbol: string;
@@ -226,14 +230,36 @@ const tradeQueue: Array<{
   time: number;
 }> = [];
 
-// Flush trade queue every 2 seconds
-setInterval(async () => {
-  if (tradeQueue.length === 0) return;
+// Prevent concurrent batch processing
+let isProcessingBatch = false;
+
+// Configuration
+const BATCH_CONFIG = {
+  MAX_BATCH_SIZE: 100,        // Max trades per batch insert
+  FLUSH_INTERVAL_MS: 5000,    // Flush every 5 seconds
+  MAX_QUEUE_SIZE: 5000,       // Drop oldest if queue exceeds this
+  SKIP_TRADER_UPDATES: false, // Set true if DB is overwhelmed
+};
+
+// Aggregate trader stats in memory, flush periodically
+const traderStatsBuffer: Map<string, { trades: number; volume: number }> = new Map();
+let lastTraderFlush = Date.now();
+const TRADER_FLUSH_INTERVAL = 30000; // Flush trader stats every 30 seconds
+
+// Process trade batch with size limits
+async function processTradeBatch(): Promise<void> {
+  if (isProcessingBatch || tradeQueue.length === 0) return;
   
-  const trades = tradeQueue.splice(0, tradeQueue.length); // Take all trades
+  isProcessingBatch = true;
   
   try {
-    // Batch insert all trades at once
+    // Take only up to MAX_BATCH_SIZE trades
+    const batchSize = Math.min(tradeQueue.length, BATCH_CONFIG.MAX_BATCH_SIZE);
+    const trades = tradeQueue.splice(0, batchSize);
+    
+    if (trades.length === 0) return;
+    
+    // Build batch insert query
     const values = trades.map((t, i) => {
       const offset = i * 7;
       return `($${offset + 1}::varchar, $${offset + 2}::varchar, $${offset + 3}::varchar, $${offset + 4}, $${offset + 5}, $${offset + 6}, to_timestamp($${offset + 7}/1000.0))`;
@@ -243,41 +269,95 @@ setInterval(async () => {
       t.walletAddress, t.symbol, t.side, Math.abs(t.size), t.price, t.value, t.time
     ]);
     
+    // Single batch insert for all trades
     await query(
       `INSERT INTO trades (wallet_address, symbol, side, size, price, value, timestamp) VALUES ${values}`,
       params
     );
     
-    // Batch update trader stats
-    const walletUpdates = new Map<string, { trades: number; volume: number }>();
+    // Aggregate trader stats in memory (don't write to DB yet)
     for (const t of trades) {
       if (t.walletAddress) {
-        const existing = walletUpdates.get(t.walletAddress) || { trades: 0, volume: 0 };
+        const existing = traderStatsBuffer.get(t.walletAddress) || { trades: 0, volume: 0 };
         existing.trades++;
         existing.volume += t.value;
-        walletUpdates.set(t.walletAddress, existing);
+        traderStatsBuffer.set(t.walletAddress, existing);
       }
     }
     
-    // Update traders table in batch
-    for (const [wallet, data] of walletUpdates) {
+    console.log(`💾 Inserted ${trades.length} trades | Queue: ${tradeQueue.length} | Traders buffered: ${traderStatsBuffer.size}`);
+    
+  } catch (error) {
+    console.error('❌ Batch insert failed:', error);
+  } finally {
+    isProcessingBatch = false;
+  }
+}
+
+// Flush aggregated trader stats to DB (runs less frequently)
+async function flushTraderStats(): Promise<void> {
+  if (traderStatsBuffer.size === 0) return;
+  
+  const now = Date.now();
+  if (now - lastTraderFlush < TRADER_FLUSH_INTERVAL) return;
+  
+  lastTraderFlush = now;
+  
+  // Take a snapshot and clear buffer
+  const updates = Array.from(traderStatsBuffer.entries());
+  traderStatsBuffer.clear();
+  
+  console.log(`📊 Flushing ${updates.length} trader stats...`);
+  
+  // Process in small chunks to avoid overwhelming DB
+  const CHUNK_SIZE = 20;
+  for (let i = 0; i < updates.length; i += CHUNK_SIZE) {
+    const chunk = updates.slice(i, i + CHUNK_SIZE);
+    
+    // Use a single query with UNNEST for bulk upsert
+    try {
+      const wallets = chunk.map(([w]) => w);
+      const tradeCounts = chunk.map(([, d]) => d.trades);
+      const volumes = chunk.map(([, d]) => d.volume);
+      
       await query(
         `INSERT INTO traders (wallet_address, total_trades, total_volume, last_seen)
-         VALUES ($1::varchar, $2, $3, NOW())
+         SELECT unnest($1::varchar[]), unnest($2::int[]), unnest($3::numeric[]), NOW()
          ON CONFLICT (wallet_address) DO UPDATE SET
-           total_trades = traders.total_trades + $2,
-           total_volume = traders.total_volume + $3,
+           total_trades = traders.total_trades + EXCLUDED.total_trades,
+           total_volume = traders.total_volume + EXCLUDED.total_volume,
            last_seen = NOW()`,
-        [wallet, data.trades, data.volume]
+        [wallets, tradeCounts, volumes]
       );
+    } catch (error) {
+      console.error('❌ Trader stats chunk failed:', error);
     }
     
-    console.log(`💾 Batch inserted ${trades.length} trades, updated ${walletUpdates.size} traders`);
-  } catch (error) {
-    console.error('Failed to batch insert trades:', error);
-    // Don't re-queue - just log and move on to prevent memory leak
+    // Small delay between chunks
+    await new Promise(r => setTimeout(r, 100));
   }
-}, 2000);
+  
+  console.log(`✅ Flushed ${updates.length} trader stats`);
+}
+
+// Main flush interval - process trades
+setInterval(() => {
+  processTradeBatch().catch(console.error);
+}, BATCH_CONFIG.FLUSH_INTERVAL_MS);
+
+// Separate interval for trader stats (less frequent)
+setInterval(() => {
+  flushTraderStats().catch(console.error);
+}, TRADER_FLUSH_INTERVAL);
+
+// Queue size protection - drop oldest if too large
+setInterval(() => {
+  if (tradeQueue.length > BATCH_CONFIG.MAX_QUEUE_SIZE) {
+    const dropped = tradeQueue.length - BATCH_CONFIG.MAX_QUEUE_SIZE;
+    tradeQueue.splice(0, dropped);
+    console.warn(`⚠️ Queue overflow! Dropped ${dropped} oldest trades`);
+  }
+}, 10000);
 
 async function recordTrade(trade: {
   symbol: string;
@@ -290,12 +370,12 @@ async function recordTrade(trade: {
 }): Promise<void> {
   const value = trade.price * Math.abs(trade.size);
   
-  // Record all trades (minimum $1 to filter dust)
+  // Filter dust trades
   if (value < 1) return;
 
   const walletAddress = trade.taker || trade.maker || null;
   
-  // Add to queue instead of immediate insert
+  // Add to queue (non-blocking)
   tradeQueue.push({
     symbol: trade.symbol,
     price: trade.price,
@@ -308,11 +388,6 @@ async function recordTrade(trade: {
 
   stats.tradesReceived++;
   stats.lastTradeTime = new Date();
-  
-  // Only log significant trades to reduce console spam
-  if (value > 10000) {
-    console.log(`📈 Trade: ${trade.side.toUpperCase()} ${trade.symbol} | $${value.toFixed(2)}`);
-  }
 }
 
 // Record a liquidation to database
