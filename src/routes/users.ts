@@ -84,13 +84,12 @@ async function verifyPrivyToken(req: Request, res: Response, next: Function) {
 router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
   try {
     const privyUserId = (req as any).privyUserId;
-    const { walletAddress } = req.body;
+    const { walletAddress, email } = req.body;
 
-    console.log('[Users] Auth request:', { privyUserId, walletAddress });
+    console.log('[Users] Auth request:', { privyUserId, walletAddress, email });
 
-    if (!walletAddress) {
-      return res.status(400).json({ error: 'Wallet address required' });
-    }
+    // For email-only users, walletAddress may be null
+    const hasWallet = !!walletAddress;
 
     // First, check if user exists by privy_id
     let userResult = await query(
@@ -101,17 +100,31 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
     let user = userResult[0];
 
     if (user) {
-      // User exists by privy_id - update wallet if needed
-      if (user.wallet_address !== walletAddress) {
-        console.log('[Users] Updating wallet address for existing user:', user.id);
+      // User exists by privy_id - update wallet/email if provided
+      const updates: string[] = [];
+      const values: any[] = [];
+      let paramIndex = 1;
+
+      if (walletAddress && user.wallet_address !== walletAddress) {
+        updates.push(`wallet_address = $${paramIndex++}`);
+        values.push(walletAddress);
+      }
+      if (email && user.email !== email) {
+        updates.push(`email = $${paramIndex++}`);
+        values.push(email);
+      }
+
+      if (updates.length > 0) {
+        values.push(user.id);
         await query(
-          'UPDATE users SET wallet_address = $1 WHERE id = $2',
-          [walletAddress, user.id]
+          `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIndex}`,
+          values
         );
-        user.wallet_address = walletAddress;
+        if (walletAddress) user.wallet_address = walletAddress;
+        if (email) user.email = email;
       }
       console.log('[Users] Existing user found by privy_id:', user.id);
-    } else {
+    } else if (hasWallet) {
       // Check if wallet already exists (different privy account)
       const walletCheck = await query(
         'SELECT * FROM users WHERE wallet_address = $1',
@@ -122,23 +135,35 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
         // Wallet exists with different privy_id - update privy_id
         console.log('[Users] Wallet exists, updating privy_id');
         await query(
-          'UPDATE users SET privy_id = $1 WHERE wallet_address = $2',
-          [privyUserId, walletAddress]
+          'UPDATE users SET privy_id = $1, email = COALESCE($2, email) WHERE wallet_address = $3',
+          [privyUserId, email, walletAddress]
         );
         user = walletCheck[0];
         user.privy_id = privyUserId;
+        if (email) user.email = email;
       } else {
-        // Create new user
-        console.log('[Users] Creating new user');
+        // Create new user with wallet
+        console.log('[Users] Creating new user with wallet');
         const insertResult = await query(
-          `INSERT INTO users (privy_id, wallet_address, created_at) 
-           VALUES ($1, $2, NOW()) 
+          `INSERT INTO users (privy_id, wallet_address, email, created_at) 
+           VALUES ($1, $2, $3, NOW()) 
            RETURNING *`,
-          [privyUserId, walletAddress]
+          [privyUserId, walletAddress, email]
         );
         user = insertResult[0];
         console.log('[Users] New user created:', user?.id);
       }
+    } else {
+      // Email-only user (no wallet)
+      console.log('[Users] Creating new email-only user');
+      const insertResult = await query(
+        `INSERT INTO users (privy_id, email, created_at) 
+         VALUES ($1, $2, NOW()) 
+         RETURNING *`,
+        [privyUserId, email]
+      );
+      user = insertResult[0];
+      console.log('[Users] New email user created:', user?.id);
     }
 
     if (!user) {
@@ -146,7 +171,7 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
       return res.status(500).json({ error: 'Failed to create user' });
     }
 
-    console.log('[Users] User authenticated:', user.id, user.wallet_address);
+    console.log('[Users] User authenticated:', user.id, user.wallet_address || user.email);
 
     // Get following count
     const followingResult = await query(
@@ -154,10 +179,22 @@ router.post('/auth', verifyPrivyToken, async (req: Request, res: Response) => {
       [user.id]
     );
 
+    // Get trader stats if user has a wallet (connected or claimed)
+    const effectiveWallet = user.wallet_address || user.claimed_wallet;
+    let stats = null;
+    if (effectiveWallet) {
+      const statsResult = await query(
+        'SELECT total_trades as trade_count, total_volume, total_pnl FROM traders WHERE wallet_address = $1',
+        [effectiveWallet]
+      );
+      stats = statsResult[0] || null;
+    }
+
     res.json({ 
       user: {
         ...user,
-        following_count: parseInt(followingResult[0]?.count || '0')
+        following_count: parseInt(followingResult[0]?.count || '0'),
+        stats
       }
     });
   } catch (error: any) {
@@ -252,6 +289,61 @@ router.delete('/link/twitter', verifyPrivyToken, async (req: Request, res: Respo
   } catch (error) {
     console.error('Unlink Twitter error:', error);
     res.status(500).json({ error: 'Failed to unlink Twitter' });
+  }
+});
+
+// POST /api/users/claim-wallet - Claim a wallet (for email users)
+router.post('/claim-wallet', verifyPrivyToken, async (req: Request, res: Response) => {
+  try {
+    const privyUserId = (req as any).privyUserId;
+    const { walletAddress } = req.body;
+
+    if (!walletAddress) {
+      return res.status(400).json({ error: 'Wallet address required' });
+    }
+
+    console.log('[Users] Claiming wallet:', walletAddress, 'for user:', privyUserId);
+
+    // Update user's claimed_wallet
+    await query(
+      `UPDATE users 
+       SET claimed_wallet = $1, wallet_address = COALESCE(wallet_address, $1)
+       WHERE privy_id = $2`,
+      [walletAddress, privyUserId]
+    );
+
+    const users = await query('SELECT * FROM users WHERE privy_id = $1', [privyUserId]);
+
+    if (users.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    console.log('[Users] Wallet claimed successfully');
+    res.json({ user: users[0], success: true });
+  } catch (error) {
+    console.error('Claim wallet error:', error);
+    res.status(500).json({ error: 'Failed to claim wallet' });
+  }
+});
+
+// DELETE /api/users/claim-wallet - Unclaim wallet
+router.delete('/claim-wallet', verifyPrivyToken, async (req: Request, res: Response) => {
+  try {
+    const privyUserId = (req as any).privyUserId;
+
+    console.log('[Users] Unclaiming wallet for user:', privyUserId);
+
+    await query(
+      `UPDATE users SET claimed_wallet = NULL WHERE privy_id = $1`,
+      [privyUserId]
+    );
+
+    const users = await query('SELECT * FROM users WHERE privy_id = $1', [privyUserId]);
+
+    res.json({ user: users[0], success: true });
+  } catch (error) {
+    console.error('Unclaim wallet error:', error);
+    res.status(500).json({ error: 'Failed to unclaim wallet' });
   }
 });
 
