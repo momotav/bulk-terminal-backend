@@ -304,11 +304,9 @@ router.post('/claim-wallet', verifyPrivyToken, async (req: Request, res: Respons
 
     console.log('[Users] Claiming wallet:', walletAddress, 'for user:', privyUserId);
 
-    // Update user's claimed_wallet
+    // Update user's claimed_wallet only (don't touch wallet_address to avoid unique constraint)
     await query(
-      `UPDATE users 
-       SET claimed_wallet = $1, wallet_address = COALESCE(wallet_address, $1)
-       WHERE privy_id = $2`,
+      `UPDATE users SET claimed_wallet = $1 WHERE privy_id = $2`,
       [walletAddress, privyUserId]
     );
 
