@@ -172,15 +172,25 @@ export async function initializeDatabase(): Promise<void> {
     `);
     
     // Add unique constraint to prevent duplicate liquidations
-    // Partial index: only applies when wallet_address is not null
+    // Using DO block so it doesn't fail if index exists or duplicates exist
     await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_liquidations_unique
-      ON liquidations(wallet_address, symbol, timestamp)
-      WHERE wallet_address IS NOT NULL;
-    `).catch(() => {
-      // Index might already exist or there might be duplicates - that's ok
-      console.log('Note: idx_liquidations_unique may already exist');
-    });
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_indexes 
+          WHERE indexname = 'idx_liquidations_unique'
+        ) THEN
+          BEGIN
+            CREATE UNIQUE INDEX idx_liquidations_unique
+            ON liquidations(wallet_address, symbol, timestamp)
+            WHERE wallet_address IS NOT NULL;
+            RAISE NOTICE 'Created idx_liquidations_unique';
+          EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not create idx_liquidations_unique: %', SQLERRM;
+          END;
+        END IF;
+      END $$;
+    `);
 
     // Trades table
     await client.query(`
