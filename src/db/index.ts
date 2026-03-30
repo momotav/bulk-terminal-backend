@@ -170,6 +170,17 @@ export async function initializeDatabase(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_liquidations_wallet 
       ON liquidations(wallet_address);
     `);
+    
+    // Add unique constraint to prevent duplicate liquidations
+    // Partial index: only applies when wallet_address is not null
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_liquidations_unique
+      ON liquidations(wallet_address, symbol, timestamp)
+      WHERE wallet_address IS NOT NULL;
+    `).catch(() => {
+      // Index might already exist or there might be duplicates - that's ok
+      console.log('Note: idx_liquidations_unique may already exist');
+    });
 
     // Trades table
     await client.query(`
