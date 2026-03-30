@@ -583,7 +583,9 @@ function processMessage(data: WebSocket.Data): void {
         const reason = trade.reason || null;
         
         // Check for liquidation
+        // Per BULK API docs: reason="liquidation" and/or liq=true
         const isLiquidation = reason === 'liquidation' || 
+                              trade.liq === true ||
                               trade.liquidation || trade.isLiquidation || 
                               trade.orderType === 'liquidation' || 
                               trade.type === 'liquidation' ||
@@ -612,15 +614,22 @@ function processMessage(data: WebSocket.Data): void {
             time,
           });
         } else if (isLiquidation) {
-          console.log(`🔥 LIQUIDATION detected: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
-          recordLiquidation({
-            symbol,
-            price,
-            size,
-            side: side === 'buy' ? 'short' : 'long',
-            wallet: walletAddress,
-            time,
-          });
+          // IMPORTANT: Only record the TAKER - they are the liquidated party
+          // The maker is just a counterparty filling the liquidation order
+          // Per BULK API docs: taker = liquidated user, reason = "liquidation"
+          if (taker) {
+            console.log(`🔥 LIQUIDATION detected: ${side} ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
+            recordLiquidation({
+              symbol,
+              price,
+              size,
+              side: side === 'buy' ? 'short' : 'long',
+              wallet: taker,  // Always use taker, not walletAddress
+              time,
+            });
+          } else {
+            console.log(`⚠️ LIQUIDATION skipped (no taker): ${side} ${symbol} | $${(price * size).toFixed(2)}`);
+          }
         } else {
           recordTrade({
             symbol,
@@ -688,15 +697,20 @@ function processMessage(data: WebSocket.Data): void {
             time,
           });
         } else if (isLiquidation) {
-          console.log(`🔥 LIQUIDATION detected in trade: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
-          recordLiquidation({
-            symbol,
-            price,
-            size,
-            side: side === 'buy' ? 'short' : 'long', // If liquidation buys, it's closing a short
-            wallet: walletAddress,
-            time,
-          });
+          // IMPORTANT: Only record the TAKER - they are the liquidated party
+          if (taker) {
+            console.log(`🔥 LIQUIDATION detected in trade: ${side} ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
+            recordLiquidation({
+              symbol,
+              price,
+              size,
+              side: side === 'buy' ? 'short' : 'long', // If liquidation buys, it's closing a short
+              wallet: taker,  // Always use taker, not walletAddress
+              time,
+            });
+          } else {
+            console.log(`⚠️ LIQUIDATION skipped (no taker): ${side} ${symbol} | $${(price * size).toFixed(2)}`);
+          }
         } else {
           console.log(`🔍 Trade: ${side} ${symbol} | price=${price} size=${size} | wallet=${walletAddress?.slice(0,8)}`);
           
@@ -774,15 +788,20 @@ function processMessage(data: WebSocket.Data): void {
         
         // Route based on reason field
         if (reason === 'liquidation' || trade.liq === true) {
-          console.log(`🔥 LIQUIDATION (from trades): ${symbol} | $${(price * size).toFixed(2)}`);
-          recordLiquidation({
-            symbol,
-            price,
-            size,
-            side,
-            wallet: taker || maker,
-            time,
-          });
+          // IMPORTANT: Only record the TAKER - they are the liquidated party
+          if (taker) {
+            console.log(`🔥 LIQUIDATION (from trades): ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
+            recordLiquidation({
+              symbol,
+              price,
+              size,
+              side,
+              wallet: taker,  // Always use taker, not taker || maker
+              time,
+            });
+          } else {
+            console.log(`⚠️ LIQUIDATION skipped (no taker): ${symbol} | $${(price * size).toFixed(2)}`);
+          }
         } else if (reason === 'adl') {
           console.log(`⚡ ADL (from trades): ${symbol} | $${(price * size).toFixed(2)}`);
           recordADL({
