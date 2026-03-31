@@ -202,7 +202,7 @@ router.post('/watchlist/:address', requireAuth, async (req: Request, res: Respon
     const { nickname } = req.body;
     
     // Start tracking if not already
-    await addWalletToTrack(address);
+    await fetchAndStoreWalletSnapshot(address);
     
     await query(
       `INSERT INTO watchlist (user_id, wallet_address, nickname)
