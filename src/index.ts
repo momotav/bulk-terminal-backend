@@ -7,7 +7,7 @@ dotenv.config();
 
 import { testConnection, initializeDatabase, query } from './db';
 import { startDataCollector } from './jobs/dataCollector';
-import { startWebSocketListener, getWebSocketStats } from './jobs/wsListener';
+import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
 import { initRedis, getCacheStats } from './services/cache';
 
 // Import routes
@@ -83,6 +83,18 @@ app.get('/debug/db', async (req, res) => {
 app.get('/debug/ws', async (req, res) => {
   const wsStats = getWebSocketStats();
   res.json(wsStats);
+});
+
+// Debug endpoint to force WebSocket reconnect
+app.get('/debug/ws/reconnect', async (req, res) => {
+  forceReconnect();
+  // Wait a moment for connection attempt
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  const wsStats = getWebSocketStats();
+  res.json({ 
+    message: 'Reconnect initiated', 
+    ...wsStats 
+  });
 });
 
 // Debug endpoint to clear test liquidations
