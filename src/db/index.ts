@@ -231,6 +231,41 @@ export async function initializeDatabase(): Promise<void> {
       WHERE wallet_address IS NOT NULL;
     `);
 
+    // Pre-aggregated daily statistics table (FAST queries)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS daily_stats (
+        id SERIAL PRIMARY KEY,
+        day DATE NOT NULL,
+        symbol VARCHAR(20),
+        unique_traders INTEGER DEFAULT 0,
+        trade_count INTEGER DEFAULT 0,
+        volume DECIMAL(20,2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(day, symbol)
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_daily_stats_day 
+      ON daily_stats(day DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_daily_stats_day_symbol 
+      ON daily_stats(day, symbol);
+    `);
+    
+    // Daily total unique traders (across all symbols)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS daily_unique_traders (
+        id SERIAL PRIMARY KEY,
+        day DATE NOT NULL UNIQUE,
+        total_unique INTEGER DEFAULT 0,
+        new_users INTEGER DEFAULT 0,
+        cumulative_users INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_daily_unique_day 
+      ON daily_unique_traders(day DESC);
+    `);
+
     // ADL (Auto-Deleveraging) events table
     await client.query(`
       CREATE TABLE IF NOT EXISTS adl_events (
