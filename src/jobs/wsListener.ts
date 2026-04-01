@@ -11,7 +11,7 @@ let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let tickerSnapshotInterval: ReturnType<typeof setInterval> | null = null;
 let isConnected = false;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10;
+const MAX_RECONNECT_DISPLAY = 100; // Just for logging, not a hard limit
 
 // Cache to avoid fetching same wallet too often (wallet -> last fetch time)
 const walletFetchCache: Map<string, number> = new Map();
@@ -993,15 +993,11 @@ function scheduleReconnect(): void {
     clearTimeout(reconnectTimeout);
   }
 
-  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    console.error(`❌ Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`);
-    return;
-  }
-
-  const delay = Math.min(5000 * Math.pow(2, reconnectAttempts), 60000);
+  // Keep trying forever with exponential backoff capped at 5 minutes
+  const delay = Math.min(5000 * Math.pow(1.5, Math.min(reconnectAttempts, 10)), 300000);
   reconnectAttempts++;
   
-  console.log(`🔄 Reconnecting in ${delay/1000}s... (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+  console.log(`🔄 Reconnecting in ${delay/1000}s... (attempt ${reconnectAttempts})`);
   reconnectTimeout = setTimeout(connect, delay);
 }
 
@@ -1135,6 +1131,20 @@ export function getWebSocketStats() {
     reconnectAttempts,
     ...stats,
   };
+}
+
+// Force reconnect (can be called via debug endpoint)
+export function forceReconnect(): void {
+  console.log('🔄 Force reconnect requested...');
+  reconnectAttempts = 0; // Reset counter
+  if (ws) {
+    try {
+      ws.terminate();
+    } catch (e) {}
+    ws = null;
+  }
+  isConnected = false;
+  connect();
 }
 
 // Set to track which wallets we're subscribed to
