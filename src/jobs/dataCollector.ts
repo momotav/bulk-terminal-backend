@@ -50,15 +50,16 @@ async function collectMarketStats(): Promise<void> {
   }
 }
 
-// Update trader snapshots - ONLY top active wallets, with rate limiting
+// Update trader snapshots - wallets viewed in last 24 hours
 async function updateTraderSnapshots(): Promise<void> {
   try {
-    // Only fetch TOP 20 most recently active wallets (not all 1000!)
+    // Track wallets that have been viewed/active in last 24 hours
+    // This ensures anyone who checked their wallet gets hourly snapshots
     const activeWallets = await query<{ wallet_address: string }>(
       `SELECT wallet_address FROM traders 
-       WHERE last_seen > NOW() - INTERVAL '1 hour'
+       WHERE last_seen > NOW() - INTERVAL '24 hours'
        ORDER BY last_seen DESC 
-       LIMIT 20`
+       LIMIT 100`
     );
     
     if (activeWallets.length === 0) {
@@ -79,21 +80,20 @@ async function updateTraderSnapshots(): Promise<void> {
           (sum, p) => sum + Math.abs(p.notional || 0), 0
         );
         
-        const realizedPnl = account.margin.realizedPnl || 0;
-        const unrealizedPnl = account.margin.unrealizedPnl || 0;
+        const realizedPnl = account.margin?.realizedPnl || 0;
+        const unrealizedPnl = account.margin?.unrealizedPnl || 0;
         const totalPnl = realizedPnl + unrealizedPnl;
         
         // Update trader with current PnL
         await query(
           `UPDATE traders SET 
-             last_seen = NOW(),
              total_pnl = $2
            WHERE wallet_address = $1`,
           [wallet, totalPnl]
         );
         
-        // Create snapshot only if they have positions
-        if (account.positions.length > 0) {
+        // Create snapshot (even if no positions, to track PnL changes)
+        if (account.positions.length > 0 || totalPnl !== 0) {
           await query(
             `INSERT INTO trader_snapshots 
              (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
@@ -111,7 +111,7 @@ async function updateTraderSnapshots(): Promise<void> {
       }
     }
     
-    console.log(`👤 Updated snapshots for ${updated}/${activeWallets.length} active traders`);
+    console.log(`👤 Hourly snapshot: Updated ${updated}/${activeWallets.length} wallets`);
   } catch (error) {
     console.error('❌ Failed to update trader snapshots:', error);
   }
@@ -210,8 +210,8 @@ export function startDataCollector(): void {
     collectMarketStats();
   });
   
-  // Update trader snapshots every 5 minutes (only top 20 active)
-  cron.schedule('*/5 * * * *', () => {
+  // Update trader snapshots every hour (wallets viewed in last 24h)
+  cron.schedule('0 * * * *', () => {
     updateTraderSnapshots();
   });
   
@@ -223,5 +223,5 @@ export function startDataCollector(): void {
   // Run initial collection
   collectMarketStats();
   
-  console.log('✅ Data collector started (optimized: max 20 wallet fetches per 5 min)');
+  console.log('✅ Data collector started (hourly snapshots for wallets viewed in last 24h, max 100)');
 }
