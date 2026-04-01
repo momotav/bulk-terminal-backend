@@ -1086,7 +1086,7 @@ router.get('/tickers-bulk', async (req: Request, res: Response) => {
 
 // ============ USER STATISTICS CHARTS ============
 
-// Unique Traders By Coin (daily breakdown)
+// Unique Traders By Coin (daily breakdown) - OPTIMIZED
 router.get('/unique-traders-by-coin', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720; // Default 30 days
   
@@ -1097,68 +1097,60 @@ router.get('/unique-traders-by-coin', async (req: Request, res: Response) => {
       return res.json(cached);
     }
 
-    // Get unique traders per day per symbol
+    // Single optimized query that does both per-symbol and total in one scan
     const data = await query<{
       day: string;
       symbol: string;
       traders: string;
-    }>(`
-      SELECT 
-        DATE(timestamp) as day,
-        symbol,
-        COUNT(DISTINCT wallet_address) as traders
-      FROM trades
-      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
-        AND wallet_address IS NOT NULL
-      GROUP BY DATE(timestamp), symbol
-      ORDER BY day ASC
-    `);
-
-    // Also get total unique per day (across all symbols)
-    const totalPerDay = await query<{
-      day: string;
       total: string;
     }>(`
-      SELECT 
-        DATE(timestamp) as day,
-        COUNT(DISTINCT wallet_address) as total
-      FROM trades
-      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
-        AND wallet_address IS NOT NULL
-      GROUP BY DATE(timestamp)
-      ORDER BY day ASC
+      WITH daily_traders AS (
+        SELECT 
+          DATE(timestamp) as day,
+          symbol,
+          wallet_address
+        FROM trades
+        WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+          AND wallet_address IS NOT NULL
+      ),
+      per_symbol AS (
+        SELECT day, symbol, COUNT(DISTINCT wallet_address) as traders
+        FROM daily_traders
+        GROUP BY day, symbol
+      ),
+      per_day AS (
+        SELECT day, COUNT(DISTINCT wallet_address) as total
+        FROM daily_traders
+        GROUP BY day
+      )
+      SELECT ps.day, ps.symbol, ps.traders::text, pd.total::text
+      FROM per_symbol ps
+      JOIN per_day pd ON ps.day = pd.day
+      ORDER BY ps.day ASC
     `);
 
-    // Transform to chart format: { timestamp, BTC, ETH, SOL, total }
+    // Transform to chart format
     const dayMap = new Map<string, { BTC: number; ETH: number; SOL: number; total: number }>();
     
-    // Initialize with totals
-    for (const row of totalPerDay) {
-      const dayStr = new Date(row.day).toISOString().split('T')[0];
-      dayMap.set(dayStr, { BTC: 0, ETH: 0, SOL: 0, total: parseInt(row.total) });
-    }
-
-    // Fill in per-symbol data
     for (const row of data) {
       const dayStr = new Date(row.day).toISOString().split('T')[0];
-      const entry = dayMap.get(dayStr);
-      if (entry) {
-        const coin = row.symbol.replace('-USD', '') as 'BTC' | 'ETH' | 'SOL';
-        if (coin in entry) {
-          entry[coin] = parseInt(row.traders);
-        }
+      if (!dayMap.has(dayStr)) {
+        dayMap.set(dayStr, { BTC: 0, ETH: 0, SOL: 0, total: parseInt(row.total) });
+      }
+      const entry = dayMap.get(dayStr)!;
+      const coin = row.symbol.replace('-USD', '') as 'BTC' | 'ETH' | 'SOL';
+      if (coin in entry) {
+        entry[coin] = parseInt(row.traders);
       }
     }
 
     const chartData = Array.from(dayMap.entries())
-      .map(([day, values]) => ({
-        timestamp: day,
-        ...values
-      }))
+      .map(([day, values]) => ({ timestamp: day, ...values }))
       .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
     const result = { data: chartData };
-    await setCache(cacheKey, result, 300); // Cache 5 min
+    // Cache longer - 10 minutes for daily data (doesn't change often)
+    await setCache(cacheKey, result, 600);
     res.json(result);
   } catch (error) {
     console.error('Error fetching unique traders by coin:', error);
@@ -1166,7 +1158,7 @@ router.get('/unique-traders-by-coin', async (req: Request, res: Response) => {
   }
 });
 
-// Daily Active Users
+// Daily Active Users - OPTIMIZED
 router.get('/daily-active-users', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720; // Default 30 days
   
@@ -1197,7 +1189,8 @@ router.get('/daily-active-users', async (req: Request, res: Response) => {
     }));
 
     const result = { data: chartData };
-    await setCache(cacheKey, result, 300); // Cache 5 min
+    // Cache 10 minutes
+    await setCache(cacheKey, result, 600);
     res.json(result);
   } catch (error) {
     console.error('Error fetching DAU:', error);
@@ -1205,7 +1198,7 @@ router.get('/daily-active-users', async (req: Request, res: Response) => {
   }
 });
 
-// Cumulative New Users (first-time traders)
+// Cumulative New Users (first-time traders) - OPTIMIZED
 router.get('/cumulative-new-users', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720; // Default 30 days
   
@@ -1216,10 +1209,11 @@ router.get('/cumulative-new-users', async (req: Request, res: Response) => {
       return res.json(cached);
     }
 
-    // Get first trade date for each wallet, then count new users per day
+    // Single optimized query with window function for cumulative
     const data = await query<{
       first_day: string;
       new_users: string;
+      cumulative: string;
     }>(`
       WITH first_trades AS (
         SELECT 
@@ -1228,45 +1222,47 @@ router.get('/cumulative-new-users', async (req: Request, res: Response) => {
         FROM trades
         WHERE wallet_address IS NOT NULL
         GROUP BY wallet_address
+      ),
+      daily_new AS (
+        SELECT 
+          first_trade_date as first_day,
+          COUNT(*) as new_users
+        FROM first_trades
+        GROUP BY first_trade_date
       )
       SELECT 
-        first_trade_date as first_day,
-        COUNT(*) as new_users
-      FROM first_trades
-      WHERE first_trade_date > NOW() - INTERVAL '${hours} hours'
-      GROUP BY first_trade_date
-      ORDER BY first_trade_date ASC
+        first_day,
+        new_users::text,
+        SUM(new_users) OVER (ORDER BY first_day)::text as cumulative
+      FROM daily_new
+      WHERE first_day > NOW() - INTERVAL '${hours} hours'
+      ORDER BY first_day ASC
     `);
 
-    // Get total users before this period (for cumulative starting point)
+    // Get starting cumulative (users before this period)
     const totalBefore = await query<{ count: string }>(`
-      WITH first_trades AS (
-        SELECT 
-          wallet_address,
-          MIN(timestamp) as first_trade_date
-        FROM trades
-        WHERE wallet_address IS NOT NULL
-        GROUP BY wallet_address
-      )
-      SELECT COUNT(*) as count
-      FROM first_trades
-      WHERE first_trade_date <= NOW() - INTERVAL '${hours} hours'
+      SELECT COUNT(DISTINCT wallet_address) as count
+      FROM trades
+      WHERE wallet_address IS NOT NULL
+        AND timestamp <= NOW() - INTERVAL '${hours} hours'
+        AND wallet_address NOT IN (
+          SELECT DISTINCT wallet_address FROM trades
+          WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+            AND wallet_address IS NOT NULL
+        )
     `);
-
-    let cumulative = parseInt(totalBefore[0]?.count || '0');
     
-    const chartData = data.map(row => {
-      const newUsers = parseInt(row.new_users);
-      cumulative += newUsers;
-      return {
-        timestamp: new Date(row.first_day).toISOString().split('T')[0],
-        newUsers,
-        cumulative
-      };
-    });
+    const startingCumulative = parseInt(totalBefore[0]?.count || '0');
+    
+    const chartData = data.map(row => ({
+      timestamp: new Date(row.first_day).toISOString().split('T')[0],
+      newUsers: parseInt(row.new_users),
+      cumulative: parseInt(row.cumulative) + startingCumulative
+    }));
 
     const result = { data: chartData };
-    await setCache(cacheKey, result, 300); // Cache 5 min
+    // Cache 10 minutes
+    await setCache(cacheKey, result, 600);
     res.json(result);
   } catch (error) {
     console.error('Error fetching cumulative new users:', error);
