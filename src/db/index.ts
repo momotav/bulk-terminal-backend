@@ -224,6 +224,11 @@ export async function initializeDatabase(): Promise<void> {
       -- Composite index for symbol + time queries
       CREATE INDEX IF NOT EXISTS idx_trades_symbol_time 
       ON trades(symbol, timestamp DESC);
+      
+      -- OPTIMIZED: Index for daily unique trader counts (covers DATE(timestamp) queries)
+      CREATE INDEX IF NOT EXISTS idx_trades_date_wallet_symbol
+      ON trades(DATE(timestamp), wallet_address, symbol)
+      WHERE wallet_address IS NOT NULL;
     `);
 
     // ADL (Auto-Deleveraging) events table
