@@ -201,6 +201,165 @@ export async function addWalletToTrack(wallet: string): Promise<boolean> {
   }
 }
 
+// Aggregate daily statistics (runs every hour, updates today's stats)
+async function aggregateDailyStats(): Promise<void> {
+  try {
+    console.log('📊 Aggregating daily statistics...');
+    
+    // Get today and yesterday (to ensure yesterday is finalized)
+    const today = new Date().toISOString().split('T')[0];
+    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    
+    // Aggregate per-symbol stats for today and yesterday
+    await query(`
+      INSERT INTO daily_stats (day, symbol, unique_traders, trade_count, volume)
+      SELECT 
+        DATE(timestamp) as day,
+        symbol,
+        COUNT(DISTINCT wallet_address) as unique_traders,
+        COUNT(*) as trade_count,
+        SUM(value) as volume
+      FROM trades
+      WHERE DATE(timestamp) >= $1
+        AND wallet_address IS NOT NULL
+      GROUP BY DATE(timestamp), symbol
+      ON CONFLICT (day, symbol) DO UPDATE SET
+        unique_traders = EXCLUDED.unique_traders,
+        trade_count = EXCLUDED.trade_count,
+        volume = EXCLUDED.volume
+    `, [yesterday]);
+    
+    // Aggregate total unique traders per day
+    await query(`
+      INSERT INTO daily_unique_traders (day, total_unique)
+      SELECT 
+        DATE(timestamp) as day,
+        COUNT(DISTINCT wallet_address) as total_unique
+      FROM trades
+      WHERE DATE(timestamp) >= $1
+        AND wallet_address IS NOT NULL
+      GROUP BY DATE(timestamp)
+      ON CONFLICT (day) DO UPDATE SET
+        total_unique = EXCLUDED.total_unique
+    `, [yesterday]);
+    
+    // Calculate new users (first-time traders) for recent days
+    await query(`
+      WITH first_trades AS (
+        SELECT wallet_address, DATE(MIN(timestamp)) as first_day
+        FROM trades
+        WHERE wallet_address IS NOT NULL
+        GROUP BY wallet_address
+      ),
+      daily_new AS (
+        SELECT first_day, COUNT(*) as new_users
+        FROM first_trades
+        WHERE first_day >= $1
+        GROUP BY first_day
+      )
+      UPDATE daily_unique_traders d
+      SET new_users = dn.new_users
+      FROM daily_new dn
+      WHERE d.day = dn.first_day
+    `, [yesterday]);
+    
+    // Calculate cumulative users
+    await query(`
+      WITH running_total AS (
+        SELECT 
+          day,
+          SUM(new_users) OVER (ORDER BY day) as cumulative
+        FROM daily_unique_traders
+      )
+      UPDATE daily_unique_traders d
+      SET cumulative_users = rt.cumulative
+      FROM running_total rt
+      WHERE d.day = rt.day
+    `);
+    
+    console.log('✅ Daily stats aggregation complete');
+  } catch (error) {
+    console.error('❌ Failed to aggregate daily stats:', error);
+  }
+}
+
+// Backfill historical daily stats (run once on startup if tables are empty)
+async function backfillDailyStats(): Promise<void> {
+  try {
+    const existing = await query<{ count: string }>('SELECT COUNT(*) as count FROM daily_stats');
+    if (parseInt(existing[0]?.count || '0') > 0) {
+      console.log('📊 Daily stats already populated, skipping backfill');
+      return;
+    }
+    
+    console.log('📊 Backfilling historical daily stats (this may take a minute)...');
+    
+    // Backfill per-symbol stats
+    await query(`
+      INSERT INTO daily_stats (day, symbol, unique_traders, trade_count, volume)
+      SELECT 
+        DATE(timestamp) as day,
+        symbol,
+        COUNT(DISTINCT wallet_address) as unique_traders,
+        COUNT(*) as trade_count,
+        SUM(value) as volume
+      FROM trades
+      WHERE wallet_address IS NOT NULL
+      GROUP BY DATE(timestamp), symbol
+      ON CONFLICT (day, symbol) DO NOTHING
+    `);
+    
+    // Backfill total unique per day
+    await query(`
+      INSERT INTO daily_unique_traders (day, total_unique)
+      SELECT 
+        DATE(timestamp) as day,
+        COUNT(DISTINCT wallet_address) as total_unique
+      FROM trades
+      WHERE wallet_address IS NOT NULL
+      GROUP BY DATE(timestamp)
+      ON CONFLICT (day) DO NOTHING
+    `);
+    
+    // Calculate new users
+    await query(`
+      WITH first_trades AS (
+        SELECT wallet_address, DATE(MIN(timestamp)) as first_day
+        FROM trades
+        WHERE wallet_address IS NOT NULL
+        GROUP BY wallet_address
+      ),
+      daily_new AS (
+        SELECT first_day, COUNT(*) as new_users
+        FROM first_trades
+        GROUP BY first_day
+      )
+      UPDATE daily_unique_traders d
+      SET new_users = COALESCE(dn.new_users, 0)
+      FROM daily_new dn
+      WHERE d.day = dn.first_day
+    `);
+    
+    // Calculate cumulative
+    await query(`
+      WITH running_total AS (
+        SELECT 
+          day,
+          SUM(COALESCE(new_users, 0)) OVER (ORDER BY day) as cumulative
+        FROM daily_unique_traders
+      )
+      UPDATE daily_unique_traders d
+      SET cumulative_users = rt.cumulative
+      FROM running_total rt
+      WHERE d.day = rt.day
+    `);
+    
+    console.log('✅ Historical daily stats backfill complete');
+  } catch (error) {
+    console.error('❌ Failed to backfill daily stats:', error);
+  }
+}
+
 // Start all cron jobs
 export function startDataCollector(): void {
   console.log('🚀 Starting data collector...');
@@ -215,6 +374,11 @@ export function startDataCollector(): void {
     updateTraderSnapshots();
   });
   
+  // Aggregate daily stats every hour at :05 (after trader snapshots)
+  cron.schedule('5 * * * *', () => {
+    aggregateDailyStats();
+  });
+  
   // Clean up old data daily at 3am
   cron.schedule('0 3 * * *', () => {
     cleanupOldData();
@@ -223,5 +387,8 @@ export function startDataCollector(): void {
   // Run initial collection
   collectMarketStats();
   
-  console.log('✅ Data collector started (hourly snapshots for wallets viewed in last 24h, max 100)');
+  // Backfill daily stats on startup (only if empty)
+  setTimeout(() => backfillDailyStats(), 5000);
+  
+  console.log('✅ Data collector started (hourly snapshots + daily stats aggregation)');
 }
