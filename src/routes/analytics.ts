@@ -616,34 +616,77 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
       total: values.BTC + values.ETH + values.SOL
     }));
     
-    // Filter out restart drops: remove points where total drops more than 80% from neighbors
-    // or where total is 0 but neighbors have significant values
+    // Calculate median values for each coin to detect anomalies
+    const btcValues = data.map(d => d.BTC).filter(v => v > 0).sort((a, b) => a - b);
+    const ethValues = data.map(d => d.ETH).filter(v => v > 0).sort((a, b) => a - b);
+    const solValues = data.map(d => d.SOL).filter(v => v > 0).sort((a, b) => a - b);
+    
+    const medianBTC = btcValues.length > 0 ? btcValues[Math.floor(btcValues.length / 2)] : 0;
+    const medianETH = ethValues.length > 0 ? ethValues[Math.floor(ethValues.length / 2)] : 0;
+    const medianSOL = solValues.length > 0 ? solValues[Math.floor(solValues.length / 2)] : 0;
+    
+    // Filter out restart drops using multiple strategies
     data = data.filter((point, index, arr) => {
-      const total = point.total;
-      
-      // If total is 0 or very small, check if it's a restart drop
-      if (total < 1000) {
-        // Check previous and next points
+      // Strategy 1: If any major coin is 0 but median is significant, it's a drop
+      // Only filter if the coin normally has significant value
+      if (medianBTC > 10000000 && point.BTC === 0) {
+        // Check if neighbors have BTC data
         const prev = arr[index - 1];
         const next = arr[index + 1];
-        const prevTotal = prev?.total || 0;
-        const nextTotal = next?.total || 0;
-        
-        // If both neighbors have significant values, this is likely a restart drop
-        if (prevTotal > 100000 || nextTotal > 100000) {
-          return false; // Filter out this point
+        if ((prev && prev.BTC > medianBTC * 0.3) || (next && next.BTC > medianBTC * 0.3)) {
+          return false;
         }
       }
       
-      // Check for sudden drops more than 80%
+      if (medianETH > 10000000 && point.ETH === 0) {
+        const prev = arr[index - 1];
+        const next = arr[index + 1];
+        if ((prev && prev.ETH > medianETH * 0.3) || (next && next.ETH > medianETH * 0.3)) {
+          return false;
+        }
+      }
+      
+      if (medianSOL > 10000000 && point.SOL === 0) {
+        const prev = arr[index - 1];
+        const next = arr[index + 1];
+        if ((prev && prev.SOL > medianSOL * 0.3) || (next && next.SOL > medianSOL * 0.3)) {
+          return false;
+        }
+      }
+      
+      // Strategy 2: Detect sudden drops more than 90% for any coin
       if (index > 0) {
         const prev = arr[index - 1];
-        if (prev.total > 100000 && total < prev.total * 0.2) {
-          // Check if it recovers in the next few points
-          const next = arr[index + 1];
-          if (next && next.total > prev.total * 0.5) {
-            return false; // This is a temporary drop, filter it out
+        const next = arr[index + 1];
+        
+        // BTC sudden drop
+        if (prev.BTC > medianBTC * 0.5 && point.BTC < prev.BTC * 0.1) {
+          if (next && next.BTC > prev.BTC * 0.5) {
+            return false;
           }
+        }
+        
+        // ETH sudden drop
+        if (prev.ETH > medianETH * 0.5 && point.ETH < prev.ETH * 0.1) {
+          if (next && next.ETH > prev.ETH * 0.5) {
+            return false;
+          }
+        }
+        
+        // SOL sudden drop
+        if (prev.SOL > medianSOL * 0.5 && point.SOL < prev.SOL * 0.1) {
+          if (next && next.SOL > prev.SOL * 0.5) {
+            return false;
+          }
+        }
+      }
+      
+      // Strategy 3: Total drops to near zero
+      if (point.total < 1000) {
+        const prev = arr[index - 1];
+        const next = arr[index + 1];
+        if ((prev && prev.total > 100000) || (next && next.total > 100000)) {
+          return false;
         }
       }
       
@@ -706,19 +749,39 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
       ...values
     }));
     
-    // Filter out restart drops: remove points where all funding rates are 0
-    // but neighbors have non-zero values (indicates server restart)
+    // Count how many data points have non-zero values for each coin
+    const btcCount = data.filter(d => d.BTC !== 0).length;
+    const ethCount = data.filter(d => d.ETH !== 0).length;
+    const solCount = data.filter(d => d.SOL !== 0).length;
+    const totalPoints = data.length;
+    
+    // If a coin has data in most points, filter out points where it's suddenly 0
+    const btcShouldHaveData = btcCount > totalPoints * 0.7;
+    const ethShouldHaveData = ethCount > totalPoints * 0.7;
+    const solShouldHaveData = solCount > totalPoints * 0.7;
+    
+    // Filter out restart drops
     data = data.filter((point, index, arr) => {
-      const allZero = point.BTC === 0 && point.ETH === 0 && point.SOL === 0;
+      const prev = arr[index - 1];
+      const next = arr[index + 1];
       
+      // Check if this point has missing data that neighbors have
+      // BTC missing but should have data
+      if (btcShouldHaveData && point.BTC === 0) {
+        if ((prev && prev.BTC !== 0) || (next && next.BTC !== 0)) {
+          // Check if multiple coins are missing - likely a restart
+          const missingCount = (point.BTC === 0 ? 1 : 0) + (point.ETH === 0 ? 1 : 0) + (point.SOL === 0 ? 1 : 0);
+          if (missingCount >= 2) {
+            return false;
+          }
+        }
+      }
+      
+      // All zeros is definitely a restart
+      const allZero = point.BTC === 0 && point.ETH === 0 && point.SOL === 0;
       if (allZero) {
-        // Check if neighbors have data
-        const prev = arr[index - 1];
-        const next = arr[index + 1];
         const prevHasData = prev && (prev.BTC !== 0 || prev.ETH !== 0 || prev.SOL !== 0);
         const nextHasData = next && (next.BTC !== 0 || next.ETH !== 0 || next.SOL !== 0);
-        
-        // If surrounded by data points, this is likely a restart gap
         if (prevHasData || nextHasData) {
           return false;
         }
