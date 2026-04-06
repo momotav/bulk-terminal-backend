@@ -625,33 +625,25 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
     const medianETH = ethValues.length > 0 ? ethValues[Math.floor(ethValues.length / 2)] : 0;
     const medianSOL = solValues.length > 0 ? solValues[Math.floor(solValues.length / 2)] : 0;
     
+    // Calculate what percentage of data points have each coin
+    const btcCoverage = btcValues.length / data.length;
+    const ethCoverage = ethValues.length / data.length;
+    const solCoverage = solValues.length / data.length;
+    
     // Filter out restart drops using multiple strategies
     data = data.filter((point, index, arr) => {
-      // Strategy 1: If any major coin is 0 but median is significant, it's a drop
-      // Only filter if the coin normally has significant value
-      if (medianBTC > 10000000 && point.BTC === 0) {
-        // Check if neighbors have BTC data
-        const prev = arr[index - 1];
-        const next = arr[index + 1];
-        if ((prev && prev.BTC > medianBTC * 0.3) || (next && next.BTC > medianBTC * 0.3)) {
-          return false;
-        }
+      // Strategy 1: If a coin is 0 but it normally has data (>80% coverage) and median is significant
+      // This is likely a restart drop - filter it out
+      if (btcCoverage > 0.8 && medianBTC > 10000000 && point.BTC === 0) {
+        return false;
       }
       
-      if (medianETH > 10000000 && point.ETH === 0) {
-        const prev = arr[index - 1];
-        const next = arr[index + 1];
-        if ((prev && prev.ETH > medianETH * 0.3) || (next && next.ETH > medianETH * 0.3)) {
-          return false;
-        }
+      if (ethCoverage > 0.8 && medianETH > 10000000 && point.ETH === 0) {
+        return false;
       }
       
-      if (medianSOL > 10000000 && point.SOL === 0) {
-        const prev = arr[index - 1];
-        const next = arr[index + 1];
-        if ((prev && prev.SOL > medianSOL * 0.3) || (next && next.SOL > medianSOL * 0.3)) {
-          return false;
-        }
+      if (solCoverage > 0.8 && medianSOL > 10000000 && point.SOL === 0) {
+        return false;
       }
       
       // Strategy 2: Detect sudden drops more than 90% for any coin
@@ -659,22 +651,22 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
         const prev = arr[index - 1];
         const next = arr[index + 1];
         
-        // BTC sudden drop
-        if (prev.BTC > medianBTC * 0.5 && point.BTC < prev.BTC * 0.1) {
+        // BTC sudden drop (but not to exactly 0 - that's handled above)
+        if (point.BTC > 0 && prev.BTC > medianBTC * 0.5 && point.BTC < prev.BTC * 0.1) {
           if (next && next.BTC > prev.BTC * 0.5) {
             return false;
           }
         }
         
         // ETH sudden drop
-        if (prev.ETH > medianETH * 0.5 && point.ETH < prev.ETH * 0.1) {
+        if (point.ETH > 0 && prev.ETH > medianETH * 0.5 && point.ETH < prev.ETH * 0.1) {
           if (next && next.ETH > prev.ETH * 0.5) {
             return false;
           }
         }
         
         // SOL sudden drop
-        if (prev.SOL > medianSOL * 0.5 && point.SOL < prev.SOL * 0.1) {
+        if (point.SOL > 0 && prev.SOL > medianSOL * 0.5 && point.SOL < prev.SOL * 0.1) {
           if (next && next.SOL > prev.SOL * 0.5) {
             return false;
           }
