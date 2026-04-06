@@ -610,11 +610,45 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
       }
     }
     
-    const data = Array.from(dataMap.entries()).map(([timestamp, values]) => ({
+    let data = Array.from(dataMap.entries()).map(([timestamp, values]) => ({
       timestamp,
       ...values,
       total: values.BTC + values.ETH + values.SOL
     }));
+    
+    // Filter out restart drops: remove points where total drops more than 80% from neighbors
+    // or where total is 0 but neighbors have significant values
+    data = data.filter((point, index, arr) => {
+      const total = point.total;
+      
+      // If total is 0 or very small, check if it's a restart drop
+      if (total < 1000) {
+        // Check previous and next points
+        const prev = arr[index - 1];
+        const next = arr[index + 1];
+        const prevTotal = prev?.total || 0;
+        const nextTotal = next?.total || 0;
+        
+        // If both neighbors have significant values, this is likely a restart drop
+        if (prevTotal > 100000 || nextTotal > 100000) {
+          return false; // Filter out this point
+        }
+      }
+      
+      // Check for sudden drops more than 80%
+      if (index > 0) {
+        const prev = arr[index - 1];
+        if (prev.total > 100000 && total < prev.total * 0.2) {
+          // Check if it recovers in the next few points
+          const next = arr[index + 1];
+          if (next && next.total > prev.total * 0.5) {
+            return false; // This is a temporary drop, filter it out
+          }
+        }
+      }
+      
+      return true;
+    });
     
     const response = { hours, dataPoints: data.length, data };
     
@@ -667,10 +701,31 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
       }
     }
     
-    const data = Array.from(dataMap.entries()).map(([timestamp, values]) => ({
+    let data = Array.from(dataMap.entries()).map(([timestamp, values]) => ({
       timestamp,
       ...values
     }));
+    
+    // Filter out restart drops: remove points where all funding rates are 0
+    // but neighbors have non-zero values (indicates server restart)
+    data = data.filter((point, index, arr) => {
+      const allZero = point.BTC === 0 && point.ETH === 0 && point.SOL === 0;
+      
+      if (allZero) {
+        // Check if neighbors have data
+        const prev = arr[index - 1];
+        const next = arr[index + 1];
+        const prevHasData = prev && (prev.BTC !== 0 || prev.ETH !== 0 || prev.SOL !== 0);
+        const nextHasData = next && (next.BTC !== 0 || next.ETH !== 0 || next.SOL !== 0);
+        
+        // If surrounded by data points, this is likely a restart gap
+        if (prevHasData || nextHasData) {
+          return false;
+        }
+      }
+      
+      return true;
+    });
     
     const response = { hours, dataPoints: data.length, data };
     
