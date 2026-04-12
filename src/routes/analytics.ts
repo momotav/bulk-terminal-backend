@@ -326,7 +326,7 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
   const limit = parseInt(req.query.limit as string) || 20;
   
   try {
-    // Get recent trades from database
+    // Get recent trades - fetch more to ensure we have enough after combining
     const trades = await query(`
       SELECT 
         'trade' as type,
@@ -342,7 +342,7 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
       LIMIT $1
     `, [limit]).catch(() => []);
     
-    // Get recent liquidations from database
+    // Get recent liquidations - always fetch at least 10 to ensure some show up
     const liquidations = await query(`
       SELECT 
         'liquidation' as type,
@@ -356,14 +356,28 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
       FROM liquidations
       ORDER BY timestamp DESC
       LIMIT $1
-    `, [limit]).catch(() => []);
+    `, [Math.max(limit, 20)]).catch(() => []);
+    
+    // Strategy: Take all liquidations (up to half the limit) + fill rest with trades
+    // This ensures liquidations are always visible even if trades are more frequent
+    const maxLiquidations = Math.min(liquidations.length, Math.ceil(limit / 2));
+    const recentLiquidations = liquidations.slice(0, maxLiquidations);
+    
+    // Fill remaining slots with trades
+    const remainingSlots = limit - recentLiquidations.length;
+    const recentTrades = trades.slice(0, remainingSlots);
     
     // Combine and sort by timestamp
-    const combined = [...trades, ...liquidations]
-      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      .slice(0, limit);
+    const combined = [...recentTrades, ...recentLiquidations]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
     
-    res.json({ data: combined });
+    res.json({ 
+      data: combined,
+      meta: {
+        trades: recentTrades.length,
+        liquidations: recentLiquidations.length
+      }
+    });
   } catch (error) {
     console.error('Error fetching recent activity:', error);
     res.status(500).json({ error: 'Failed to fetch recent activity' });
