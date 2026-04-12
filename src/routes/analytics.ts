@@ -1437,4 +1437,340 @@ router.get('/cumulative-new-users', async (req: Request, res: Response) => {
   }
 });
 
+// ============ LIQUIDATIONS DASHBOARD ENDPOINTS ============
+
+// Treemap data - liquidations by coin and side
+router.get('/liquidations/treemap', async (req: Request, res: Response) => {
+  const period = req.query.period as string || '24h';
+  
+  const intervalMap: Record<string, string> = {
+    '4h': '4 hours',
+    '24h': '24 hours',
+    '3d': '3 days',
+    '7d': '7 days',
+    'all': '365 days'
+  };
+  const interval = intervalMap[period] || '24 hours';
+  
+  try {
+    const cacheKey = `liq-treemap:${period}`;
+    const cached = await getCache<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const data = await query<{
+      symbol: string;
+      side: string;
+      total_value: string;
+      count: string;
+    }>(`
+      SELECT 
+        symbol,
+        side,
+        COALESCE(SUM(value), 0) as total_value,
+        COUNT(*) as count
+      FROM liquidations
+      WHERE timestamp > NOW() - INTERVAL '${interval}'
+      GROUP BY symbol, side
+      ORDER BY total_value DESC
+    `);
+
+    const result = {
+      period,
+      data: data.map(row => ({
+        symbol: row.symbol.replace('-USD', ''),
+        side: row.side,
+        value: parseFloat(row.total_value),
+        count: parseInt(row.count)
+      })),
+      totalValue: data.reduce((sum, row) => sum + parseFloat(row.total_value), 0),
+      assets: new Set(data.map(row => row.symbol)).size
+    };
+
+    await setCache(cacheKey, result, 60); // 1 min cache
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching liquidation treemap:', error);
+    res.status(500).json({ error: 'Failed to fetch liquidation treemap' });
+  }
+});
+
+// Chart data - long vs short liquidations over time
+router.get('/liquidations/chart', async (req: Request, res: Response) => {
+  const period = req.query.period as string || 'all';
+  
+  const intervalMap: Record<string, { interval: string; bucket: string }> = {
+    '4h': { interval: '4 hours', bucket: '15 minutes' },
+    '24h': { interval: '24 hours', bucket: '1 hour' },
+    '3d': { interval: '3 days', bucket: '4 hours' },
+    '7d': { interval: '7 days', bucket: '12 hours' },
+    'all': { interval: '365 days', bucket: '1 day' }
+  };
+  const { interval, bucket } = intervalMap[period] || intervalMap['all'];
+  
+  try {
+    const cacheKey = `liq-chart:${period}`;
+    const cached = await getCache<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const data = await query<{
+      time_bucket: string;
+      long_value: string;
+      short_value: string;
+      long_count: string;
+      short_count: string;
+    }>(`
+      SELECT 
+        DATE_TRUNC('${bucket.split(' ')[1]}', timestamp) as time_bucket,
+        COALESCE(SUM(CASE WHEN side = 'long' THEN value ELSE 0 END), 0) as long_value,
+        COALESCE(SUM(CASE WHEN side = 'short' THEN value ELSE 0 END), 0) as short_value,
+        COUNT(CASE WHEN side = 'long' THEN 1 END) as long_count,
+        COUNT(CASE WHEN side = 'short' THEN 1 END) as short_count
+      FROM liquidations
+      WHERE timestamp > NOW() - INTERVAL '${interval}'
+      GROUP BY time_bucket
+      ORDER BY time_bucket ASC
+    `);
+
+    const result = {
+      period,
+      data: data.map(row => ({
+        timestamp: row.time_bucket,
+        longValue: parseFloat(row.long_value),
+        shortValue: parseFloat(row.short_value),
+        longCount: parseInt(row.long_count),
+        shortCount: parseInt(row.short_count)
+      }))
+    };
+
+    await setCache(cacheKey, result, 60);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching liquidation chart:', error);
+    res.status(500).json({ error: 'Failed to fetch liquidation chart' });
+  }
+});
+
+// Summary for a specific coin
+router.get('/liquidations/summary/:symbol', async (req: Request, res: Response) => {
+  const { symbol } = req.params;
+  const period = req.query.period as string || '7d';
+  const dbSymbol = symbol.includes('-') ? symbol : `${symbol}-USD`;
+  
+  const intervalMap: Record<string, string> = {
+    '4h': '4 hours',
+    '24h': '24 hours',
+    '3d': '3 days',
+    '7d': '7 days',
+    'all': '365 days'
+  };
+  const interval = intervalMap[period] || '7 days';
+  
+  try {
+    const cacheKey = `liq-summary:${symbol}:${period}`;
+    const cached = await getCache<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const data = await query<{
+      total_value: string;
+      total_count: string;
+      long_value: string;
+      short_value: string;
+      long_count: string;
+      short_count: string;
+      largest_value: string;
+      largest_size: string;
+    }>(`
+      SELECT 
+        COALESCE(SUM(value), 0) as total_value,
+        COUNT(*) as total_count,
+        COALESCE(SUM(CASE WHEN side = 'long' THEN value ELSE 0 END), 0) as long_value,
+        COALESCE(SUM(CASE WHEN side = 'short' THEN value ELSE 0 END), 0) as short_value,
+        COUNT(CASE WHEN side = 'long' THEN 1 END) as long_count,
+        COUNT(CASE WHEN side = 'short' THEN 1 END) as short_count,
+        COALESCE(MAX(value), 0) as largest_value,
+        COALESCE(MAX(size), 0) as largest_size
+      FROM liquidations
+      WHERE symbol = $1
+        AND timestamp > NOW() - INTERVAL '${interval}'
+    `, [dbSymbol]);
+
+    const row = data[0];
+    const totalValue = parseFloat(row.total_value);
+    const longValue = parseFloat(row.long_value);
+    const shortValue = parseFloat(row.short_value);
+
+    const result = {
+      symbol: symbol.replace('-USD', ''),
+      period,
+      totalValue,
+      totalCount: parseInt(row.total_count),
+      longValue,
+      shortValue,
+      longCount: parseInt(row.long_count),
+      shortCount: parseInt(row.short_count),
+      longPercent: totalValue > 0 ? (longValue / totalValue) * 100 : 0,
+      shortPercent: totalValue > 0 ? (shortValue / totalValue) * 100 : 0,
+      largestValue: parseFloat(row.largest_value),
+      largestSize: parseFloat(row.largest_size)
+    };
+
+    await setCache(cacheKey, result, 60);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching liquidation summary:', error);
+    res.status(500).json({ error: 'Failed to fetch liquidation summary' });
+  }
+});
+
+// Market summary for a specific coin
+router.get('/liquidations/market/:symbol', async (req: Request, res: Response) => {
+  const { symbol } = req.params;
+  const period = req.query.period as string || 'all';
+  const dbSymbol = symbol.includes('-') ? symbol : `${symbol}-USD`;
+  
+  const intervalMap: Record<string, string> = {
+    '4h': '4 hours',
+    '24h': '24 hours',
+    '3d': '3 days',
+    '7d': '7 days',
+    'all': '365 days'
+  };
+  const interval = intervalMap[period] || '365 days';
+  
+  try {
+    const cacheKey = `liq-market:${symbol}:${period}`;
+    const cached = await getCache<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    // Get liquidation stats
+    const liqData = await query<{
+      total_value: string;
+      long_value: string;
+      short_value: string;
+      long_count: string;
+      short_count: string;
+    }>(`
+      SELECT 
+        COALESCE(SUM(value), 0) as total_value,
+        COALESCE(SUM(CASE WHEN side = 'long' THEN value ELSE 0 END), 0) as long_value,
+        COALESCE(SUM(CASE WHEN side = 'short' THEN value ELSE 0 END), 0) as short_value,
+        COUNT(CASE WHEN side = 'long' THEN 1 END) as long_count,
+        COUNT(CASE WHEN side = 'short' THEN 1 END) as short_count
+      FROM liquidations
+      WHERE symbol = $1
+        AND timestamp > NOW() - INTERVAL '${interval}'
+    `, [dbSymbol]);
+
+    // Get current price and 24h change from BULK API
+    let markPrice = 0;
+    let priceChange24h = 0;
+    try {
+      const tickerRes = await fetch(`${BULK_API_BASE}/ticker/${dbSymbol}`);
+      if (tickerRes.ok) {
+        const ticker = await tickerRes.json() as BulkTicker;
+        markPrice = ticker.markPrice || ticker.lastPrice || 0;
+        priceChange24h = ticker.priceChangePercent || 0;
+      }
+    } catch (e) {
+      console.error('Failed to fetch ticker for market summary:', e);
+    }
+
+    const row = liqData[0];
+    const totalValue = parseFloat(row.total_value);
+    const longValue = parseFloat(row.long_value);
+    const shortValue = parseFloat(row.short_value);
+    const longCount = parseInt(row.long_count);
+    const shortCount = parseInt(row.short_count);
+
+    const result = {
+      symbol: symbol.replace('-USD', ''),
+      period,
+      markPrice,
+      priceChange24h,
+      totalValue,
+      longValue,
+      shortValue,
+      longCount,
+      shortCount,
+      longPercent: totalValue > 0 ? (longValue / totalValue) * 100 : 0,
+      shortPercent: totalValue > 0 ? (shortValue / totalValue) * 100 : 0,
+      dominant: longValue > shortValue ? 'LONGS' : shortValue > longValue ? 'SHORTS' : 'NEUTRAL'
+    };
+
+    await setCache(cacheKey, result, 30); // 30s cache (has live price)
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching market summary:', error);
+    res.status(500).json({ error: 'Failed to fetch market summary' });
+  }
+});
+
+// Featured/Recent large liquidations
+router.get('/liquidations/featured', async (req: Request, res: Response) => {
+  const limit = parseInt(req.query.limit as string) || 10;
+  const symbol = req.query.symbol as string;
+  
+  try {
+    const cacheKey = `liq-featured:${symbol || 'all'}:${limit}`;
+    const cached = await getCache<any>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    let whereClause = 'WHERE timestamp > NOW() - INTERVAL \'7 days\'';
+    const params: any[] = [];
+    
+    if (symbol && symbol !== 'ALL') {
+      const dbSymbol = symbol.includes('-') ? symbol : `${symbol}-USD`;
+      whereClause += ' AND symbol = $1';
+      params.push(dbSymbol);
+    }
+
+    const data = await query<{
+      id: number;
+      wallet_address: string;
+      symbol: string;
+      side: string;
+      size: string;
+      price: string;
+      value: string;
+      timestamp: string;
+    }>(`
+      SELECT id, wallet_address, symbol, side, size, price, value, timestamp
+      FROM liquidations
+      ${whereClause}
+      ORDER BY value DESC
+      LIMIT ${limit}
+    `, params);
+
+    const result = {
+      data: data.map(row => ({
+        id: row.id,
+        wallet: row.wallet_address,
+        symbol: row.symbol.replace('-USD', ''),
+        side: row.side,
+        size: parseFloat(row.size),
+        price: parseFloat(row.price),
+        value: parseFloat(row.value),
+        timestamp: row.timestamp,
+        isHighImpact: parseFloat(row.value) > 100000 // > $100k is "high impact"
+      }))
+    };
+
+    await setCache(cacheKey, result, 30);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching featured liquidations:', error);
+    res.status(500).json({ error: 'Failed to fetch featured liquidations' });
+  }
+});
+
 export default router;
