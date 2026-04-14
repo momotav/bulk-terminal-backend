@@ -395,13 +395,47 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
     const startTime = now - (hours * 60 * 60 * 1000);
     
     // Determine interval based on hours
+    // For longer periods, always use 1d interval to show daily bars
     let interval = '1h';
     if (hours <= 24) interval = '1h';
-    else if (hours <= 168) interval = '4h';
-    else if (hours <= 720) interval = '1d';
-    else interval = '1d';
+    else if (hours <= 168) interval = '1d';  // Week: 1 bar per day
+    else interval = '1d';  // Month, ALL: 1 bar per day
     
     const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    
+    // For cumulative calculation, we need ALL historical data
+    // Fetch all-time data with daily interval
+    const allTimeKlinesPromises = symbols.map(symbol => 
+      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1d&limit=1000`)
+        .then(r => r.ok ? r.json() : [])
+        .catch(() => [])
+    );
+    
+    const [btcAllTime, ethAllTime, solAllTime] = await Promise.all(allTimeKlinesPromises);
+    
+    // Calculate total historical volume up to the start of our view period
+    let historicalCumulative = 0;
+    const allTimeMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
+    
+    // Process all-time data
+    [btcAllTime, ethAllTime, solAllTime].forEach((klines, idx) => {
+      const sym = ['BTC', 'ETH', 'SOL'][idx];
+      (klines as any[]).forEach((k: any) => {
+        const ts = k.t;
+        if (!allTimeMap.has(ts)) allTimeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+        (allTimeMap.get(ts) as any)[sym] = (k.v || 0) * (k.c || 0);
+      });
+    });
+    
+    // Sort all-time data and calculate cumulative up to startTime
+    const allTimeSorted = Array.from(allTimeMap.entries()).sort((a, b) => a[0] - b[0]);
+    for (const [ts, vol] of allTimeSorted) {
+      if (ts < startTime) {
+        historicalCumulative += vol.BTC + vol.ETH + vol.SOL;
+      }
+    }
+    
+    // Now fetch data for the actual view period
     const klinesPromises = symbols.map(symbol => 
       fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=${interval}&startTime=${startTime}&endTime=${now}`)
         .then(r => r.ok ? r.json() : [])
@@ -434,8 +468,8 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
       volumeMap.get(ts)!.SOL = (k.v || 0) * (k.c || 0);
     });
     
-    // Convert to array and sort, add cumulative
-    let cumulative = 0;
+    // Convert to array and sort, add cumulative starting from historical total
+    let cumulative = historicalCumulative;
     const data = Array.from(volumeMap.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([ts, vol]) => {
@@ -451,7 +485,7 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
         };
       });
     
-    console.log(`📊 Volume chart: ${data.length} data points from BULK API klines`);
+    console.log(`📊 Volume chart: ${data.length} data points, historical cumulative: $${(historicalCumulative/1e9).toFixed(2)}B`);
     res.json({ data });
   } catch (error) {
     console.error('Error fetching volume chart from API:', error);
@@ -468,13 +502,46 @@ router.get('/trades-chart-api', async (req: Request, res: Response) => {
     const startTime = now - (hours * 60 * 60 * 1000);
     
     // Determine interval based on hours
+    // For longer periods, always use 1d interval to show daily bars
     let interval = '1h';
     if (hours <= 24) interval = '1h';
-    else if (hours <= 168) interval = '4h';
-    else if (hours <= 720) interval = '1d';
-    else interval = '1d';
+    else if (hours <= 168) interval = '1d';  // Week: 1 bar per day
+    else interval = '1d';  // Month, ALL: 1 bar per day
     
     const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    
+    // For cumulative calculation, we need ALL historical data
+    const allTimeKlinesPromises = symbols.map(symbol => 
+      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1d&limit=1000`)
+        .then(r => r.ok ? r.json() : [])
+        .catch(() => [])
+    );
+    
+    const [btcAllTime, ethAllTime, solAllTime] = await Promise.all(allTimeKlinesPromises);
+    
+    // Calculate total historical trades up to the start of our view period
+    let historicalCumulative = 0;
+    const allTimeMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
+    
+    // Process all-time data
+    [btcAllTime, ethAllTime, solAllTime].forEach((klines, idx) => {
+      const sym = ['BTC', 'ETH', 'SOL'][idx];
+      (klines as any[]).forEach((k: any) => {
+        const ts = k.t;
+        if (!allTimeMap.has(ts)) allTimeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+        (allTimeMap.get(ts) as any)[sym] = k.n || 0;
+      });
+    });
+    
+    // Sort all-time data and calculate cumulative up to startTime
+    const allTimeSorted = Array.from(allTimeMap.entries()).sort((a, b) => a[0] - b[0]);
+    for (const [ts, trades] of allTimeSorted) {
+      if (ts < startTime) {
+        historicalCumulative += trades.BTC + trades.ETH + trades.SOL;
+      }
+    }
+    
+    // Now fetch data for the actual view period
     const klinesPromises = symbols.map(symbol => 
       fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=${interval}&startTime=${startTime}&endTime=${now}`)
         .then(r => r.ok ? r.json() : [])
@@ -507,8 +574,8 @@ router.get('/trades-chart-api', async (req: Request, res: Response) => {
       tradesMap.get(ts)!.SOL = k.n || 0;
     });
     
-    // Convert to array and sort, add cumulative
-    let cumulative = 0;
+    // Convert to array and sort, add cumulative starting from historical total
+    let cumulative = historicalCumulative;
     const data = Array.from(tradesMap.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([ts, trades]) => {
@@ -524,7 +591,7 @@ router.get('/trades-chart-api', async (req: Request, res: Response) => {
         };
       });
     
-    console.log(`📊 Trades chart: ${data.length} data points from BULK API klines`);
+    console.log(`📊 Trades chart: ${data.length} data points, historical cumulative: ${historicalCumulative.toLocaleString()}`);
     res.json({ data });
   } catch (error) {
     console.error('Error fetching trades chart from API:', error);
