@@ -966,6 +966,9 @@ router.get('/volume-chart', async (req: Request, res: Response) => {
 });
 
 // Get trades chart data from database
+// NOTE: Only shows data from BULK API launch (April 13, 2026 19:00 UTC) for chart alignment
+const BULK_API_START = '2026-04-13T19:00:00.000Z';
+
 router.get('/trades-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
   const isAllTime = hours >= 8760;
@@ -978,13 +981,16 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
   }
   
   try {
-    // First get total all-time trade count
+    // Get total trades count ONLY from BULK API start date onwards (for chart alignment)
     const totalResult = await query<{ total: string }>(`
-      SELECT COUNT(*) as total FROM trades
+      SELECT COUNT(*) as total FROM trades WHERE timestamp >= '${BULK_API_START}'
     `);
     const totalAllTime = parseFloat(totalResult[0]?.total || '0');
     
-    // Get visible period data
+    // Calculate the effective start time (max of user's requested period and BULK API start)
+    const requestedStart = isAllTime ? BULK_API_START : `NOW() - INTERVAL '${hours} hours'`;
+    
+    // Get visible period data (always filtered to BULK API start at minimum)
     const visibleRows = await Promise.race([
       query(`
         SELECT 
@@ -993,7 +999,7 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
           COUNT(*) as trade_count,
           SUM(value) as volume
         FROM trades
-        WHERE timestamp >= NOW() - INTERVAL '${isAllTime ? 8760 : hours} hours'
+        WHERE timestamp >= GREATEST('${BULK_API_START}'::timestamp, ${isAllTime ? `'${BULK_API_START}'::timestamp` : `NOW() - INTERVAL '${hours} hours'`})
         GROUP BY date_trunc('day', timestamp), symbol
         ORDER BY day ASC
       `),
@@ -1006,7 +1012,7 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
       visibleSum += parseFloat(row.trade_count || 0);
     }
     
-    // Historical = total - visible
+    // Historical = total (from BULK start) - visible period
     const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
