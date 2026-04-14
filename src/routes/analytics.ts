@@ -930,31 +930,32 @@ router.get('/volume-chart', async (req: Request, res: Response) => {
   const isAllTime = hours >= 8760;
   
   try {
-    // Get all data for cumulative calculation
-    const allRows = await query(`
+    // First get total all-time volume
+    const totalResult = await query<{ total: string }>(`
+      SELECT COALESCE(SUM(value), 0) as total FROM trades
+    `);
+    const totalAllTime = parseFloat(totalResult[0]?.total || '0');
+    
+    // Get visible period data
+    const visibleRows = await query(`
       SELECT 
         date_trunc('day', timestamp) as day,
         symbol,
         SUM(value) as volume
       FROM trades
+      WHERE timestamp >= NOW() - INTERVAL '${isAllTime ? 8760 : hours} hours'
       GROUP BY date_trunc('day', timestamp), symbol
       ORDER BY day ASC
     `);
     
-    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
-    
-    // Calculate historical cumulative and filter visible rows
-    let historicalCumulative = 0;
-    const visibleRows: any[] = [];
-    
-    for (const row of allRows) {
-      const rowTime = new Date(row.day).getTime();
-      if (rowTime < startTime) {
-        historicalCumulative += parseFloat(row.volume || 0);
-      } else {
-        visibleRows.push(row);
-      }
+    // Calculate visible sum
+    let visibleSum = 0;
+    for (const row of visibleRows) {
+      visibleSum += parseFloat(row.volume || 0);
     }
+    
+    // Historical = total - visible
+    const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
     res.json({ data });
@@ -977,8 +978,14 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
   }
   
   try {
-    // Get all data for cumulative calculation
-    const allRows = await Promise.race([
+    // First get total all-time trade count
+    const totalResult = await query<{ total: string }>(`
+      SELECT COUNT(*) as total FROM trades
+    `);
+    const totalAllTime = parseFloat(totalResult[0]?.total || '0');
+    
+    // Get visible period data
+    const visibleRows = await Promise.race([
       query(`
         SELECT 
           date_trunc('day', timestamp) as day,
@@ -986,26 +993,21 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
           COUNT(*) as trade_count,
           SUM(value) as volume
         FROM trades
+        WHERE timestamp >= NOW() - INTERVAL '${isAllTime ? 8760 : hours} hours'
         GROUP BY date_trunc('day', timestamp), symbol
         ORDER BY day ASC
       `),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 8000))
     ]) as any[];
     
-    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
-    
-    // Calculate historical cumulative and filter visible rows
-    let historicalCumulative = 0;
-    const visibleRows: any[] = [];
-    
-    for (const row of allRows) {
-      const rowTime = new Date(row.day).getTime();
-      if (rowTime < startTime) {
-        historicalCumulative += parseFloat(row.trade_count || 0);
-      } else {
-        visibleRows.push(row);
-      }
+    // Calculate visible sum (count)
+    let visibleSum = 0;
+    for (const row of visibleRows) {
+      visibleSum += parseFloat(row.trade_count || 0);
     }
+    
+    // Historical = total - visible
+    const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
     const result = { data };
@@ -1034,8 +1036,14 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
   }
   
   try {
-    // Get all data for cumulative calculation
-    const allRows = await Promise.race([
+    // First get total all-time liquidation value
+    const totalResult = await query<{ total: string }>(`
+      SELECT COALESCE(SUM(value), 0) as total FROM liquidations
+    `);
+    const totalAllTime = parseFloat(totalResult[0]?.total || '0');
+    
+    // Get visible period data
+    const visibleRows = await Promise.race([
       query(`
         SELECT 
           date_trunc('day', timestamp) as day,
@@ -1043,26 +1051,21 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
           COUNT(*) as liquidation_count,
           SUM(value) as total_value
         FROM liquidations
+        WHERE timestamp >= NOW() - INTERVAL '${isAllTime ? 8760 : hours} hours'
         GROUP BY date_trunc('day', timestamp), symbol
         ORDER BY day ASC
       `),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
     ]) as any[];
     
-    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
-    
-    // Calculate historical cumulative and filter visible rows
-    let historicalCumulative = 0;
-    const visibleRows: any[] = [];
-    
-    for (const row of allRows) {
-      const rowTime = new Date(row.day).getTime();
-      if (rowTime < startTime) {
-        historicalCumulative += parseFloat(row.total_value || 0);
-      } else {
-        visibleRows.push(row);
-      }
+    // Calculate visible sum
+    let visibleSum = 0;
+    for (const row of visibleRows) {
+      visibleSum += parseFloat(row.total_value || 0);
     }
+    
+    // Historical = total - visible
+    const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
     const result = { data };
@@ -1083,32 +1086,33 @@ router.get('/adl-chart', async (req: Request, res: Response) => {
   const isAllTime = hours >= 8760;
   
   try {
-    // Get all data for cumulative calculation
-    const allRows = await query(`
+    // First get total all-time ADL value
+    const totalResult = await query<{ total: string }>(`
+      SELECT COALESCE(SUM(value), 0) as total FROM adl_events
+    `).catch(() => [{ total: '0' }]);
+    const totalAllTime = parseFloat(totalResult[0]?.total || '0');
+    
+    // Get visible period data
+    const visibleRows = await query(`
       SELECT 
         date_trunc('day', timestamp) as day,
         symbol,
         COUNT(*) as adl_count,
         SUM(value) as total_value
       FROM adl_events
+      WHERE timestamp >= NOW() - INTERVAL '${isAllTime ? 8760 : hours} hours'
       GROUP BY date_trunc('day', timestamp), symbol
       ORDER BY day ASC
     `).catch(() => []);
     
-    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
-    
-    // Calculate historical cumulative and filter visible rows
-    let historicalCumulative = 0;
-    const visibleRows: any[] = [];
-    
-    for (const row of allRows) {
-      const rowTime = new Date(row.day).getTime();
-      if (rowTime < startTime) {
-        historicalCumulative += parseFloat(row.total_value || 0);
-      } else {
-        visibleRows.push(row);
-      }
+    // Calculate visible sum
+    let visibleSum = 0;
+    for (const row of visibleRows) {
+      visibleSum += parseFloat(row.total_value || 0);
     }
+    
+    // Historical = total - visible
+    const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
     res.json({ data });
@@ -1672,7 +1676,7 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
     '7d': { interval: '7 days', bucket: '12 hours' },
     'all': { interval: '365 days', bucket: '1 day' }
   };
-  const { interval, bucket } = intervalMap[period] || intervalMap['all'];
+  const { bucket } = intervalMap[period] || intervalMap['all'];
   const isAllTime = period === 'all';
   
   try {
@@ -1682,8 +1686,20 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
       return res.json(cached);
     }
 
-    // First, get ALL data to calculate proper cumulative
-    const allData = await query<{
+    // First, get the TOTAL cumulative of ALL liquidations ever (raw sum, no bucketing)
+    const totalResult = await query<{ total: string }>(`
+      SELECT COALESCE(SUM(value), 0) as total FROM liquidations
+    `);
+    const totalAllTime = parseFloat(totalResult[0]?.total || '0');
+
+    // Now get bucketed data for the visible period
+    const intervalHours: Record<string, number> = {
+      '4h': 4, '24h': 24, '3d': 72, '7d': 168, 'all': 8760
+    };
+    const hours = intervalHours[period] || 8760;
+    
+    // Get data for visible period with appropriate bucket
+    const visibleData = await query<{
       time_bucket: string;
       long_value: string;
       short_value: string;
@@ -1697,31 +1713,21 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
         COUNT(CASE WHEN side = 'long' THEN 1 END) as long_count,
         COUNT(CASE WHEN side = 'short' THEN 1 END) as short_count
       FROM liquidations
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
       GROUP BY time_bucket
       ORDER BY time_bucket ASC
     `);
 
-    // Calculate interval start time
-    const intervalHours: Record<string, number> = {
-      '4h': 4, '24h': 24, '3d': 72, '7d': 168, 'all': 8760
-    };
-    const hours = intervalHours[period] || 8760;
-    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
-    
-    // Calculate historical cumulative and filter visible data
-    let historicalCumulative = 0;
-    const visibleData: typeof allData = [];
-    
-    for (const row of allData) {
-      const rowTime = new Date(row.time_bucket).getTime();
-      if (rowTime < startTime) {
-        historicalCumulative += parseFloat(row.long_value) + parseFloat(row.short_value);
-      } else {
-        visibleData.push(row);
-      }
+    // Calculate the sum of visible data
+    let visibleSum = 0;
+    for (const row of visibleData) {
+      visibleSum += parseFloat(row.long_value) + parseFloat(row.short_value);
     }
+    
+    // Historical cumulative = total all time - visible period sum
+    const historicalCumulative = totalAllTime - visibleSum;
 
-    // Build result with cumulative
+    // Build result with cumulative starting from historical
     let cumulative = historicalCumulative;
     const result = {
       period,
