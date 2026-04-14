@@ -393,96 +393,90 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
   
   try {
     const now = Date.now();
-    const startTime = now - (hours * 60 * 60 * 1000);
-    
-    // Determine interval based on hours
-    let interval = '1h';
-    if (hours <= 24) interval = '1h';
-    else interval = '1d';  // Week, Month, ALL: 1 bar per day
+    const startTime = isAllTime ? 0 : now - (hours * 60 * 60 * 1000);
     
     const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
     
-    // Always fetch ALL historical daily data for cumulative calculation
-    const allTimeKlinesPromises = symbols.map(symbol => 
-      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1d&limit=1000`)
+    // Always fetch hourly data (more reliable than daily from BULK API)
+    // Fetch a large limit to get all available data
+    const klinesPromises = symbols.map(symbol => 
+      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
         .then(r => r.ok ? r.json() : [])
         .catch(() => [])
     );
     
-    const [btcAllTime, ethAllTime, solAllTime] = await Promise.all(allTimeKlinesPromises);
+    const [btcKlines, ethKlines, solKlines] = await Promise.all(klinesPromises);
     
-    // Build complete all-time map
-    const allTimeMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
+    // Create a map of timestamp -> volumes (hourly)
+    const hourlyMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
     
-    [btcAllTime, ethAllTime, solAllTime].forEach((klines, idx) => {
-      const sym = ['BTC', 'ETH', 'SOL'][idx];
-      (klines as any[]).forEach((k: any) => {
-        const ts = k.t;
-        if (!allTimeMap.has(ts)) allTimeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-        (allTimeMap.get(ts) as any)[sym] = (k.v || 0) * (k.c || 0);
-      });
+    (btcKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      hourlyMap.get(ts)!.BTC = (k.v || 0) * (k.c || 0);
     });
     
-    // For hourly view (1D), fetch hourly data separately
-    let volumeMap: Map<number, { BTC: number; ETH: number; SOL: number }>;
+    (ethKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      hourlyMap.get(ts)!.ETH = (k.v || 0) * (k.c || 0);
+    });
+    
+    (solKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      hourlyMap.get(ts)!.SOL = (k.v || 0) * (k.c || 0);
+    });
+    
+    // Determine output format based on period
+    let outputMap: Map<number, { BTC: number; ETH: number; SOL: number }>;
     let historicalCumulative = 0;
     
-    if (interval === '1h') {
-      // Calculate cumulative from all daily data BEFORE startTime
-      const allTimeSorted = Array.from(allTimeMap.entries()).sort((a, b) => a[0] - b[0]);
-      for (const [ts, vol] of allTimeSorted) {
-        if (ts < startTime) {
+    if (hours <= 24) {
+      // Hourly bars for 1D view
+      outputMap = new Map();
+      const sortedHourly = Array.from(hourlyMap.entries()).sort((a, b) => a[0] - b[0]);
+      
+      for (const [ts, vol] of sortedHourly) {
+        if (ts >= startTime) {
+          outputMap.set(ts, vol);
+        } else {
           historicalCumulative += vol.BTC + vol.ETH + vol.SOL;
         }
       }
-      
-      // Fetch hourly data for the view period
-      const klinesPromises = symbols.map(symbol => 
-        fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&startTime=${startTime}&endTime=${now}`)
-          .then(r => r.ok ? r.json() : [])
-          .catch(() => [])
-      );
-      
-      const [btcKlines, ethKlines, solKlines] = await Promise.all(klinesPromises);
-      
-      volumeMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
-      
-      (btcKlines as any[]).forEach((k: any) => {
-        const ts = k.t;
-        if (!volumeMap.has(ts)) volumeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-        volumeMap.get(ts)!.BTC = (k.v || 0) * (k.c || 0);
-      });
-      
-      (ethKlines as any[]).forEach((k: any) => {
-        const ts = k.t;
-        if (!volumeMap.has(ts)) volumeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-        volumeMap.get(ts)!.ETH = (k.v || 0) * (k.c || 0);
-      });
-      
-      (solKlines as any[]).forEach((k: any) => {
-        const ts = k.t;
-        if (!volumeMap.has(ts)) volumeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-        volumeMap.get(ts)!.SOL = (k.v || 0) * (k.c || 0);
-      });
     } else {
-      // For daily views (W, M, ALL), use the all-time daily data
-      // Filter by startTime only if not ALL time
-      volumeMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
+      // Aggregate hourly data into daily bars for W/M/ALL
+      const dailyMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
       
-      const allTimeSorted = Array.from(allTimeMap.entries()).sort((a, b) => a[0] - b[0]);
-      for (const [ts, vol] of allTimeSorted) {
+      for (const [ts, vol] of hourlyMap.entries()) {
+        // Get start of day (UTC)
+        const date = new Date(ts);
+        const dayStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+        
+        if (!dailyMap.has(dayStart)) {
+          dailyMap.set(dayStart, { BTC: 0, ETH: 0, SOL: 0 });
+        }
+        dailyMap.get(dayStart)!.BTC += vol.BTC;
+        dailyMap.get(dayStart)!.ETH += vol.ETH;
+        dailyMap.get(dayStart)!.SOL += vol.SOL;
+      }
+      
+      // Filter by startTime and calculate historical cumulative
+      outputMap = new Map();
+      const sortedDaily = Array.from(dailyMap.entries()).sort((a, b) => a[0] - b[0]);
+      
+      for (const [ts, vol] of sortedDaily) {
         if (isAllTime || ts >= startTime) {
-          volumeMap.set(ts, vol);
+          outputMap.set(ts, vol);
         } else {
-          // Add to historical cumulative
           historicalCumulative += vol.BTC + vol.ETH + vol.SOL;
         }
       }
     }
     
-    // Convert to array and sort, add cumulative starting from historical total
+    // Convert to array and add cumulative
     let cumulative = historicalCumulative;
-    const data = Array.from(volumeMap.entries())
+    const data = Array.from(outputMap.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([ts, vol]) => {
         const total = vol.BTC + vol.ETH + vol.SOL;
@@ -512,94 +506,89 @@ router.get('/trades-chart-api', async (req: Request, res: Response) => {
   
   try {
     const now = Date.now();
-    const startTime = now - (hours * 60 * 60 * 1000);
-    
-    // Determine interval based on hours
-    let interval = '1h';
-    if (hours <= 24) interval = '1h';
-    else interval = '1d';  // Week, Month, ALL: 1 bar per day
+    const startTime = isAllTime ? 0 : now - (hours * 60 * 60 * 1000);
     
     const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
     
-    // Always fetch ALL historical daily data for cumulative calculation
-    const allTimeKlinesPromises = symbols.map(symbol => 
-      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1d&limit=1000`)
+    // Always fetch hourly data (more reliable than daily from BULK API)
+    const klinesPromises = symbols.map(symbol => 
+      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
         .then(r => r.ok ? r.json() : [])
         .catch(() => [])
     );
     
-    const [btcAllTime, ethAllTime, solAllTime] = await Promise.all(allTimeKlinesPromises);
+    const [btcKlines, ethKlines, solKlines] = await Promise.all(klinesPromises);
     
-    // Build complete all-time map
-    const allTimeMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
+    // Create a map of timestamp -> trades (hourly)
+    const hourlyMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
     
-    [btcAllTime, ethAllTime, solAllTime].forEach((klines, idx) => {
-      const sym = ['BTC', 'ETH', 'SOL'][idx];
-      (klines as any[]).forEach((k: any) => {
-        const ts = k.t;
-        if (!allTimeMap.has(ts)) allTimeMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-        (allTimeMap.get(ts) as any)[sym] = k.n || 0;
-      });
+    (btcKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      hourlyMap.get(ts)!.BTC = k.n || 0;
     });
     
-    // For hourly view (1D), fetch hourly data separately
-    let tradesMap: Map<number, { BTC: number; ETH: number; SOL: number }>;
+    (ethKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      hourlyMap.get(ts)!.ETH = k.n || 0;
+    });
+    
+    (solKlines as any[]).forEach((k: any) => {
+      const ts = k.t;
+      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
+      hourlyMap.get(ts)!.SOL = k.n || 0;
+    });
+    
+    // Determine output format based on period
+    let outputMap: Map<number, { BTC: number; ETH: number; SOL: number }>;
     let historicalCumulative = 0;
     
-    if (interval === '1h') {
-      // Calculate cumulative from all daily data BEFORE startTime
-      const allTimeSorted = Array.from(allTimeMap.entries()).sort((a, b) => a[0] - b[0]);
-      for (const [ts, trades] of allTimeSorted) {
-        if (ts < startTime) {
+    if (hours <= 24) {
+      // Hourly bars for 1D view
+      outputMap = new Map();
+      const sortedHourly = Array.from(hourlyMap.entries()).sort((a, b) => a[0] - b[0]);
+      
+      for (const [ts, trades] of sortedHourly) {
+        if (ts >= startTime) {
+          outputMap.set(ts, trades);
+        } else {
           historicalCumulative += trades.BTC + trades.ETH + trades.SOL;
         }
       }
-      
-      // Fetch hourly data for the view period
-      const klinesPromises = symbols.map(symbol => 
-        fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&startTime=${startTime}&endTime=${now}`)
-          .then(r => r.ok ? r.json() : [])
-          .catch(() => [])
-      );
-      
-      const [btcKlines, ethKlines, solKlines] = await Promise.all(klinesPromises);
-      
-      tradesMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
-      
-      (btcKlines as any[]).forEach((k: any) => {
-        const ts = k.t;
-        if (!tradesMap.has(ts)) tradesMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-        tradesMap.get(ts)!.BTC = k.n || 0;
-      });
-      
-      (ethKlines as any[]).forEach((k: any) => {
-        const ts = k.t;
-        if (!tradesMap.has(ts)) tradesMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-        tradesMap.get(ts)!.ETH = k.n || 0;
-      });
-      
-      (solKlines as any[]).forEach((k: any) => {
-        const ts = k.t;
-        if (!tradesMap.has(ts)) tradesMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-        tradesMap.get(ts)!.SOL = k.n || 0;
-      });
     } else {
-      // For daily views (W, M, ALL), use the all-time daily data
-      tradesMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
+      // Aggregate hourly data into daily bars for W/M/ALL
+      const dailyMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
       
-      const allTimeSorted = Array.from(allTimeMap.entries()).sort((a, b) => a[0] - b[0]);
-      for (const [ts, trades] of allTimeSorted) {
+      for (const [ts, trades] of hourlyMap.entries()) {
+        // Get start of day (UTC)
+        const date = new Date(ts);
+        const dayStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+        
+        if (!dailyMap.has(dayStart)) {
+          dailyMap.set(dayStart, { BTC: 0, ETH: 0, SOL: 0 });
+        }
+        dailyMap.get(dayStart)!.BTC += trades.BTC;
+        dailyMap.get(dayStart)!.ETH += trades.ETH;
+        dailyMap.get(dayStart)!.SOL += trades.SOL;
+      }
+      
+      // Filter by startTime and calculate historical cumulative
+      outputMap = new Map();
+      const sortedDaily = Array.from(dailyMap.entries()).sort((a, b) => a[0] - b[0]);
+      
+      for (const [ts, trades] of sortedDaily) {
         if (isAllTime || ts >= startTime) {
-          tradesMap.set(ts, trades);
+          outputMap.set(ts, trades);
         } else {
           historicalCumulative += trades.BTC + trades.ETH + trades.SOL;
         }
       }
     }
     
-    // Convert to array and sort, add cumulative starting from historical total
+    // Convert to array and add cumulative
     let cumulative = historicalCumulative;
-    const data = Array.from(tradesMap.entries())
+    const data = Array.from(outputMap.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([ts, trades]) => {
         const total = trades.BTC + trades.ETH + trades.SOL;
