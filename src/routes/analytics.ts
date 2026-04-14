@@ -1030,6 +1030,7 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
 });
 
 // Get liquidations chart data from database
+// NOTE: Only shows data from BULK API launch (April 13, 2026 19:00 UTC) for chart alignment
 router.get('/liquidations-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
   const isAllTime = hours >= 8760;
@@ -1042,13 +1043,13 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
   }
   
   try {
-    // First get total all-time liquidation value
+    // Get total liquidation value ONLY from BULK API start date onwards
     const totalResult = await query<{ total: string }>(`
-      SELECT COALESCE(SUM(value), 0) as total FROM liquidations
+      SELECT COALESCE(SUM(value), 0) as total FROM liquidations WHERE timestamp >= '${BULK_API_START}'
     `);
     const totalAllTime = parseFloat(totalResult[0]?.total || '0');
     
-    // Get visible period data
+    // Get visible period data (always filtered to BULK API start at minimum)
     const visibleRows = await Promise.race([
       query(`
         SELECT 
@@ -1057,7 +1058,7 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
           COUNT(*) as liquidation_count,
           SUM(value) as total_value
         FROM liquidations
-        WHERE timestamp >= NOW() - INTERVAL '${isAllTime ? 8760 : hours} hours'
+        WHERE timestamp >= GREATEST('${BULK_API_START}'::timestamp, ${isAllTime ? `'${BULK_API_START}'::timestamp` : `NOW() - INTERVAL '${hours} hours'`})
         GROUP BY date_trunc('day', timestamp), symbol
         ORDER BY day ASC
       `),
@@ -1070,7 +1071,7 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
       visibleSum += parseFloat(row.total_value || 0);
     }
     
-    // Historical = total - visible
+    // Historical = total (from BULK start) - visible period
     const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
@@ -1087,18 +1088,19 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
 });
 
 // Get ADL chart data from database
+// NOTE: Only shows data from BULK API launch (April 13, 2026 19:00 UTC) for chart alignment
 router.get('/adl-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
   const isAllTime = hours >= 8760;
   
   try {
-    // First get total all-time ADL value
+    // Get total ADL value ONLY from BULK API start date onwards
     const totalResult = await query<{ total: string }>(`
-      SELECT COALESCE(SUM(value), 0) as total FROM adl_events
+      SELECT COALESCE(SUM(value), 0) as total FROM adl_events WHERE timestamp >= '${BULK_API_START}'
     `).catch(() => [{ total: '0' }]);
     const totalAllTime = parseFloat(totalResult[0]?.total || '0');
     
-    // Get visible period data
+    // Get visible period data (always filtered to BULK API start at minimum)
     const visibleRows = await query(`
       SELECT 
         date_trunc('day', timestamp) as day,
@@ -1106,7 +1108,7 @@ router.get('/adl-chart', async (req: Request, res: Response) => {
         COUNT(*) as adl_count,
         SUM(value) as total_value
       FROM adl_events
-      WHERE timestamp >= NOW() - INTERVAL '${isAllTime ? 8760 : hours} hours'
+      WHERE timestamp >= GREATEST('${BULK_API_START}'::timestamp, ${isAllTime ? `'${BULK_API_START}'::timestamp` : `NOW() - INTERVAL '${hours} hours'`})
       GROUP BY date_trunc('day', timestamp), symbol
       ORDER BY day ASC
     `).catch(() => []);
@@ -1117,7 +1119,7 @@ router.get('/adl-chart', async (req: Request, res: Response) => {
       visibleSum += parseFloat(row.total_value || 0);
     }
     
-    // Historical = total - visible
+    // Historical = total (from BULK start) - visible period
     const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
@@ -1672,6 +1674,7 @@ router.get('/liquidations/treemap', async (req: Request, res: Response) => {
 });
 
 // Chart data - long vs short liquidations over time
+// NOTE: Only shows data from BULK API launch (April 13, 2026 19:00 UTC) for chart alignment
 router.get('/liquidations/chart', async (req: Request, res: Response) => {
   const period = req.query.period as string || 'all';
   
@@ -1692,9 +1695,9 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
       return res.json(cached);
     }
 
-    // First, get the TOTAL cumulative of ALL liquidations ever (raw sum, no bucketing)
+    // Get total liquidations ONLY from BULK API start date onwards
     const totalResult = await query<{ total: string }>(`
-      SELECT COALESCE(SUM(value), 0) as total FROM liquidations
+      SELECT COALESCE(SUM(value), 0) as total FROM liquidations WHERE timestamp >= '${BULK_API_START}'
     `);
     const totalAllTime = parseFloat(totalResult[0]?.total || '0');
 
@@ -1704,7 +1707,7 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
     };
     const hours = intervalHours[period] || 8760;
     
-    // Get data for visible period with appropriate bucket
+    // Get data for visible period with appropriate bucket (always filtered to BULK API start)
     const visibleData = await query<{
       time_bucket: string;
       long_value: string;
@@ -1719,7 +1722,7 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
         COUNT(CASE WHEN side = 'long' THEN 1 END) as long_count,
         COUNT(CASE WHEN side = 'short' THEN 1 END) as short_count
       FROM liquidations
-      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+      WHERE timestamp >= GREATEST('${BULK_API_START}'::timestamp, ${isAllTime ? `'${BULK_API_START}'::timestamp` : `NOW() - INTERVAL '${hours} hours'`})
       GROUP BY time_bucket
       ORDER BY time_bucket ASC
     `);
@@ -1730,7 +1733,7 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
       visibleSum += parseFloat(row.long_value) + parseFloat(row.short_value);
     }
     
-    // Historical cumulative = total all time - visible period sum
+    // Historical cumulative = total (from BULK start) - visible period sum
     const historicalCumulative = totalAllTime - visibleSum;
 
     // Build result with cumulative starting from historical
