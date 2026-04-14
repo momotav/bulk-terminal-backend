@@ -889,8 +889,11 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
 
 // ============ DATABASE CHARTS (Volume, Trades, Liquidations, ADL) ============
 
-// Helper function to transform raw DB rows to chart format
-function transformToChartData(rows: any[]): { timestamp: string; BTC: number; ETH: number; SOL: number; total: number }[] {
+// Helper function to transform raw DB rows to chart format with cumulative
+function transformToChartData(
+  rows: any[], 
+  historicalCumulative: number = 0
+): { timestamp: string; BTC: number; ETH: number; SOL: number; total: number; Cumulative: number }[] {
   const dataMap = new Map<string, { timestamp: string; BTC: number; ETH: number; SOL: number; total: number }>();
   
   for (const row of rows) {
@@ -909,28 +912,51 @@ function transformToChartData(rows: any[]): { timestamp: string; BTC: number; ET
     else if (symbol.includes('SOL')) entry.SOL += value;
   }
   
-  return Array.from(dataMap.values()).sort((a, b) => 
+  // Sort and add cumulative
+  const sorted = Array.from(dataMap.values()).sort((a, b) => 
     new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
   );
+  
+  let cumulative = historicalCumulative;
+  return sorted.map(entry => {
+    cumulative += entry.total;
+    return { ...entry, Cumulative: cumulative };
+  });
 }
 
 // Get volume chart data from database
 router.get('/volume-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
+  const isAllTime = hours >= 8760;
   
   try {
-    const rows = await query(`
+    // Get all data for cumulative calculation
+    const allRows = await query(`
       SELECT 
         date_trunc('day', timestamp) as day,
         symbol,
         SUM(value) as volume
       FROM trades
-      WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
       GROUP BY date_trunc('day', timestamp), symbol
       ORDER BY day ASC
     `);
     
-    const data = transformToChartData(rows);
+    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
+    
+    // Calculate historical cumulative and filter visible rows
+    let historicalCumulative = 0;
+    const visibleRows: any[] = [];
+    
+    for (const row of allRows) {
+      const rowTime = new Date(row.day).getTime();
+      if (rowTime < startTime) {
+        historicalCumulative += parseFloat(row.volume || 0);
+      } else {
+        visibleRows.push(row);
+      }
+    }
+    
+    const data = transformToChartData(visibleRows, historicalCumulative);
     res.json({ data });
   } catch (error) {
     console.error('Error fetching volume chart:', error);
@@ -941,6 +967,7 @@ router.get('/volume-chart', async (req: Request, res: Response) => {
 // Get trades chart data from database
 router.get('/trades-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
+  const isAllTime = hours >= 8760;
   const cacheKey = `analytics:trades_chart:${hours}`;
   
   // Check cache first
@@ -950,8 +977,8 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
   }
   
   try {
-    // Use Promise.race with timeout to prevent hanging
-    const rows = await Promise.race([
+    // Get all data for cumulative calculation
+    const allRows = await Promise.race([
       query(`
         SELECT 
           date_trunc('day', timestamp) as day,
@@ -959,14 +986,28 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
           COUNT(*) as trade_count,
           SUM(value) as volume
         FROM trades
-        WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
         GROUP BY date_trunc('day', timestamp), symbol
         ORDER BY day ASC
       `),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 8000))
     ]) as any[];
     
-    const data = transformToChartData(rows);
+    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
+    
+    // Calculate historical cumulative and filter visible rows
+    let historicalCumulative = 0;
+    const visibleRows: any[] = [];
+    
+    for (const row of allRows) {
+      const rowTime = new Date(row.day).getTime();
+      if (rowTime < startTime) {
+        historicalCumulative += parseFloat(row.trade_count || 0);
+      } else {
+        visibleRows.push(row);
+      }
+    }
+    
+    const data = transformToChartData(visibleRows, historicalCumulative);
     const result = { data };
     
     // Cache for 60 seconds
@@ -983,6 +1024,7 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
 // Get liquidations chart data from database
 router.get('/liquidations-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
+  const isAllTime = hours >= 8760;
   const cacheKey = `analytics:liquidations_chart:${hours}`;
   
   // Check cache first
@@ -992,7 +1034,8 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
   }
   
   try {
-    const rows = await Promise.race([
+    // Get all data for cumulative calculation
+    const allRows = await Promise.race([
       query(`
         SELECT 
           date_trunc('day', timestamp) as day,
@@ -1000,14 +1043,28 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
           COUNT(*) as liquidation_count,
           SUM(value) as total_value
         FROM liquidations
-        WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
         GROUP BY date_trunc('day', timestamp), symbol
         ORDER BY day ASC
       `),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
     ]) as any[];
     
-    const data = transformToChartData(rows);
+    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
+    
+    // Calculate historical cumulative and filter visible rows
+    let historicalCumulative = 0;
+    const visibleRows: any[] = [];
+    
+    for (const row of allRows) {
+      const rowTime = new Date(row.day).getTime();
+      if (rowTime < startTime) {
+        historicalCumulative += parseFloat(row.total_value || 0);
+      } else {
+        visibleRows.push(row);
+      }
+    }
+    
+    const data = transformToChartData(visibleRows, historicalCumulative);
     const result = { data };
     
     // Cache for 60 seconds
@@ -1023,22 +1080,37 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
 // Get ADL chart data from database
 router.get('/adl-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
+  const isAllTime = hours >= 8760;
   
   try {
-    // Try adl_events table first, return empty array if doesn't exist
-    const rows = await query(`
+    // Get all data for cumulative calculation
+    const allRows = await query(`
       SELECT 
         date_trunc('day', timestamp) as day,
         symbol,
         COUNT(*) as adl_count,
         SUM(value) as total_value
       FROM adl_events
-      WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
       GROUP BY date_trunc('day', timestamp), symbol
       ORDER BY day ASC
     `).catch(() => []);
     
-    const data = transformToChartData(rows);
+    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
+    
+    // Calculate historical cumulative and filter visible rows
+    let historicalCumulative = 0;
+    const visibleRows: any[] = [];
+    
+    for (const row of allRows) {
+      const rowTime = new Date(row.day).getTime();
+      if (rowTime < startTime) {
+        historicalCumulative += parseFloat(row.total_value || 0);
+      } else {
+        visibleRows.push(row);
+      }
+    }
+    
+    const data = transformToChartData(visibleRows, historicalCumulative);
     res.json({ data });
   } catch (error) {
     console.error('Error fetching ADL chart:', error);
@@ -1601,6 +1673,7 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
     'all': { interval: '365 days', bucket: '1 day' }
   };
   const { interval, bucket } = intervalMap[period] || intervalMap['all'];
+  const isAllTime = period === 'all';
   
   try {
     const cacheKey = `liq-chart:${period}`;
@@ -1609,7 +1682,8 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
       return res.json(cached);
     }
 
-    const data = await query<{
+    // First, get ALL data to calculate proper cumulative
+    const allData = await query<{
       time_bucket: string;
       long_value: string;
       short_value: string;
@@ -1623,20 +1697,47 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
         COUNT(CASE WHEN side = 'long' THEN 1 END) as long_count,
         COUNT(CASE WHEN side = 'short' THEN 1 END) as short_count
       FROM liquidations
-      WHERE timestamp > NOW() - INTERVAL '${interval}'
       GROUP BY time_bucket
       ORDER BY time_bucket ASC
     `);
 
+    // Calculate interval start time
+    const intervalHours: Record<string, number> = {
+      '4h': 4, '24h': 24, '3d': 72, '7d': 168, 'all': 8760
+    };
+    const hours = intervalHours[period] || 8760;
+    const startTime = isAllTime ? 0 : Date.now() - (hours * 60 * 60 * 1000);
+    
+    // Calculate historical cumulative and filter visible data
+    let historicalCumulative = 0;
+    const visibleData: typeof allData = [];
+    
+    for (const row of allData) {
+      const rowTime = new Date(row.time_bucket).getTime();
+      if (rowTime < startTime) {
+        historicalCumulative += parseFloat(row.long_value) + parseFloat(row.short_value);
+      } else {
+        visibleData.push(row);
+      }
+    }
+
+    // Build result with cumulative
+    let cumulative = historicalCumulative;
     const result = {
       period,
-      data: data.map(row => ({
-        timestamp: row.time_bucket,
-        longValue: parseFloat(row.long_value),
-        shortValue: parseFloat(row.short_value),
-        longCount: parseInt(row.long_count),
-        shortCount: parseInt(row.short_count)
-      }))
+      data: visibleData.map(row => {
+        const longVal = parseFloat(row.long_value);
+        const shortVal = parseFloat(row.short_value);
+        cumulative += longVal + shortVal;
+        return {
+          timestamp: row.time_bucket,
+          longValue: longVal,
+          shortValue: shortVal,
+          longCount: parseInt(row.long_count),
+          shortCount: parseInt(row.short_count),
+          Cumulative: cumulative
+        };
+      })
     };
 
     await setCache(cacheKey, result, 60);
