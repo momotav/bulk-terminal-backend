@@ -2048,11 +2048,11 @@ router.get('/volatility-chart', async (req: Request, res: Response) => {
   }
   
   try {
-    // Determine bucket interval based on time range
-    let bucketInterval = '1 hour';
-    if (hours <= 24) bucketInterval = '1 hour';
-    else if (hours <= 168) bucketInterval = '4 hours';
-    else bucketInterval = '1 day';
+    // Determine bucket interval for date_trunc (PostgreSQL format)
+    let bucketInterval = 'hour';
+    if (hours <= 24) bucketInterval = 'hour';
+    else if (hours <= 168) bucketInterval = 'hour';
+    else bucketInterval = 'day';
     
     const data = await query<{
       time_bucket: string;
@@ -2061,7 +2061,7 @@ router.get('/volatility-chart', async (req: Request, res: Response) => {
       sol_vol: string;
     }>(`
       SELECT 
-        date_trunc('${bucketInterval.replace(' ', '_')}', timestamp) as time_bucket,
+        date_trunc('${bucketInterval}', timestamp) as time_bucket,
         AVG(CASE WHEN symbol = 'BTC-USD' THEN regime_vol END) as btc_vol,
         AVG(CASE WHEN symbol = 'ETH-USD' THEN regime_vol END) as eth_vol,
         AVG(CASE WHEN symbol = 'SOL-USD' THEN regime_vol END) as sol_vol
@@ -2102,11 +2102,11 @@ router.get('/fair-spread-chart', async (req: Request, res: Response) => {
   }
   
   try {
-    // Determine bucket interval
-    let bucketInterval = '1 hour';
-    if (hours <= 24) bucketInterval = '1 hour';
-    else if (hours <= 168) bucketInterval = '4 hours';
-    else bucketInterval = '1 day';
+    // Determine bucket interval for date_trunc (PostgreSQL format)
+    let bucketInterval = 'hour';
+    if (hours <= 24) bucketInterval = 'hour';
+    else if (hours <= 168) bucketInterval = 'hour';
+    else bucketInterval = 'day';
     
     const data = await query<{
       time_bucket: string;
@@ -2114,7 +2114,7 @@ router.get('/fair-spread-chart', async (req: Request, res: Response) => {
       avg_fair: string;
     }>(`
       SELECT 
-        date_trunc('${bucketInterval.replace(' ', '_')}', timestamp) as time_bucket,
+        date_trunc('${bucketInterval}', timestamp) as time_bucket,
         AVG(mark_price) as avg_mark,
         AVG(fair_book_px) as avg_fair
       FROM ticker_snapshots
@@ -2205,11 +2205,11 @@ router.get('/protocol-revenue-chart', async (req: Request, res: Response) => {
   }
   
   try {
-    // Determine bucket interval
-    let bucketInterval = '1 hour';
-    if (hours <= 24) bucketInterval = '1 hour';
-    else if (hours <= 168) bucketInterval = '4 hours';
-    else bucketInterval = '1 day';
+    // Determine bucket interval for date_trunc (PostgreSQL format)
+    let bucketInterval = 'hour';
+    if (hours <= 24) bucketInterval = 'hour';
+    else if (hours <= 168) bucketInterval = 'hour'; // Still hourly, just more data
+    else bucketInterval = 'day';
     
     const data = await query<{
       time_bucket: string;
@@ -2218,7 +2218,7 @@ router.get('/protocol-revenue-chart', async (req: Request, res: Response) => {
       taker_fees: string;
     }>(`
       SELECT 
-        date_trunc('${bucketInterval.replace(' ', '_')}', timestamp) as time_bucket,
+        date_trunc('${bucketInterval}', timestamp) as time_bucket,
         MAX(total_protocol_settlement) as protocol_revenue,
         MAX(total_maker_fees) as maker_fees,
         MAX(total_taker_fees) as taker_fees
