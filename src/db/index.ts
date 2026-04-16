@@ -172,7 +172,6 @@ export async function initializeDatabase(): Promise<void> {
     `);
     
     // Add unique constraint to prevent duplicate liquidations
-    // Using DO block so it doesn't fail if index exists or duplicates exist
     await client.query(`
       DO $$
       BEGIN
@@ -308,7 +307,8 @@ export async function initializeDatabase(): Promise<void> {
       ON market_stats(symbol, timestamp DESC);
     `);
 
-    // Ticker snapshots (for OI/Funding charts - collected every minute by wsListener)
+    // Ticker snapshots (for OI/Funding/Regime charts - collected every minute by wsListener)
+    // UPDATED: Added regime, regime_vol, fair_book_px columns
     await client.query(`
       CREATE TABLE IF NOT EXISTS ticker_snapshots (
         id SERIAL PRIMARY KEY,
@@ -317,6 +317,9 @@ export async function initializeDatabase(): Promise<void> {
         open_interest_usd DECIMAL(20, 2),
         funding_rate DECIMAL(20, 8),
         mark_price DECIMAL(20, 2),
+        regime INTEGER,
+        regime_vol DECIMAL(20, 8),
+        fair_book_px DECIMAL(20, 2),
         timestamp TIMESTAMP DEFAULT NOW()
       );
       
@@ -325,6 +328,37 @@ export async function initializeDatabase(): Promise<void> {
       
       CREATE INDEX IF NOT EXISTS idx_ticker_snapshots_time 
       ON ticker_snapshots(timestamp DESC);
+    `);
+
+    // Add new columns to ticker_snapshots if they don't exist
+    await client.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ticker_snapshots' AND column_name='regime') THEN
+          ALTER TABLE ticker_snapshots ADD COLUMN regime INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ticker_snapshots' AND column_name='regime_vol') THEN
+          ALTER TABLE ticker_snapshots ADD COLUMN regime_vol DECIMAL(20, 8);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ticker_snapshots' AND column_name='fair_book_px') THEN
+          ALTER TABLE ticker_snapshots ADD COLUMN fair_book_px DECIMAL(20, 2);
+        END IF;
+      END $$;
+    `);
+
+    // NEW: Fee snapshots (for protocol revenue tracking)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS fee_snapshots (
+        id SERIAL PRIMARY KEY,
+        total_maker_fees DECIMAL(20, 2),
+        total_taker_fees DECIMAL(20, 2),
+        total_protocol_settlement DECIMAL(20, 2),
+        settled_fills BIGINT,
+        timestamp TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_fee_snapshots_time 
+      ON fee_snapshots(timestamp DESC);
     `);
 
     // Wallet follows (Privy auth - users following wallets)
