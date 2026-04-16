@@ -360,6 +360,38 @@ async function backfillDailyStats(): Promise<void> {
   }
 }
 
+// ============ FEE SNAPSHOT COLLECTION ============
+
+const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
+
+// Collect fee state snapshot (for protocol revenue tracking)
+async function collectFeeSnapshot(): Promise<void> {
+  try {
+    const res = await fetch(`${BULK_API_BASE}/feeState`);
+    if (!res.ok) {
+      console.error('Failed to fetch fee state from BULK API');
+      return;
+    }
+    
+    const feeState = await res.json() as any;
+    
+    const totalMakerFees = feeState.total_maker_fees || 0;
+    const totalTakerFees = feeState.total_taker_fees || 0;
+    const totalProtocolSettlement = feeState.total_protocol_settlement || 0;
+    const settledFills = feeState.settled_fills || 0;
+    
+    await query(
+      `INSERT INTO fee_snapshots (total_maker_fees, total_taker_fees, total_protocol_settlement, settled_fills, timestamp)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [totalMakerFees, totalTakerFees, totalProtocolSettlement, settledFills]
+    );
+    
+    console.log(`💰 Fee snapshot: Protocol revenue $${totalProtocolSettlement.toFixed(2)} | Fills: ${settledFills}`);
+  } catch (error) {
+    console.error('❌ Failed to collect fee snapshot:', error);
+  }
+}
+
 // Start all cron jobs
 export function startDataCollector(): void {
   console.log('🚀 Starting data collector...');
@@ -379,6 +411,11 @@ export function startDataCollector(): void {
     aggregateDailyStats();
   });
   
+  // Collect fee snapshots every 10 minutes
+  cron.schedule('*/10 * * * *', () => {
+    collectFeeSnapshot();
+  });
+  
   // Clean up old data daily at 3am
   cron.schedule('0 3 * * *', () => {
     cleanupOldData();
@@ -386,9 +423,10 @@ export function startDataCollector(): void {
   
   // Run initial collection
   collectMarketStats();
+  collectFeeSnapshot();
   
   // Backfill daily stats on startup (only if empty)
   setTimeout(() => backfillDailyStats(), 5000);
   
-  console.log('✅ Data collector started (hourly snapshots + daily stats aggregation)');
+  console.log('✅ Data collector started (hourly snapshots + daily stats aggregation + fee tracking)');
 }
