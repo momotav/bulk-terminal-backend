@@ -31,12 +31,16 @@ const stats = {
 
 // ============ TICKER SNAPSHOTS FOR REAL OI/FUNDING HISTORY ============
 
-// Fetch and store ticker snapshots (OI, funding rate) every minute
+// Fetch and store ticker snapshots (OI, funding rate, regime data) every minute
 interface TickerData {
   openInterest?: string | number;
   markPrice?: string | number;
   lastPrice?: string | number;
   fundingRate?: string | number;
+  // New regime fields from BULK API
+  regime?: number;
+  regimeVol?: number;
+  fairBookPx?: number;
 }
 
 // Track last ticker snapshot time per symbol to avoid duplicates
@@ -97,18 +101,23 @@ async function snapshotTickersFallback(): Promise<void> {
       const openInterestUsd = openInterestCoins * markPrice;
       const fundingRate = parseFloat(String(ticker.fundingRate || 0));
       
-      // Store snapshot in database
+      // New regime fields
+      const regime = ticker.regime ?? null;
+      const regimeVol = ticker.regimeVol ?? null;
+      const fairBookPx = ticker.fairBookPx ?? null;
+      
+      // Store snapshot in database (now includes regime data)
       await query(
-        `INSERT INTO ticker_snapshots (symbol, open_interest_coins, open_interest_usd, funding_rate, mark_price, timestamp)
-         VALUES ($1, $2, $3, $4, $5, NOW())`,
-        [symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice]
+        `INSERT INTO ticker_snapshots (symbol, open_interest_coins, open_interest_usd, funding_rate, mark_price, regime, regime_vol, fair_book_px, timestamp)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
+        [symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice, regime, regimeVol, fairBookPx]
       );
       
       lastTickerSnapshotTime.set(symbol, Date.now());
       stats.tickerSnapshots++;
       stats.lastTickerSnapshot = new Date();
       
-      console.log(`📊 Ticker (REST fallback): ${symbol} | OI: $${openInterestUsd.toFixed(0)} | Funding: ${(fundingRate * 100).toFixed(4)}%`);
+      console.log(`📊 Ticker (REST): ${symbol} | OI: $${openInterestUsd.toFixed(0)} | Funding: ${(fundingRate * 100).toFixed(4)}% | Regime: ${regime}`);
     } catch (error) {
       console.error(`Failed to snapshot ticker for ${symbol}:`, error);
     }
