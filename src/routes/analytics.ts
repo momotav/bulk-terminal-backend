@@ -1982,4 +1982,400 @@ router.get('/liquidations/featured', async (req: Request, res: Response) => {
   }
 });
 
+// ============ NEW: REGIME & SENTIMENT ENDPOINTS ============
+
+// Live market regime data (from BULK API tickers)
+router.get('/regime', async (req: Request, res: Response) => {
+  const cacheKey = 'analytics:regime';
+  
+  const cached = await getCache<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
+  try {
+    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    const regimeData: any[] = [];
+    
+    for (const symbol of symbols) {
+      try {
+        const tickerRes = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
+        if (tickerRes.ok) {
+          const ticker = await tickerRes.json() as any;
+          regimeData.push({
+            symbol: symbol.replace('-USD', ''),
+            regime: ticker.regime ?? 0,
+            regimeDt: ticker.regimeDt ?? 0,
+            regimeVol: ticker.regimeVol ?? 0,
+            fairBookPx: ticker.fairBookPx ?? 0,
+            markPrice: ticker.markPrice ?? 0,
+            fairBias: ticker.fairBias ?? 0,
+            timestamp: ticker.timestamp
+          });
+        }
+      } catch (e) {
+        console.error(`Failed to fetch regime for ${symbol}:`, e);
+      }
+    }
+    
+    // Calculate aggregate regime (weighted by some factor or just average)
+    const avgRegime = regimeData.length > 0 
+      ? regimeData.reduce((sum, d) => sum + (d.regime || 0), 0) / regimeData.length 
+      : 0;
+    
+    const result = {
+      timestamp: Date.now(),
+      aggregateRegime: avgRegime,
+      markets: regimeData
+    };
+    
+    await setCache(cacheKey, result, 10); // 10 second cache for live data
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching regime data:', error);
+    res.status(500).json({ error: 'Failed to fetch regime data' });
+  }
+});
+
+// Volatility history chart data
+router.get('/volatility-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 24;
+  const cacheKey = `analytics:volatility_chart:${hours}`;
+  
+  const cached = await getCache<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
+  try {
+    // Determine bucket interval based on time range
+    let bucketInterval = '1 hour';
+    if (hours <= 24) bucketInterval = '1 hour';
+    else if (hours <= 168) bucketInterval = '4 hours';
+    else bucketInterval = '1 day';
+    
+    const data = await query<{
+      time_bucket: string;
+      btc_vol: string;
+      eth_vol: string;
+      sol_vol: string;
+    }>(`
+      SELECT 
+        date_trunc('${bucketInterval.replace(' ', '_')}', timestamp) as time_bucket,
+        AVG(CASE WHEN symbol = 'BTC-USD' THEN regime_vol END) as btc_vol,
+        AVG(CASE WHEN symbol = 'ETH-USD' THEN regime_vol END) as eth_vol,
+        AVG(CASE WHEN symbol = 'SOL-USD' THEN regime_vol END) as sol_vol
+      FROM ticker_snapshots
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+        AND regime_vol IS NOT NULL
+      GROUP BY time_bucket
+      ORDER BY time_bucket ASC
+    `);
+    
+    const result = {
+      period: hours,
+      data: data.map(row => ({
+        timestamp: row.time_bucket,
+        BTC: parseFloat(row.btc_vol || '0'),
+        ETH: parseFloat(row.eth_vol || '0'),
+        SOL: parseFloat(row.sol_vol || '0')
+      }))
+    };
+    
+    await setCache(cacheKey, result, 60);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching volatility chart:', error);
+    res.status(500).json({ error: 'Failed to fetch volatility chart' });
+  }
+});
+
+// Fair price vs mark price spread chart
+router.get('/fair-spread-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 24;
+  const symbol = (req.query.symbol as string) || 'BTC-USD';
+  const cacheKey = `analytics:fair_spread:${symbol}:${hours}`;
+  
+  const cached = await getCache<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
+  try {
+    // Determine bucket interval
+    let bucketInterval = '1 hour';
+    if (hours <= 24) bucketInterval = '1 hour';
+    else if (hours <= 168) bucketInterval = '4 hours';
+    else bucketInterval = '1 day';
+    
+    const data = await query<{
+      time_bucket: string;
+      avg_mark: string;
+      avg_fair: string;
+    }>(`
+      SELECT 
+        date_trunc('${bucketInterval.replace(' ', '_')}', timestamp) as time_bucket,
+        AVG(mark_price) as avg_mark,
+        AVG(fair_book_px) as avg_fair
+      FROM ticker_snapshots
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+        AND symbol = $1
+        AND fair_book_px IS NOT NULL
+      GROUP BY time_bucket
+      ORDER BY time_bucket ASC
+    `, [symbol]);
+    
+    const result = {
+      symbol,
+      period: hours,
+      data: data.map(row => {
+        const markPrice = parseFloat(row.avg_mark || '0');
+        const fairPrice = parseFloat(row.avg_fair || '0');
+        const spread = fairPrice > 0 ? ((markPrice - fairPrice) / fairPrice) * 100 : 0;
+        return {
+          timestamp: row.time_bucket,
+          markPrice,
+          fairPrice,
+          spreadBps: spread * 100 // in basis points
+        };
+      })
+    };
+    
+    await setCache(cacheKey, result, 60);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching fair spread chart:', error);
+    res.status(500).json({ error: 'Failed to fetch fair spread chart' });
+  }
+});
+
+// ============ FEE STATE ENDPOINTS ============
+
+// Fee tiers (from BULK API)
+router.get('/fee-tiers', async (req: Request, res: Response) => {
+  const cacheKey = 'analytics:fee_tiers';
+  
+  const cached = await getCache<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
+  try {
+    const feeRes = await fetch(`${BULK_API_BASE}/feeState`);
+    if (!feeRes.ok) {
+      throw new Error('Failed to fetch fee state from BULK API');
+    }
+    
+    const feeState = await feeRes.json() as any;
+    
+    // Extract global fee tiers
+    const globalScope = feeState.scopes?.find((s: any) => s.instrument === 'global');
+    const tiers = globalScope?.active_policy?.tiers || [];
+    
+    const result = {
+      timestamp: feeState.stamp,
+      windowDays: globalScope?.active_policy?.window_days || 15,
+      tiers: tiers.map((t: any) => ({
+        thresholdVolume: t.threshold_volume,
+        makerBps: t.maker_bps,
+        takerBps: t.taker_bps
+      })),
+      totalMakerFees: feeState.total_maker_fees || 0,
+      totalTakerFees: feeState.total_taker_fees || 0,
+      totalProtocolSettlement: feeState.total_protocol_settlement || 0,
+      settledFills: feeState.settled_fills || 0
+    };
+    
+    await setCache(cacheKey, result, 300); // 5 min cache
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching fee tiers:', error);
+    res.status(500).json({ error: 'Failed to fetch fee tiers' });
+  }
+});
+
+// Protocol revenue chart (requires fee_snapshots table - collected periodically)
+router.get('/protocol-revenue-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 168; // Default 7 days
+  const cacheKey = `analytics:protocol_revenue:${hours}`;
+  
+  const cached = await getCache<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
+  try {
+    // Determine bucket interval
+    let bucketInterval = '1 hour';
+    if (hours <= 24) bucketInterval = '1 hour';
+    else if (hours <= 168) bucketInterval = '4 hours';
+    else bucketInterval = '1 day';
+    
+    const data = await query<{
+      time_bucket: string;
+      protocol_revenue: string;
+      maker_fees: string;
+      taker_fees: string;
+    }>(`
+      SELECT 
+        date_trunc('${bucketInterval.replace(' ', '_')}', timestamp) as time_bucket,
+        MAX(total_protocol_settlement) as protocol_revenue,
+        MAX(total_maker_fees) as maker_fees,
+        MAX(total_taker_fees) as taker_fees
+      FROM fee_snapshots
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+      GROUP BY time_bucket
+      ORDER BY time_bucket ASC
+    `);
+    
+    // Calculate deltas (difference between consecutive snapshots)
+    const withDeltas = data.map((row, i) => {
+      const prevRevenue = i > 0 ? parseFloat(data[i - 1].protocol_revenue || '0') : 0;
+      const currentRevenue = parseFloat(row.protocol_revenue || '0');
+      return {
+        timestamp: row.time_bucket,
+        cumulativeRevenue: currentRevenue,
+        periodRevenue: i > 0 ? currentRevenue - prevRevenue : 0,
+        makerFees: parseFloat(row.maker_fees || '0'),
+        takerFees: parseFloat(row.taker_fees || '0')
+      };
+    });
+    
+    const result = {
+      period: hours,
+      data: withDeltas
+    };
+    
+    await setCache(cacheKey, result, 60);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching protocol revenue chart:', error);
+    res.status(500).json({ error: 'Failed to fetch protocol revenue chart' });
+  }
+});
+
+// ============ ADL EVENTS CHART ============
+
+// ADL events chart (already in DB)
+router.get('/adl-chart', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 168;
+  const cacheKey = `analytics:adl_chart:${hours}`;
+  
+  const cached = await getCache<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
+  try {
+    // Determine bucket interval
+    let bucketInterval = '1 hour';
+    if (hours <= 24) bucketInterval = '1 hour';
+    else if (hours <= 168) bucketInterval = '4 hours';
+    else bucketInterval = '1 day';
+    
+    // Start date for BULK API data
+    const BULK_API_START = '2026-04-13T19:00:00.000Z';
+    
+    const data = await query<{
+      time_bucket: string;
+      btc_value: string;
+      eth_value: string;
+      sol_value: string;
+      total_count: string;
+    }>(`
+      SELECT 
+        date_trunc('${bucketInterval.replace(' ', '_')}', timestamp) as time_bucket,
+        COALESCE(SUM(CASE WHEN symbol = 'BTC-USD' THEN value END), 0) as btc_value,
+        COALESCE(SUM(CASE WHEN symbol = 'ETH-USD' THEN value END), 0) as eth_value,
+        COALESCE(SUM(CASE WHEN symbol = 'SOL-USD' THEN value END), 0) as sol_value,
+        COUNT(*) as total_count
+      FROM adl_events
+      WHERE timestamp >= GREATEST('${BULK_API_START}'::timestamp, NOW() - INTERVAL '${hours} hours')
+      GROUP BY time_bucket
+      ORDER BY time_bucket ASC
+    `);
+    
+    // Calculate cumulative
+    let cumulative = 0;
+    const result = {
+      period: hours,
+      data: data.map(row => {
+        const total = parseFloat(row.btc_value) + parseFloat(row.eth_value) + parseFloat(row.sol_value);
+        cumulative += total;
+        return {
+          timestamp: row.time_bucket,
+          BTC: parseFloat(row.btc_value),
+          ETH: parseFloat(row.eth_value),
+          SOL: parseFloat(row.sol_value),
+          total,
+          count: parseInt(row.total_count),
+          Cumulative: cumulative
+        };
+      })
+    };
+    
+    await setCache(cacheKey, result, 60);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching ADL chart:', error);
+    res.status(500).json({ error: 'Failed to fetch ADL chart' });
+  }
+});
+
+// ADL summary stats
+router.get('/adl-summary', async (req: Request, res: Response) => {
+  const period = req.query.period as string || '7d';
+  const cacheKey = `analytics:adl_summary:${period}`;
+  
+  const cached = await getCache<any>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
+  const intervalMap: Record<string, string> = {
+    '24h': '24 hours',
+    '7d': '7 days',
+    '30d': '30 days',
+    'all': '365 days'
+  };
+  const interval = intervalMap[period] || '7 days';
+  
+  try {
+    const data = await query<{
+      total_value: string;
+      total_count: string;
+      btc_value: string;
+      eth_value: string;
+      sol_value: string;
+    }>(`
+      SELECT 
+        COALESCE(SUM(value), 0) as total_value,
+        COUNT(*) as total_count,
+        COALESCE(SUM(CASE WHEN symbol = 'BTC-USD' THEN value END), 0) as btc_value,
+        COALESCE(SUM(CASE WHEN symbol = 'ETH-USD' THEN value END), 0) as eth_value,
+        COALESCE(SUM(CASE WHEN symbol = 'SOL-USD' THEN value END), 0) as sol_value
+      FROM adl_events
+      WHERE timestamp > NOW() - INTERVAL '${interval}'
+    `);
+    
+    const row = data[0];
+    const result = {
+      period,
+      totalValue: parseFloat(row.total_value),
+      totalCount: parseInt(row.total_count),
+      byAsset: {
+        BTC: parseFloat(row.btc_value),
+        ETH: parseFloat(row.eth_value),
+        SOL: parseFloat(row.sol_value)
+      }
+    };
+    
+    await setCache(cacheKey, result, 60);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching ADL summary:', error);
+    res.status(500).json({ error: 'Failed to fetch ADL summary' });
+  }
+});
+
 export default router;
