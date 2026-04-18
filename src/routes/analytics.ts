@@ -2228,16 +2228,27 @@ router.get('/protocol-revenue-chart', async (req: Request, res: Response) => {
       ORDER BY time_bucket ASC
     `);
     
-    // Calculate deltas (difference between consecutive snapshots)
+    // Calculate deltas (difference between consecutive snapshots).
+    // fee_snapshots stores RUNNING TOTALS from BULK's /feeState endpoint, so to get
+    // the period's actual flows we subtract the previous bucket's total.
+    // Note: total_maker_fees in BULK is NEGATIVE (maker REBATES — protocol pays makers),
+    // so we take Math.abs() at display time. Here we just keep the raw signed delta.
     const withDeltas = data.map((row, i) => {
-      const prevRevenue = i > 0 ? parseFloat(data[i - 1].protocol_revenue || '0') : 0;
-      const currentRevenue = parseFloat(row.protocol_revenue || '0');
+      const prev = data[i - 1];
+      const prevProtocol = i > 0 ? parseFloat(prev.protocol_revenue || '0') : 0;
+      const prevMaker    = i > 0 ? parseFloat(prev.maker_fees       || '0') : 0;
+      const prevTaker    = i > 0 ? parseFloat(prev.taker_fees       || '0') : 0;
+
+      const curProtocol = parseFloat(row.protocol_revenue || '0');
+      const curMaker    = parseFloat(row.maker_fees       || '0');
+      const curTaker    = parseFloat(row.taker_fees       || '0');
+
       return {
         timestamp: row.time_bucket,
-        cumulativeRevenue: currentRevenue,
-        periodRevenue: i > 0 ? currentRevenue - prevRevenue : 0,
-        makerFees: parseFloat(row.maker_fees || '0'),
-        takerFees: parseFloat(row.taker_fees || '0')
+        cumulativeRevenue: curProtocol,                       // running total (for the line)
+        periodRevenue:     i > 0 ? curProtocol - prevProtocol : 0, // delta for the bar
+        makerFees:         i > 0 ? curMaker    - prevMaker    : 0, // delta for the bar
+        takerFees:         i > 0 ? curTaker    - prevTaker    : 0, // delta for the bar
       };
     });
     
