@@ -2231,8 +2231,13 @@ router.get('/protocol-revenue-chart', async (req: Request, res: Response) => {
     // Calculate deltas (difference between consecutive snapshots).
     // fee_snapshots stores RUNNING TOTALS from BULK's /feeState endpoint, so to get
     // the period's actual flows we subtract the previous bucket's total.
-    // Note: total_maker_fees in BULK is NEGATIVE (maker REBATES — protocol pays makers),
-    // so we take Math.abs() at display time. Here we just keep the raw signed delta.
+    //
+    // BULK's sign convention (verified from /feeState response):
+    //   total_maker_fees        → POSITIVE  (rebates received by makers)
+    //   total_taker_fees        → NEGATIVE  (fees paid by takers, from their POV)
+    //   total_protocol_settlement → POSITIVE (protocol's cut)
+    //   Identity: |total_taker_fees| = total_maker_fees + total_protocol_settlement
+    // Deltas of each are returned as-is here; the frontend applies Math.abs() on display.
     const withDeltas = data.map((row, i) => {
       const prev = data[i - 1];
       const prevProtocol = i > 0 ? parseFloat(prev.protocol_revenue || '0') : 0;
@@ -2386,6 +2391,116 @@ router.get('/adl-summary', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error fetching ADL summary:', error);
     res.status(500).json({ error: 'Failed to fetch ADL summary' });
+  }
+});
+
+// ============ ORDER BOOK (live proxy of BULK /l2book) ============
+
+// Live order book snapshot for a given market.
+// This is a thin caching proxy over BULK's /l2book endpoint so the frontend can
+// auto-refresh every few seconds without hammering BULK when many users are on
+// the page. Cache TTL is deliberately short (2s) to keep data fresh.
+//
+// Only BTC-USD / ETH-USD / SOL-USD are allowed here to match the rest of the
+// site; the BULK endpoint itself supports more markets.
+router.get('/orderbook/:coin', async (req: Request, res: Response) => {
+  const coinParam = String(req.params.coin || '').toUpperCase();
+
+  // Whitelist input to prevent arbitrary proxying and inject-style abuse.
+  const ALLOWED = new Set(['BTC-USD', 'ETH-USD', 'SOL-USD']);
+  const coin = coinParam.endsWith('-USD') ? coinParam : `${coinParam}-USD`;
+  if (!ALLOWED.has(coin)) {
+    return res.status(400).json({ error: `Unsupported market: ${coinParam}` });
+  }
+
+  const nlevels = Math.max(1, Math.min(50, parseInt(String(req.query.nlevels ?? '20'), 10) || 20));
+  const cacheKey = `analytics:orderbook:${coin}:${nlevels}`;
+
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+
+  try {
+    const url = `${BULK_API_BASE}/l2book?type=l2book&coin=${encodeURIComponent(coin)}&nlevels=${nlevels}`;
+    const upstream = await fetch(url);
+    if (!upstream.ok) {
+      console.error(`BULK /l2book returned ${upstream.status} for ${coin}`);
+      return res.status(502).json({ error: 'Upstream order book unavailable' });
+    }
+    const raw: any = await upstream.json();
+
+    // Validate shape defensively — BULK's docs say `levels: [bids, asks]` and we
+    // want to fail loudly rather than push a malformed payload to the client.
+    if (!raw || !Array.isArray(raw.levels) || raw.levels.length !== 2) {
+      console.error('Unexpected /l2book shape:', JSON.stringify(raw).slice(0, 200));
+      return res.status(502).json({ error: 'Malformed upstream response' });
+    }
+
+    const bids = Array.isArray(raw.levels[0]) ? raw.levels[0] : [];
+    const asks = Array.isArray(raw.levels[1]) ? raw.levels[1] : [];
+
+    // Compute derived stats here so the frontend doesn't have to redo math on
+    // every refresh. All values are USD-quoted (BULK markets are USD quote).
+    const bestBid = bids[0] ? { px: Number(bids[0].px), sz: Number(bids[0].sz), n: Number(bids[0].n) } : null;
+    const bestAsk = asks[0] ? { px: Number(asks[0].px), sz: Number(asks[0].sz), n: Number(asks[0].n) } : null;
+
+    let mid: number | null = null;
+    let spreadAbs: number | null = null;
+    let spreadBps: number | null = null;
+    if (bestBid && bestAsk) {
+      mid = (bestBid.px + bestAsk.px) / 2;
+      spreadAbs = bestAsk.px - bestBid.px;
+      spreadBps = mid > 0 ? (spreadAbs / mid) * 10000 : null;
+    }
+
+    // Depth within ±2% of mid (notional USD).
+    const depth2pct = (() => {
+      if (!mid) return { bid: 0, ask: 0 };
+      const lo = mid * 0.98, hi = mid * 1.02;
+      const bidUsd = bids
+        .filter((l: any) => Number(l.px) >= lo)
+        .reduce((s: number, l: any) => s + Number(l.px) * Number(l.sz), 0);
+      const askUsd = asks
+        .filter((l: any) => Number(l.px) <= hi)
+        .reduce((s: number, l: any) => s + Number(l.px) * Number(l.sz), 0);
+      return { bid: bidUsd, ask: askUsd };
+    })();
+
+    // Book imbalance: fraction of total ±2% depth on the bid side, rebased to
+    // [-1, +1] where +1 = all bids, -1 = all asks, 0 = balanced.
+    const totalDepth = depth2pct.bid + depth2pct.ask;
+    const imbalance = totalDepth > 0 ? (depth2pct.bid - depth2pct.ask) / totalDepth : 0;
+
+    const result = {
+      symbol: raw.symbol || coin,
+      updateType: raw.updateType || 'snapshot',
+      // BULK returns nanoseconds despite the docs saying ms. Normalize to ms
+      // here so the client has a single time format to deal with.
+      timestamp: typeof raw.timestamp === 'number'
+        ? Math.floor(raw.timestamp / 1_000_000)
+        : Date.now(),
+      bids: bids.map((l: any) => ({ px: Number(l.px), sz: Number(l.sz), n: Number(l.n) })),
+      asks: asks.map((l: any) => ({ px: Number(l.px), sz: Number(l.sz), n: Number(l.n) })),
+      stats: {
+        bestBid,
+        bestAsk,
+        mid,
+        spreadAbs,
+        spreadBps,
+        bidDepth2pctUsd: depth2pct.bid,
+        askDepth2pctUsd: depth2pct.ask,
+        imbalance,
+      },
+    };
+
+    // 2-second TTL — order books move fast, but not so fast that a cached copy
+    // for 2 seconds will mislead anyone. Prevents thundering herd against BULK.
+    await setCache(cacheKey, result, 2);
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching order book:', error);
+    res.status(500).json({ error: 'Failed to fetch order book' });
   }
 });
 
