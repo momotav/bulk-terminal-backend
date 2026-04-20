@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
+import { getActiveSymbols } from '../services/markets';
 
 const WS_URL = process.env.BULK_WS_URL || 'wss://exchange-ws1.bulk.trade';
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
@@ -80,9 +81,10 @@ async function recordTickerSnapshot(
 
 // FALLBACK: Fetch tickers via REST API (used if WebSocket ticker subscription fails)
 async function snapshotTickersFallback(): Promise<void> {
-  // All available BULK markets
-  const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
-  
+  // Pull the live market list so we cover every coin BULK has listed —
+  // falls back to a bundled list if /exchangeInfo is unreachable.
+  const symbols = await getActiveSymbols();
+
   for (const symbol of symbols) {
     // Skip if we got a recent WebSocket update
     const lastTime = lastTickerSnapshotTime.get(symbol) || 0;
@@ -1033,66 +1035,60 @@ function connect(): void {
       },
     });
 
-    ws.on('open', () => {
+    ws.on('open', async () => {
       isConnected = true;
       reconnectAttempts = 0;
       console.log('✅ WebSocket connected to BULK Exchange');
 
-      // BULK API v1.0.12 valid streams:
-      // - trades (includes liquidations/ADL via "reason" field)
-      // - ticker, candle, l2Snapshot, l2Delta, risk, frontendContext
-      // - account.{wallet} (for per-wallet events)
-      
-      // All available BULK markets
-      const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
-      
-      // Try multiple subscription formats to find what works
-      console.log('🧪 Testing WebSocket subscription formats...');
-      
-      // Start REST API polling as backup
-      startTickerPolling();
-      
+      // BULK API v1.0.13 stream surface (from the official docs):
+      //   trades — per-market trade stream (carries liquidations/ADL via `reason`)
+      //   ticker — per-market 24h stats (also regime, fairVol, fairBias, etc.)
+      //
+      // We subscribe to BOTH for every market. `trades` feeds the volume,
+      // liquidations and ADL detectors. `ticker` feeds open-interest /
+      // funding-rate snapshots in real time (the REST fallback only runs if
+      // we stop seeing ticker events).
+      //
+      // The list of markets is fetched live from BULK's /exchangeInfo so that
+      // whenever BULK lists a new coin (BNB, DOGE, FARTCOIN, SUI, ZEC were
+      // missing before this change) we start collecting its data without
+      // code changes.
+      let symbols: string[] = [];
       try {
-        // Format 1: Original array format with symbol
-        ws?.send(JSON.stringify({
-          method: 'subscribe',
-          subscription: symbols.map(symbol => ({ type: 'trades', symbol }))
-        }));
-        console.log('📡 Sent format 1: array with symbol field');
-        
-        // Send other formats with delays using setTimeout
-        setTimeout(() => {
-          // Format 2: Single object per symbol (Hyperliquid style)
-          for (const symbol of symbols.slice(0, 1)) { // Just try BTC first
-            ws?.send(JSON.stringify({
-              method: 'subscribe',
-              subscription: { type: 'trades', symbol }
-            }));
-          }
-          console.log('📡 Sent format 2: single object with symbol');
-        }, 500);
-        
-        setTimeout(() => {
-          // Format 3: With coin instead of symbol
-          for (const symbol of symbols.slice(0, 1)) {
-            const coin = symbol.replace('-USD', '');
-            ws?.send(JSON.stringify({
-              method: 'subscribe',
-              subscription: { type: 'trades', coin }
-            }));
-          }
-          console.log('📡 Sent format 3: single object with coin');
-        }, 1000);
-        
-        setTimeout(() => {
-          // Format 4: Array with coin
-          ws?.send(JSON.stringify({
-            method: 'subscribe',
-            subscription: symbols.map(s => ({ type: 'trades', coin: s.replace('-USD', '') }))
-          }));
-          console.log('📡 Sent format 4: array with coin field');
-        }, 1500);
-        
+        symbols = await getActiveSymbols();
+      } catch (err) {
+        console.error('Failed to resolve active symbols, will subscribe to fallback set:', err);
+      }
+      if (symbols.length === 0) {
+        console.error('No symbols available to subscribe — WS will idle until reconnect');
+        startTickerPolling();
+        startHeartbeat();
+        return;
+      }
+
+      console.log(`📡 Subscribing to ${symbols.length} markets: ${symbols.join(', ')}`);
+
+      // Start REST API polling as backup regardless — it no-ops if the WS
+      // ticker stream is up (snapshotTickersFallback skips symbols that got a
+      // recent WS update).
+      startTickerPolling();
+
+      try {
+        // v1.0.13 subscription format (confirmed per API docs):
+        //   { method: 'subscribe', subscription: [{ type: 'trades', symbol: 'BTC-USD' }, ...] }
+        // Supports up to 100 subscriptions per connection — we need 2 per
+        // market (trades + ticker), so we stay well under the limit even with
+        // ~50 coins.
+        const subs: Array<{ type: string; symbol: string }> = [];
+        for (const symbol of symbols) {
+          subs.push({ type: 'trades', symbol });
+          subs.push({ type: 'ticker', symbol });
+        }
+
+        // BULK has a 100-subscription per-connection cap. If we ever grow
+        // past that, split into chunks; for now a single batch is fine.
+        ws?.send(JSON.stringify({ method: 'subscribe', subscription: subs }));
+        console.log(`📡 Sent subscription batch (${subs.length} topics)`);
       } catch (e) {
         console.error('Failed to subscribe:', e);
       }
