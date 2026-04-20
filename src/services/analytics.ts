@@ -1,4 +1,5 @@
 import { query } from '../db';
+import { getActiveSymbols } from './markets';
 
 export interface MarketStatsPoint {
   timestamp: Date;
@@ -170,9 +171,11 @@ class AnalyticsService {
     symbols: string[];
     prices: Record<string, number[]>;
   }> {
-    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    // Dynamic symbol list so new coins appear in the correlation matrix
+    // automatically.
+    const symbols = await getActiveSymbols();
     const prices: Record<string, number[]> = {};
-    
+
     for (const symbol of symbols) {
       const rows = await query<{ price: number }>(
         `SELECT price
@@ -183,7 +186,7 @@ class AnalyticsService {
       );
       prices[symbol] = rows.map(r => parseFloat(r.price as any) || 0);
     }
-    
+
     return { symbols, prices };
   }
 
