@@ -1,5 +1,7 @@
 // Service to interact with BULK Exchange API
 
+import { getActiveSymbols } from './markets';
+
 const BULK_API_URL = process.env.BULK_API_URL || 'https://exchange-api.bulk.trade/api/v1';
 
 export interface Ticker {
@@ -117,8 +119,10 @@ class BulkApiService {
       console.log('Bulk tickers endpoint not available, falling back to individual');
     }
     
-    // Fall back to individual symbol requests
-    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    // Fall back to individual symbol requests — use the live market list so
+    // we don't miss newer coins (BNB, DOGE, FARTCOIN, SUI, ZEC). Falls back
+    // internally to a hardcoded list if /exchangeInfo is unreachable.
+    const symbols = await getActiveSymbols();
     const tickers = await Promise.all(
       symbols.map(symbol => this.getTicker(symbol))
     );
