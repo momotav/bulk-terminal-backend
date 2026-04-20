@@ -1,14 +1,18 @@
 import { Router, Request, Response } from 'express';
 import { query } from '../db';
 import { getCache, setCache } from '../services/cache';
+import { getActiveSymbols } from '../services/markets';
+import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coinShape';
 
 const router = Router();
 
 // BULK API base URL
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
-// All supported markets
-const MARKETS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'GOLD-USD', 'XRP-USD'];
+// NOTE: the old `const MARKETS = ['BTC-USD', ...]` constant was removed.
+// Every caller now resolves the live market list via `getActiveSymbols()`
+// from `../services/markets`, so new coins listed on BULK appear here
+// automatically with no code changes.
 
 // Type for BULK ticker response
 interface BulkTicker {
@@ -76,9 +80,14 @@ async function fetchKlines(symbol: string, interval: string = '1h', limit: numbe
 }
 
 // Fetch klines for all markets and combine
+// Helper: fetch klines for every market BULK currently has listed. The symbol
+// list comes from the shared `getActiveSymbols()` helper (which proxies
+// /exchangeInfo with 5-min cache + fallback), so new coins appear here with
+// no code changes.
 async function fetchAllKlines(interval: string = '1h', limit: number = 100): Promise<{ symbol: string; klines: BulkKline[] }[]> {
+  const symbols = await getActiveSymbols();
   const results = await Promise.all(
-    MARKETS.map(async (symbol) => ({
+    symbols.map(async (symbol) => ({
       symbol,
       klines: await fetchKlines(symbol, interval, limit)
     }))
@@ -86,13 +95,14 @@ async function fetchAllKlines(interval: string = '1h', limit: number = 100): Pro
   return results;
 }
 
-// Helper: Fetch all tickers and sum volume/OI
+// Helper: Fetch all tickers and sum volume/OI across every live market.
 async function fetchTickersForStats(): Promise<{ volume24h: number; openInterest: number; timestamp: number }> {
   let totalVolume = 0;
   let totalOI = 0;
   let timestamp = Date.now();
 
-  const tickerPromises = MARKETS.map(symbol =>
+  const symbols = await getActiveSymbols();
+  const tickerPromises = symbols.map(symbol =>
     fetch(`${BULK_API_BASE}/ticker/${symbol}`)
       .then(r => r.ok ? r.json() as Promise<BulkTicker> : null)
       .catch(() => null)
@@ -390,108 +400,91 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
 router.get('/volume-chart-api', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
   const isAllTime = hours >= 8760; // 1 year or more = ALL time
-  
+
   try {
     const now = Date.now();
     const startTime = isAllTime ? 0 : now - (hours * 60 * 60 * 1000);
-    
-    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
-    
-    // Always fetch hourly data (more reliable than daily from BULK API)
-    // Fetch a large limit to get all available data
-    const klinesPromises = symbols.map(symbol => 
-      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
-        .then(r => r.ok ? r.json() : [])
-        .catch(() => [])
+
+    // Fetch the live list of markets from BULK (via shared helper — cached 5
+    // min, falls back to known-good list). This replaces the old hardcoded
+    // ['BTC-USD', 'ETH-USD', 'SOL-USD'] so new coins appear automatically.
+    const symbols = await getActiveSymbols();
+
+    // Fetch hourly klines for every market in parallel. Any that fail return
+    // an empty array so one bad coin doesn't take down the chart.
+    const klinesResults = await Promise.all(
+      symbols.map(symbol =>
+        fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
+          .then(r => r.ok ? r.json() : [])
+          .catch(() => [])
+      )
     );
-    
-    const [btcKlines, ethKlines, solKlines] = await Promise.all(klinesPromises);
-    
-    // Create a map of timestamp -> volumes (hourly)
-    const hourlyMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
-    
-    (btcKlines as any[]).forEach((k: any) => {
-      const ts = k.t;
-      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-      hourlyMap.get(ts)!.BTC = (k.v || 0) * (k.c || 0);
+
+    // Build a timestamp → { coin → volume_usd } map. Each symbol contributes
+    // its hourly notional volume (base_volume * close_price).
+    const hourlyMap = new Map<number, Record<string, number>>();
+
+    symbols.forEach((symbol, i) => {
+      const coin = coinFromSymbol(symbol);
+      const klines = klinesResults[i] as any[];
+      for (const k of klines) {
+        const ts = k.t;
+        if (!hourlyMap.has(ts)) hourlyMap.set(ts, zeroCoinDict(symbols));
+        // Hourly notional USD volume = base volume * close price
+        hourlyMap.get(ts)![coin] = (k.v || 0) * (k.c || 0);
+      }
     });
-    
-    (ethKlines as any[]).forEach((k: any) => {
-      const ts = k.t;
-      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-      hourlyMap.get(ts)!.ETH = (k.v || 0) * (k.c || 0);
-    });
-    
-    (solKlines as any[]).forEach((k: any) => {
-      const ts = k.t;
-      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-      hourlyMap.get(ts)!.SOL = (k.v || 0) * (k.c || 0);
-    });
-    
-    // Determine output format based on period
-    let outputMap: Map<number, { BTC: number; ETH: number; SOL: number }>;
+
+    // Roll up to hourly (1D view) or daily (W/M/ALL view).
+    let outputMap: Map<number, Record<string, number>>;
     let historicalCumulative = 0;
-    
+
+    const sumOfCoins = (dict: Record<string, number>): number =>
+      Object.values(dict).reduce((s, v) => s + (typeof v === 'number' ? v : 0), 0);
+
     if (hours <= 24) {
       // Hourly bars for 1D view
       outputMap = new Map();
       const sortedHourly = Array.from(hourlyMap.entries()).sort((a, b) => a[0] - b[0]);
-      
       for (const [ts, vol] of sortedHourly) {
-        if (ts >= startTime) {
-          outputMap.set(ts, vol);
-        } else {
-          historicalCumulative += vol.BTC + vol.ETH + vol.SOL;
-        }
+        if (ts >= startTime) outputMap.set(ts, vol);
+        else historicalCumulative += sumOfCoins(vol);
       }
     } else {
-      // Aggregate hourly data into daily bars for W/M/ALL
-      const dailyMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
-      
+      // Aggregate hourly into daily bars for W/M/ALL
+      const dailyMap = new Map<number, Record<string, number>>();
       for (const [ts, vol] of hourlyMap.entries()) {
-        // Get start of day (UTC)
         const date = new Date(ts);
         const dayStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
-        
-        if (!dailyMap.has(dayStart)) {
-          dailyMap.set(dayStart, { BTC: 0, ETH: 0, SOL: 0 });
+        if (!dailyMap.has(dayStart)) dailyMap.set(dayStart, zeroCoinDict(symbols));
+        const day = dailyMap.get(dayStart)!;
+        for (const [coin, v] of Object.entries(vol)) {
+          day[coin] = (day[coin] || 0) + v;
         }
-        dailyMap.get(dayStart)!.BTC += vol.BTC;
-        dailyMap.get(dayStart)!.ETH += vol.ETH;
-        dailyMap.get(dayStart)!.SOL += vol.SOL;
       }
-      
-      // Filter by startTime and calculate historical cumulative
       outputMap = new Map();
       const sortedDaily = Array.from(dailyMap.entries()).sort((a, b) => a[0] - b[0]);
-      
       for (const [ts, vol] of sortedDaily) {
-        if (isAllTime || ts >= startTime) {
-          outputMap.set(ts, vol);
-        } else {
-          historicalCumulative += vol.BTC + vol.ETH + vol.SOL;
-        }
+        if (isAllTime || ts >= startTime) outputMap.set(ts, vol);
+        else historicalCumulative += sumOfCoins(vol);
       }
     }
-    
-    // Convert to array and add cumulative
+
+    // Emit additive rows — legacy BTC/ETH/SOL fields + new `coins` dict.
     let cumulative = historicalCumulative;
     const data = Array.from(outputMap.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([ts, vol]) => {
-        const total = vol.BTC + vol.ETH + vol.SOL;
+        const total = sumOfCoins(vol);
         cumulative += total;
-        return {
-          timestamp: new Date(ts).toISOString(),
-          BTC: vol.BTC,
-          ETH: vol.ETH,
-          SOL: vol.SOL,
-          total,
-          Cumulative: cumulative,
-        };
+        return buildAdditiveRow(
+          new Date(ts).toISOString(),
+          vol,
+          { total, Cumulative: cumulative }
+        );
       });
-    
-    console.log(`📊 Volume chart (${isAllTime ? 'ALL' : hours + 'h'}): ${data.length} bars, cumulative: $${(cumulative/1e9).toFixed(2)}B`);
+
+    console.log(`📊 Volume chart (${isAllTime ? 'ALL' : hours + 'h'}): ${data.length} bars, ${symbols.length} coins, cumulative: $${(cumulative/1e9).toFixed(2)}B`);
     res.json({ data });
   } catch (error) {
     console.error('Error fetching volume chart from API:', error);
@@ -503,107 +496,82 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
 router.get('/trades-chart-api', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
   const isAllTime = hours >= 8760; // 1 year or more = ALL time
-  
+
   try {
     const now = Date.now();
     const startTime = isAllTime ? 0 : now - (hours * 60 * 60 * 1000);
-    
-    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
-    
-    // Always fetch hourly data (more reliable than daily from BULK API)
-    const klinesPromises = symbols.map(symbol => 
-      fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
-        .then(r => r.ok ? r.json() : [])
-        .catch(() => [])
+
+    // Dynamic symbol list — same pattern as /volume-chart-api.
+    const symbols = await getActiveSymbols();
+
+    const klinesResults = await Promise.all(
+      symbols.map(symbol =>
+        fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
+          .then(r => r.ok ? r.json() : [])
+          .catch(() => [])
+      )
     );
-    
-    const [btcKlines, ethKlines, solKlines] = await Promise.all(klinesPromises);
-    
-    // Create a map of timestamp -> trades (hourly)
-    const hourlyMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
-    
-    (btcKlines as any[]).forEach((k: any) => {
-      const ts = k.t;
-      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-      hourlyMap.get(ts)!.BTC = k.n || 0;
+
+    // Per-hour trade-count dictionary. BULK's klines `n` field is the number
+    // of trades that occurred in that candle.
+    const hourlyMap = new Map<number, Record<string, number>>();
+
+    symbols.forEach((symbol, i) => {
+      const coin = coinFromSymbol(symbol);
+      const klines = klinesResults[i] as any[];
+      for (const k of klines) {
+        const ts = k.t;
+        if (!hourlyMap.has(ts)) hourlyMap.set(ts, zeroCoinDict(symbols));
+        hourlyMap.get(ts)![coin] = k.n || 0;
+      }
     });
-    
-    (ethKlines as any[]).forEach((k: any) => {
-      const ts = k.t;
-      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-      hourlyMap.get(ts)!.ETH = k.n || 0;
-    });
-    
-    (solKlines as any[]).forEach((k: any) => {
-      const ts = k.t;
-      if (!hourlyMap.has(ts)) hourlyMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-      hourlyMap.get(ts)!.SOL = k.n || 0;
-    });
-    
-    // Determine output format based on period
-    let outputMap: Map<number, { BTC: number; ETH: number; SOL: number }>;
+
+    let outputMap: Map<number, Record<string, number>>;
     let historicalCumulative = 0;
-    
+
+    const sumOfCoins = (dict: Record<string, number>): number =>
+      Object.values(dict).reduce((s, v) => s + (typeof v === 'number' ? v : 0), 0);
+
     if (hours <= 24) {
-      // Hourly bars for 1D view
       outputMap = new Map();
       const sortedHourly = Array.from(hourlyMap.entries()).sort((a, b) => a[0] - b[0]);
-      
       for (const [ts, trades] of sortedHourly) {
-        if (ts >= startTime) {
-          outputMap.set(ts, trades);
-        } else {
-          historicalCumulative += trades.BTC + trades.ETH + trades.SOL;
-        }
+        if (ts >= startTime) outputMap.set(ts, trades);
+        else historicalCumulative += sumOfCoins(trades);
       }
     } else {
-      // Aggregate hourly data into daily bars for W/M/ALL
-      const dailyMap = new Map<number, { BTC: number; ETH: number; SOL: number }>();
-      
+      const dailyMap = new Map<number, Record<string, number>>();
       for (const [ts, trades] of hourlyMap.entries()) {
-        // Get start of day (UTC)
         const date = new Date(ts);
         const dayStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
-        
-        if (!dailyMap.has(dayStart)) {
-          dailyMap.set(dayStart, { BTC: 0, ETH: 0, SOL: 0 });
+        if (!dailyMap.has(dayStart)) dailyMap.set(dayStart, zeroCoinDict(symbols));
+        const day = dailyMap.get(dayStart)!;
+        for (const [coin, v] of Object.entries(trades)) {
+          day[coin] = (day[coin] || 0) + v;
         }
-        dailyMap.get(dayStart)!.BTC += trades.BTC;
-        dailyMap.get(dayStart)!.ETH += trades.ETH;
-        dailyMap.get(dayStart)!.SOL += trades.SOL;
       }
-      
-      // Filter by startTime and calculate historical cumulative
       outputMap = new Map();
       const sortedDaily = Array.from(dailyMap.entries()).sort((a, b) => a[0] - b[0]);
-      
       for (const [ts, trades] of sortedDaily) {
-        if (isAllTime || ts >= startTime) {
-          outputMap.set(ts, trades);
-        } else {
-          historicalCumulative += trades.BTC + trades.ETH + trades.SOL;
-        }
+        if (isAllTime || ts >= startTime) outputMap.set(ts, trades);
+        else historicalCumulative += sumOfCoins(trades);
       }
     }
-    
-    // Convert to array and add cumulative
+
     let cumulative = historicalCumulative;
     const data = Array.from(outputMap.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([ts, trades]) => {
-        const total = trades.BTC + trades.ETH + trades.SOL;
+        const total = sumOfCoins(trades);
         cumulative += total;
-        return {
-          timestamp: new Date(ts).toISOString(),
-          BTC: trades.BTC,
-          ETH: trades.ETH,
-          SOL: trades.SOL,
-          total,
-          Cumulative: cumulative,
-        };
+        return buildAdditiveRow(
+          new Date(ts).toISOString(),
+          trades,
+          { total, Cumulative: cumulative }
+        );
       });
-    
-    console.log(`📊 Trades chart (${isAllTime ? 'ALL' : hours + 'h'}): ${data.length} bars, cumulative: ${cumulative.toLocaleString()}`);
+
+    console.log(`📊 Trades chart (${isAllTime ? 'ALL' : hours + 'h'}): ${data.length} bars, ${symbols.length} coins, cumulative: ${cumulative.toLocaleString()}`);
     res.json({ data });
   } catch (error) {
     console.error('Error fetching trades chart from API:', error);
@@ -667,13 +635,13 @@ router.get('/funding-rate-history/:symbol', async (req: Request, res: Response) 
 router.get('/oi-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
   const cacheKey = `analytics:oi_chart:${hours}`;
-  
+
   // Check cache first
   const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
-  
+
   try {
     const result = await Promise.race([
       query(`
@@ -688,101 +656,92 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
       `),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
     ]) as any[];
-    
-    // Group by timestamp
-    const dataMap = new Map<string, { BTC: number; ETH: number; SOL: number }>();
-    
+
+    const symbols = await getActiveSymbols();
+
+    // Group by timestamp → per-coin OI dictionary. The SQL already groups by
+    // symbol, so we just pivot rows into a { coin: value } shape keyed by ts.
+    const dataMap = new Map<string, Record<string, number>>();
     for (const row of result) {
       const ts = new Date(row.timestamp).toISOString();
-      if (!dataMap.has(ts)) {
-        dataMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-      }
-      const coin = (row.symbol || '').split('-')[0] as 'BTC' | 'ETH' | 'SOL';
-      if (coin in dataMap.get(ts)!) {
-        dataMap.get(ts)![coin] = parseFloat(row.value || 0);
-      }
+      if (!dataMap.has(ts)) dataMap.set(ts, zeroCoinDict(symbols));
+      const coin = coinFromSymbol(row.symbol || '');
+      if (coin) dataMap.get(ts)![coin] = parseFloat(row.value || 0);
     }
-    
-    let data = Array.from(dataMap.entries()).map(([timestamp, values]) => ({
-      timestamp,
-      ...values,
-      total: values.BTC + values.ETH + values.SOL
-    }));
-    
-    // Calculate median values for each coin to detect anomalies
-    const btcValues = data.map(d => d.BTC).filter(v => v > 0).sort((a, b) => a - b);
-    const ethValues = data.map(d => d.ETH).filter(v => v > 0).sort((a, b) => a - b);
-    const solValues = data.map(d => d.SOL).filter(v => v > 0).sort((a, b) => a - b);
-    
-    const medianBTC = btcValues.length > 0 ? btcValues[Math.floor(btcValues.length / 2)] : 0;
-    const medianETH = ethValues.length > 0 ? ethValues[Math.floor(ethValues.length / 2)] : 0;
-    const medianSOL = solValues.length > 0 ? solValues[Math.floor(solValues.length / 2)] : 0;
-    
-    // Calculate what percentage of data points have each coin
-    const btcCoverage = btcValues.length / data.length;
-    const ethCoverage = ethValues.length / data.length;
-    const solCoverage = solValues.length / data.length;
-    
-    // Filter out restart drops using multiple strategies
+
+    // Build an intermediate array that has per-coin values + `total`. We do
+    // anomaly detection on this, then wrap into the additive output shape.
+    let data: Array<{ timestamp: string; total: number; coinValues: Record<string, number> }> =
+      Array.from(dataMap.entries()).map(([timestamp, values]) => ({
+        timestamp,
+        coinValues: values,
+        total: Object.values(values).reduce((s, v) => s + v, 0),
+      }));
+
+    // Per-coin anomaly detection — handles the case where the WS temporarily
+    // drops and OI briefly appears as 0 or ~0. We do this per coin rather
+    // than hardcoding BTC/ETH/SOL so new markets get the same treatment.
+    const medianOf = (arr: number[]): number => {
+      const pos = arr.filter(v => v > 0).sort((a, b) => a - b);
+      return pos.length > 0 ? pos[Math.floor(pos.length / 2)] : 0;
+    };
+    const medians: Record<string, number> = {};
+    const coverage: Record<string, number> = {};
+    for (const coin of Object.keys(data[0]?.coinValues || {})) {
+      const all = data.map(d => d.coinValues[coin] || 0);
+      const pos = all.filter(v => v > 0);
+      medians[coin] = medianOf(all);
+      coverage[coin] = data.length > 0 ? pos.length / data.length : 0;
+    }
+
     data = data.filter((point, index, arr) => {
-      // Strategy 1: If a coin is 0 but it normally has data (>80% coverage) and median is significant
-      // This is likely a restart drop - filter it out
-      if (btcCoverage > 0.8 && medianBTC > 10000000 && point.BTC === 0) {
-        return false;
-      }
-      
-      if (ethCoverage > 0.8 && medianETH > 10000000 && point.ETH === 0) {
-        return false;
-      }
-      
-      if (solCoverage > 0.8 && medianSOL > 10000000 && point.SOL === 0) {
-        return false;
-      }
-      
-      // Strategy 2: Detect sudden drops more than 90% for any coin
-      if (index > 0) {
-        const prev = arr[index - 1];
-        const next = arr[index + 1];
-        
-        // BTC sudden drop (but not to exactly 0 - that's handled above)
-        if (point.BTC > 0 && prev.BTC > medianBTC * 0.5 && point.BTC < prev.BTC * 0.1) {
-          if (next && next.BTC > prev.BTC * 0.5) {
-            return false;
-          }
-        }
-        
-        // ETH sudden drop
-        if (point.ETH > 0 && prev.ETH > medianETH * 0.5 && point.ETH < prev.ETH * 0.1) {
-          if (next && next.ETH > prev.ETH * 0.5) {
-            return false;
-          }
-        }
-        
-        // SOL sudden drop
-        if (point.SOL > 0 && prev.SOL > medianSOL * 0.5 && point.SOL < prev.SOL * 0.1) {
-          if (next && next.SOL > prev.SOL * 0.5) {
-            return false;
-          }
-        }
-      }
-      
-      // Strategy 3: Total drops to near zero
-      if (point.total < 1000) {
-        const prev = arr[index - 1];
-        const next = arr[index + 1];
-        if ((prev && prev.total > 100000) || (next && next.total > 100000)) {
+      // Strategy 1: coin normally has data (>80% coverage) and its median is
+      // significant, but the current point is exactly zero → probably a WS
+      // restart artifact, drop this tick.
+      for (const [coin, v] of Object.entries(point.coinValues)) {
+        if (coverage[coin] > 0.8 && medians[coin] > 10_000_000 && v === 0) {
           return false;
         }
       }
-      
+
+      // Strategy 2: sudden > 90% drop for any coin that recovers on the next
+      // tick — also most likely a WS restart, drop it.
+      if (index > 0) {
+        const prev = arr[index - 1];
+        const next = arr[index + 1];
+        for (const [coin, v] of Object.entries(point.coinValues)) {
+          const p = prev.coinValues[coin] || 0;
+          const n = next?.coinValues[coin] || 0;
+          const m = medians[coin] || 0;
+          if (v > 0 && p > m * 0.5 && v < p * 0.1) {
+            if (next && n > p * 0.5) return false;
+          }
+        }
+      }
+
+      // Strategy 3: total collapses to near-zero but surrounding points are
+      // healthy — same restart signature.
+      if (point.total < 1000) {
+        const prev = arr[index - 1];
+        const next = arr[index + 1];
+        if ((prev && prev.total > 100_000) || (next && next.total > 100_000)) {
+          return false;
+        }
+      }
+
       return true;
     });
-    
-    const response = { hours, dataPoints: data.length, data };
-    
+
+    // Emit additive rows.
+    const out = data.map(d =>
+      buildAdditiveRow(d.timestamp, d.coinValues, { total: d.total })
+    );
+
+    const response = { hours, dataPoints: out.length, data: out };
+
     // Cache for 60 seconds
     await setCache(cacheKey, response, 60);
-    
+
     res.json(response);
   } catch (error) {
     console.error('Error fetching OI chart:', error);
@@ -816,70 +775,67 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
     ]) as any[];
     
-    const dataMap = new Map<string, { BTC: number; ETH: number; SOL: number }>();
-    
+    const symbols = await getActiveSymbols();
+    const dataMap = new Map<string, Record<string, number>>();
+
     for (const row of result) {
       const ts = new Date(row.timestamp).toISOString();
-      if (!dataMap.has(ts)) {
-        dataMap.set(ts, { BTC: 0, ETH: 0, SOL: 0 });
-      }
-      const coin = (row.symbol || '').split('-')[0] as 'BTC' | 'ETH' | 'SOL';
-      if (coin in dataMap.get(ts)!) {
-        dataMap.get(ts)![coin] = parseFloat(row.value || 0);
+      if (!dataMap.has(ts)) dataMap.set(ts, zeroCoinDict(symbols));
+      const coin = coinFromSymbol(row.symbol || '');
+      if (coin) dataMap.get(ts)![coin] = parseFloat(row.value || 0);
+    }
+
+    let data: Array<{ timestamp: string; coinValues: Record<string, number> }> =
+      Array.from(dataMap.entries()).map(([timestamp, values]) => ({
+        timestamp,
+        coinValues: values,
+      }));
+
+    // Per-coin coverage: how often a coin has a non-zero value in the window.
+    // If a coin normally has data (>70% coverage) but this point shows 0, it's
+    // most likely a WS restart artifact.
+    const coverage: Record<string, number> = {};
+    if (data.length > 0) {
+      for (const coin of Object.keys(data[0].coinValues)) {
+        const nonZero = data.filter(d => d.coinValues[coin] !== 0).length;
+        coverage[coin] = nonZero / data.length;
       }
     }
-    
-    let data = Array.from(dataMap.entries()).map(([timestamp, values]) => ({
-      timestamp,
-      ...values
-    }));
-    
-    // Count how many data points have non-zero values for each coin
-    const btcCount = data.filter(d => d.BTC !== 0).length;
-    const ethCount = data.filter(d => d.ETH !== 0).length;
-    const solCount = data.filter(d => d.SOL !== 0).length;
-    const totalPoints = data.length;
-    
-    // If a coin has data in most points, filter out points where it's suddenly 0
-    const btcShouldHaveData = btcCount > totalPoints * 0.7;
-    const ethShouldHaveData = ethCount > totalPoints * 0.7;
-    const solShouldHaveData = solCount > totalPoints * 0.7;
-    
-    // Filter out restart drops
+
     data = data.filter((point, index, arr) => {
       const prev = arr[index - 1];
       const next = arr[index + 1];
-      
-      // Check if this point has missing data that neighbors have
-      // BTC missing but should have data
-      if (btcShouldHaveData && point.BTC === 0) {
-        if ((prev && prev.BTC !== 0) || (next && next.BTC !== 0)) {
-          // Check if multiple coins are missing - likely a restart
-          const missingCount = (point.BTC === 0 ? 1 : 0) + (point.ETH === 0 ? 1 : 0) + (point.SOL === 0 ? 1 : 0);
-          if (missingCount >= 2) {
-            return false;
-          }
-        }
+
+      // If 2+ coins that normally have data are simultaneously zero AND
+      // neighboring points have data, skip this tick — WS restart.
+      const missingWithHistory = Object.entries(point.coinValues).filter(
+        ([coin, v]) => v === 0 && coverage[coin] > 0.7
+      );
+      if (missingWithHistory.length >= 2) {
+        const hasNeighborData =
+          (prev && Object.values(prev.coinValues).some(v => v !== 0)) ||
+          (next && Object.values(next.coinValues).some(v => v !== 0));
+        if (hasNeighborData) return false;
       }
-      
-      // All zeros is definitely a restart
-      const allZero = point.BTC === 0 && point.ETH === 0 && point.SOL === 0;
+
+      // All zeros, surrounded by data → definite restart, drop it.
+      const allZero = Object.values(point.coinValues).every(v => v === 0);
       if (allZero) {
-        const prevHasData = prev && (prev.BTC !== 0 || prev.ETH !== 0 || prev.SOL !== 0);
-        const nextHasData = next && (next.BTC !== 0 || next.ETH !== 0 || next.SOL !== 0);
-        if (prevHasData || nextHasData) {
-          return false;
-        }
+        const prevHasData = prev && Object.values(prev.coinValues).some(v => v !== 0);
+        const nextHasData = next && Object.values(next.coinValues).some(v => v !== 0);
+        if (prevHasData || nextHasData) return false;
       }
-      
+
       return true;
     });
-    
-    const response = { hours, dataPoints: data.length, data };
-    
+
+    const out = data.map(d => buildAdditiveRow(d.timestamp, d.coinValues));
+
+    const response = { hours, dataPoints: out.length, data: out };
+
     // Cache for 60 seconds
     await setCache(cacheKey, response, 60);
-    
+
     res.json(response);
   } catch (error) {
     console.error('Error fetching funding chart:', error);
@@ -889,38 +845,50 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
 
 // ============ DATABASE CHARTS (Volume, Trades, Liquidations, ADL) ============
 
-// Helper function to transform raw DB rows to chart format with cumulative
+// Helper function to transform raw DB rows to chart format with cumulative.
+// Output rows use the additive shape: legacy top-level BTC/ETH/SOL/... fields
+// PLUS a canonical `coins: { ... }` dictionary covering every market. That
+// means the same helper powers both old frontend code (reading row.BTC) and
+// new code (reading row.coins.BNB etc).
 function transformToChartData(
-  rows: any[], 
+  rows: any[],
   historicalCumulative: number = 0
-): { timestamp: string; BTC: number; ETH: number; SOL: number; total: number; Cumulative: number }[] {
-  const dataMap = new Map<string, { timestamp: string; BTC: number; ETH: number; SOL: number; total: number }>();
-  
+): Record<string, unknown>[] {
+  const dataMap = new Map<string, { timestamp: string; total: number; coinValues: Record<string, number> }>();
+
   for (const row of rows) {
     const dateKey = new Date(row.day).toISOString();
     if (!dataMap.has(dateKey)) {
-      dataMap.set(dateKey, { timestamp: dateKey, BTC: 0, ETH: 0, SOL: 0, total: 0 });
+      dataMap.set(dateKey, { timestamp: dateKey, total: 0, coinValues: {} });
     }
     const entry = dataMap.get(dateKey)!;
-    const value = parseFloat(row.volume || row.total_value || row.trade_count || row.liquidation_count || row.adl_count || 0);
-    
+    const value = parseFloat(
+      row.volume || row.total_value || row.trade_count || row.liquidation_count || row.adl_count || 0
+    );
+
     entry.total += value;
-    
-    const symbol = row.symbol || '';
-    if (symbol.includes('BTC')) entry.BTC += value;
-    else if (symbol.includes('ETH')) entry.ETH += value;
-    else if (symbol.includes('SOL')) entry.SOL += value;
+
+    // Use the coin part of the symbol as the dictionary key — works for any
+    // market BULK has, including ones that didn't exist when this was written.
+    const coin = coinFromSymbol(row.symbol || '');
+    if (coin) {
+      entry.coinValues[coin] = (entry.coinValues[coin] || 0) + value;
+    }
   }
-  
+
   // Sort and add cumulative
-  const sorted = Array.from(dataMap.values()).sort((a, b) => 
-    new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  const sorted = Array.from(dataMap.values()).sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
   );
-  
+
   let cumulative = historicalCumulative;
   return sorted.map(entry => {
     cumulative += entry.total;
-    return { ...entry, Cumulative: cumulative };
+    return buildAdditiveRow(
+      entry.timestamp,
+      entry.coinValues,
+      { total: entry.total, Cumulative: cumulative }
+    );
   });
 }
 
@@ -1258,50 +1226,42 @@ router.get('/klines/:symbol', async (req: Request, res: Response) => {
 // Volume chart from BULK API /klines (no PostgreSQL needed!)
 router.get('/volume-chart-bulk', async (req: Request, res: Response) => {
   const interval = (req.query.interval as string) || '1h';
-  
+
   try {
-    // Fetch klines for all markets
+    // Fetch klines for all markets (fetchAllKlines itself iterates MARKETS —
+    // we migrate that separately below).
     const allKlines = await fetchAllKlines(interval, 500);
-    
-    // Create a map of timestamp -> { total, BTC, ETH, SOL, ... }
-    const dataMap = new Map<number, { timestamp: string; total: number; BTC: number; ETH: number; SOL: number; XRP: number; GOLD: number }>();
-    
+
+    // Per-timestamp per-coin dictionary. No hardcoded coin list — we build
+    // the dict organically as symbols come in, so any new BULK market
+    // automatically appears here.
+    type Entry = { timestamp: string; total: number; coinValues: Record<string, number> };
+    const dataMap = new Map<number, Entry>();
+
     for (const { symbol, klines } of allKlines) {
+      const coin = coinFromSymbol(symbol);
       for (const kline of klines) {
         const timestamp = kline.t;
-        
         if (!dataMap.has(timestamp)) {
           dataMap.set(timestamp, {
             timestamp: new Date(timestamp).toISOString(),
             total: 0,
-            BTC: 0,
-            ETH: 0,
-            SOL: 0,
-            XRP: 0,
-            GOLD: 0
+            coinValues: {},
           });
         }
-        
         const entry = dataMap.get(timestamp)!;
         // Volume in quote (USD) = volume in base * close price
         const volumeUsd = kline.v * kline.c;
-        
         entry.total += volumeUsd;
-        
-        if (symbol === 'BTC-USD') entry.BTC = volumeUsd;
-        else if (symbol === 'ETH-USD') entry.ETH = volumeUsd;
-        else if (symbol === 'SOL-USD') entry.SOL = volumeUsd;
-        else if (symbol === 'XRP-USD') entry.XRP = volumeUsd;
-        else if (symbol === 'GOLD-USD') entry.GOLD = volumeUsd;
+        entry.coinValues[coin] = (entry.coinValues[coin] || 0) + volumeUsd;
       }
     }
-    
-    // Sort by timestamp
-    const data = Array.from(dataMap.values()).sort((a, b) => 
-      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-    );
-    
-    res.json({ 
+
+    const data = Array.from(dataMap.values())
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+      .map(e => buildAdditiveRow(e.timestamp, e.coinValues, { total: e.total }));
+
+    res.json({
       data,
       source: 'bulk-api',
       interval,
@@ -1349,8 +1309,10 @@ router.get('/market-stats-bulk', async (req: Request, res: Response) => {
 // All tickers from BULK API
 router.get('/tickers-bulk', async (req: Request, res: Response) => {
   try {
+    // Use live symbol list so new markets appear automatically.
+    const symbols = await getActiveSymbols();
     const tickers = await Promise.all(
-      MARKETS.map(async (symbol) => {
+      symbols.map(async (symbol) => {
         try {
           const response = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
           if (!response.ok) return null;
@@ -1360,7 +1322,7 @@ router.get('/tickers-bulk', async (req: Request, res: Response) => {
         }
       })
     );
-    
+
     res.json({
       tickers: tickers.filter(t => t !== null),
       source: 'bulk-api'
@@ -1376,7 +1338,7 @@ router.get('/tickers-bulk', async (req: Request, res: Response) => {
 // Unique Traders By Coin (daily breakdown) - USES PRE-AGGREGATED TABLE
 router.get('/unique-traders-by-coin', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720; // Default 30 days
-  
+
   try {
     const cacheKey = `unique-traders-coin:${hours}`;
     const cached = await getCache<any>(cacheKey);
@@ -1395,7 +1357,7 @@ router.get('/unique-traders-by-coin', async (req: Request, res: Response) => {
       WHERE day > NOW() - INTERVAL '${hours} hours'
       ORDER BY day ASC, symbol ASC
     `);
-    
+
     // Get total unique per day
     const totals = await query<{
       day: string;
@@ -1406,6 +1368,8 @@ router.get('/unique-traders-by-coin', async (req: Request, res: Response) => {
       WHERE day > NOW() - INTERVAL '${hours} hours'
       ORDER BY day ASC
     `);
+
+    const symbols = await getActiveSymbols();
 
     // If pre-aggregated tables are empty, fall back to direct query (slower)
     if (data.length === 0) {
@@ -1437,22 +1401,25 @@ router.get('/unique-traders-by-coin', async (req: Request, res: Response) => {
         JOIN per_day pd ON ps.day = pd.day
         ORDER BY ps.day ASC
       `);
-      
-      const dayMap = new Map<string, { BTC: number; ETH: number; SOL: number; total: number }>();
+
+      // Per-day per-coin dict. We keep `total` separately as an extra field.
+      const dayMap = new Map<string, { coinValues: Record<string, number>; total: number }>();
       for (const row of fallback) {
         const dayStr = new Date(row.day).toISOString().split('T')[0];
         if (!dayMap.has(dayStr)) {
-          dayMap.set(dayStr, { BTC: 0, ETH: 0, SOL: 0, total: parseInt(row.total) });
+          dayMap.set(dayStr, { coinValues: zeroCoinDict(symbols), total: parseInt(row.total) });
         }
         const entry = dayMap.get(dayStr)!;
-        const coin = row.symbol.replace('-USD', '') as 'BTC' | 'ETH' | 'SOL';
-        if (coin in entry) entry[coin] = parseInt(row.traders);
+        const coin = coinFromSymbol(row.symbol);
+        if (coin) entry.coinValues[coin] = parseInt(row.traders);
       }
-      
+
       const chartData = Array.from(dayMap.entries())
-        .map(([day, values]) => ({ timestamp: day, ...values }))
-        .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-      
+        .map(([day, { coinValues, total }]) =>
+          buildAdditiveRow(day, coinValues, { total })
+        )
+        .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+
       const result = { data: chartData };
       await setCache(cacheKey, result, 60); // Short cache for fallback
       return res.json(result);
@@ -1463,21 +1430,26 @@ router.get('/unique-traders-by-coin', async (req: Request, res: Response) => {
     for (const row of totals) {
       totalMap.set(new Date(row.day).toISOString().split('T')[0], parseInt(row.total_unique));
     }
-    
-    const dayMap = new Map<string, { BTC: number; ETH: number; SOL: number; total: number }>();
+
+    const dayMap = new Map<string, { coinValues: Record<string, number>; total: number }>();
     for (const row of data) {
       const dayStr = new Date(row.day).toISOString().split('T')[0];
       if (!dayMap.has(dayStr)) {
-        dayMap.set(dayStr, { BTC: 0, ETH: 0, SOL: 0, total: totalMap.get(dayStr) || 0 });
+        dayMap.set(dayStr, {
+          coinValues: zeroCoinDict(symbols),
+          total: totalMap.get(dayStr) || 0,
+        });
       }
       const entry = dayMap.get(dayStr)!;
-      const coin = row.symbol.replace('-USD', '') as 'BTC' | 'ETH' | 'SOL';
-      if (coin in entry) entry[coin] = parseInt(row.unique_traders);
+      const coin = coinFromSymbol(row.symbol);
+      if (coin) entry.coinValues[coin] = parseInt(row.unique_traders);
     }
 
     const chartData = Array.from(dayMap.entries())
-      .map(([day, values]) => ({ timestamp: day, ...values }))
-      .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+      .map(([day, { coinValues, total }]) =>
+        buildAdditiveRow(day, coinValues, { total })
+      )
+      .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
 
     const result = { data: chartData };
     await setCache(cacheKey, result, 600); // 10 min cache
@@ -1987,23 +1959,25 @@ router.get('/liquidations/featured', async (req: Request, res: Response) => {
 // Live market regime data (from BULK API tickers)
 router.get('/regime', async (req: Request, res: Response) => {
   const cacheKey = 'analytics:regime';
-  
+
   const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
-  
+
   try {
-    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
+    // Fetch regime data for every market BULK has listed — new coins
+    // automatically appear here once BULK starts returning regime fields.
+    const symbols = await getActiveSymbols();
     const regimeData: any[] = [];
-    
+
     for (const symbol of symbols) {
       try {
         const tickerRes = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
         if (tickerRes.ok) {
           const ticker = await tickerRes.json() as any;
           regimeData.push({
-            symbol: symbol.replace('-USD', ''),
+            symbol: coinFromSymbol(symbol),
             regime: ticker.regime ?? 0,
             regimeDt: ticker.regimeDt ?? 0,
             regimeVol: ticker.regimeVol ?? 0,
@@ -2017,18 +1991,18 @@ router.get('/regime', async (req: Request, res: Response) => {
         console.error(`Failed to fetch regime for ${symbol}:`, e);
       }
     }
-    
+
     // Calculate aggregate regime (weighted by some factor or just average)
-    const avgRegime = regimeData.length > 0 
-      ? regimeData.reduce((sum, d) => sum + (d.regime || 0), 0) / regimeData.length 
+    const avgRegime = regimeData.length > 0
+      ? regimeData.reduce((sum, d) => sum + (d.regime || 0), 0) / regimeData.length
       : 0;
-    
+
     const result = {
       timestamp: Date.now(),
       aggregateRegime: avgRegime,
       markets: regimeData
     };
-    
+
     await setCache(cacheKey, result, 10); // 10 second cache for live data
     res.json(result);
   } catch (error) {
@@ -2041,47 +2015,53 @@ router.get('/regime', async (req: Request, res: Response) => {
 router.get('/volatility-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
   const cacheKey = `analytics:volatility_chart:${hours}`;
-  
+
   const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
-  
+
   try {
     // Determine bucket interval for date_trunc (PostgreSQL format)
     let bucketInterval = 'hour';
     if (hours <= 24) bucketInterval = 'hour';
     else if (hours <= 168) bucketInterval = 'hour';
     else bucketInterval = 'day';
-    
-    const data = await query<{
+
+    // Pivot per-(time_bucket, symbol) rows into per-timestamp dicts. The SQL
+    // now groups dynamically by symbol — no more hardcoded btc_vol/eth_vol
+    // columns — so any market with regime_vol data appears automatically.
+    const rows = await query<{
       time_bucket: string;
-      btc_vol: string;
-      eth_vol: string;
-      sol_vol: string;
+      symbol: string;
+      vol: string;
     }>(`
       SELECT 
         date_trunc('${bucketInterval}', timestamp) as time_bucket,
-        AVG(CASE WHEN symbol = 'BTC-USD' THEN regime_vol END) as btc_vol,
-        AVG(CASE WHEN symbol = 'ETH-USD' THEN regime_vol END) as eth_vol,
-        AVG(CASE WHEN symbol = 'SOL-USD' THEN regime_vol END) as sol_vol
+        symbol,
+        AVG(regime_vol) as vol
       FROM ticker_snapshots
       WHERE timestamp > NOW() - INTERVAL '${hours} hours'
         AND regime_vol IS NOT NULL
-      GROUP BY time_bucket
+      GROUP BY time_bucket, symbol
       ORDER BY time_bucket ASC
     `);
-    
-    const result = {
-      period: hours,
-      data: data.map(row => ({
-        timestamp: row.time_bucket,
-        BTC: parseFloat(row.btc_vol || '0'),
-        ETH: parseFloat(row.eth_vol || '0'),
-        SOL: parseFloat(row.sol_vol || '0')
-      }))
-    };
-    
+
+    const symbols = await getActiveSymbols();
+    const bucketMap = new Map<string, Record<string, number>>();
+    for (const row of rows) {
+      const ts = new Date(row.time_bucket).toISOString();
+      if (!bucketMap.has(ts)) bucketMap.set(ts, zeroCoinDict(symbols));
+      const coin = coinFromSymbol(row.symbol);
+      if (coin) bucketMap.get(ts)![coin] = parseFloat(row.vol || '0');
+    }
+
+    const data = Array.from(bucketMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([ts, coinValues]) => buildAdditiveRow(ts, coinValues));
+
+    const result = { period: hours, data };
+
     await setCache(cacheKey, result, 60);
     res.json(result);
   } catch (error) {
@@ -2276,60 +2256,63 @@ router.get('/protocol-revenue-chart', async (req: Request, res: Response) => {
 router.get('/adl-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 168;
   const cacheKey = `analytics:adl_chart:${hours}`;
-  
+
   const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
-  
+
   try {
     // Determine bucket interval
     let bucketInterval = '1 hour';
     if (hours <= 24) bucketInterval = '1 hour';
     else if (hours <= 168) bucketInterval = '4 hours';
     else bucketInterval = '1 day';
-    
+
     // Start date for BULK API data
     const BULK_API_START = '2026-04-13T19:00:00.000Z';
-    
-    const data = await query<{
+
+    // Group dynamically per symbol — no more hardcoded btc_value/eth_value
+    // columns. Any new market BULK lists appears automatically once ADL
+    // events for it land in the DB.
+    const rows = await query<{
       time_bucket: string;
-      btc_value: string;
-      eth_value: string;
-      sol_value: string;
-      total_count: string;
+      symbol: string;
+      bucket_value: string;
+      bucket_count: string;
     }>(`
       SELECT 
         date_trunc('${bucketInterval.replace(' ', '_')}', timestamp) as time_bucket,
-        COALESCE(SUM(CASE WHEN symbol = 'BTC-USD' THEN value END), 0) as btc_value,
-        COALESCE(SUM(CASE WHEN symbol = 'ETH-USD' THEN value END), 0) as eth_value,
-        COALESCE(SUM(CASE WHEN symbol = 'SOL-USD' THEN value END), 0) as sol_value,
-        COUNT(*) as total_count
+        symbol,
+        COALESCE(SUM(value), 0) as bucket_value,
+        COUNT(*) as bucket_count
       FROM adl_events
       WHERE timestamp >= GREATEST('${BULK_API_START}'::timestamp, NOW() - INTERVAL '${hours} hours')
-      GROUP BY time_bucket
+      GROUP BY time_bucket, symbol
       ORDER BY time_bucket ASC
     `);
-    
-    // Calculate cumulative
+
+    const symbols = await getActiveSymbols();
+    const bucketMap = new Map<string, { coinValues: Record<string, number>; count: number }>();
+    for (const row of rows) {
+      const ts = new Date(row.time_bucket).toISOString();
+      if (!bucketMap.has(ts)) bucketMap.set(ts, { coinValues: zeroCoinDict(symbols), count: 0 });
+      const entry = bucketMap.get(ts)!;
+      const coin = coinFromSymbol(row.symbol);
+      if (coin) entry.coinValues[coin] = parseFloat(row.bucket_value || '0');
+      entry.count += parseInt(row.bucket_count || '0');
+    }
+
     let cumulative = 0;
-    const result = {
-      period: hours,
-      data: data.map(row => {
-        const total = parseFloat(row.btc_value) + parseFloat(row.eth_value) + parseFloat(row.sol_value);
+    const data = Array.from(bucketMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([ts, { coinValues, count }]) => {
+        const total = Object.values(coinValues).reduce((s, v) => s + v, 0);
         cumulative += total;
-        return {
-          timestamp: row.time_bucket,
-          BTC: parseFloat(row.btc_value),
-          ETH: parseFloat(row.eth_value),
-          SOL: parseFloat(row.sol_value),
-          total,
-          count: parseInt(row.total_count),
-          Cumulative: cumulative
-        };
-      })
-    };
-    
+        return buildAdditiveRow(ts, coinValues, { total, count, Cumulative: cumulative });
+      });
+
+    const result = { period: hours, data };
     await setCache(cacheKey, result, 60);
     res.json(result);
   } catch (error) {
@@ -2342,12 +2325,12 @@ router.get('/adl-chart', async (req: Request, res: Response) => {
 router.get('/adl-summary', async (req: Request, res: Response) => {
   const period = req.query.period as string || '7d';
   const cacheKey = `analytics:adl_summary:${period}`;
-  
+
   const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
   }
-  
+
   const intervalMap: Record<string, string> = {
     '24h': '24 hours',
     '7d': '7 days',
@@ -2355,37 +2338,40 @@ router.get('/adl-summary', async (req: Request, res: Response) => {
     'all': '365 days'
   };
   const interval = intervalMap[period] || '7 days';
-  
+
   try {
-    const data = await query<{
-      total_value: string;
-      total_count: string;
-      btc_value: string;
-      eth_value: string;
-      sol_value: string;
-    }>(`
-      SELECT 
-        COALESCE(SUM(value), 0) as total_value,
-        COUNT(*) as total_count,
-        COALESCE(SUM(CASE WHEN symbol = 'BTC-USD' THEN value END), 0) as btc_value,
-        COALESCE(SUM(CASE WHEN symbol = 'ETH-USD' THEN value END), 0) as eth_value,
-        COALESCE(SUM(CASE WHEN symbol = 'SOL-USD' THEN value END), 0) as sol_value
-      FROM adl_events
-      WHERE timestamp > NOW() - INTERVAL '${interval}'
-    `);
-    
-    const row = data[0];
+    // Totals plus per-symbol breakdown, dynamically grouped.
+    const [totals, bySymbol] = await Promise.all([
+      query<{ total_value: string; total_count: string }>(`
+        SELECT
+          COALESCE(SUM(value), 0) as total_value,
+          COUNT(*) as total_count
+        FROM adl_events
+        WHERE timestamp > NOW() - INTERVAL '${interval}'
+      `),
+      query<{ symbol: string; sym_value: string }>(`
+        SELECT symbol, COALESCE(SUM(value), 0) as sym_value
+        FROM adl_events
+        WHERE timestamp > NOW() - INTERVAL '${interval}'
+        GROUP BY symbol
+      `),
+    ]);
+
+    const symbols = await getActiveSymbols();
+    const byAsset: Record<string, number> = zeroCoinDict(symbols);
+    for (const r of bySymbol) {
+      const coin = coinFromSymbol(r.symbol);
+      if (coin) byAsset[coin] = parseFloat(r.sym_value || '0');
+    }
+
+    const row = totals[0];
     const result = {
       period,
-      totalValue: parseFloat(row.total_value),
-      totalCount: parseInt(row.total_count),
-      byAsset: {
-        BTC: parseFloat(row.btc_value),
-        ETH: parseFloat(row.eth_value),
-        SOL: parseFloat(row.sol_value)
-      }
+      totalValue: parseFloat(row?.total_value || '0'),
+      totalCount: parseInt(row?.total_count || '0'),
+      byAsset, // full dict with every coin — old consumers reading .BTC/.ETH/.SOL still work
     };
-    
+
     await setCache(cacheKey, result, 60);
     res.json(result);
   } catch (error) {
@@ -2501,6 +2487,56 @@ router.get('/orderbook/:coin', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error fetching order book:', error);
     res.status(500).json({ error: 'Failed to fetch order book' });
+  }
+});
+
+// ============ EXCHANGE INFO (list of all markets from BULK) ============
+
+// Proxy BULK's /exchangeInfo so the frontend doesn't have to hit the external
+// API directly (avoids CORS, adds caching, normalizes the shape). This drives
+// the dynamic coin list that powers every chart's coin selector — whenever
+// BULK lists a new market, it shows up here automatically.
+//
+// Cached aggressively (5 minutes) because market metadata changes infrequently.
+router.get('/exchange-info', async (_req: Request, res: Response) => {
+  const cacheKey = 'analytics:exchange_info';
+
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+
+  try {
+    const upstream = await fetch(`${BULK_API_BASE}/exchangeInfo`);
+    if (!upstream.ok) {
+      console.error(`BULK /exchangeInfo returned ${upstream.status}`);
+      return res.status(502).json({ error: 'Upstream exchange info unavailable' });
+    }
+    const raw: any = await upstream.json();
+
+    // BULK returns an array of market objects. Normalize each to the minimal
+    // shape the frontend needs — we can add more fields later as needed.
+    const markets = Array.isArray(raw)
+      ? raw
+          .filter((m: any) => m && typeof m.symbol === 'string')
+          .map((m: any) => ({
+            symbol: String(m.symbol),                              // e.g. "BTC-USD"
+            coin: String(m.baseAsset || m.symbol.replace('-USD', '')), // e.g. "BTC"
+            quoteAsset: String(m.quoteAsset || 'USDC'),
+            status: String(m.status || 'TRADING'),
+            maxLeverage: Number(m.maxLeverage || 0),
+            tickSize: Number(m.tickSize || 0),
+            lotSize: Number(m.lotSize || 0),
+            minNotional: Number(m.minNotional || 0),
+          }))
+      : [];
+
+    const result = { markets, count: markets.length, timestamp: Date.now() };
+    await setCache(cacheKey, result, 300); // 5-minute TTL
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching exchange info:', error);
+    res.status(500).json({ error: 'Failed to fetch exchange info' });
   }
 });
 
