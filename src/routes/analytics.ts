@@ -2387,15 +2387,18 @@ router.get('/adl-summary', async (req: Request, res: Response) => {
 // auto-refresh every few seconds without hammering BULK when many users are on
 // the page. Cache TTL is deliberately short (2s) to keep data fresh.
 //
-// Only BTC-USD / ETH-USD / SOL-USD are allowed here to match the rest of the
-// site; the BULK endpoint itself supports more markets.
+// Any market BULK has listed is valid — the whitelist is resolved at request
+// time from /exchangeInfo (via the shared getActiveSymbols helper) rather
+// than being a hardcoded list, so new coins become queryable automatically.
 router.get('/orderbook/:coin', async (req: Request, res: Response) => {
   const coinParam = String(req.params.coin || '').toUpperCase();
-
-  // Whitelist input to prevent arbitrary proxying and inject-style abuse.
-  const ALLOWED = new Set(['BTC-USD', 'ETH-USD', 'SOL-USD']);
   const coin = coinParam.endsWith('-USD') ? coinParam : `${coinParam}-USD`;
-  if (!ALLOWED.has(coin)) {
+
+  // Validate against the live set of BULK markets. This both prevents arbitrary
+  // proxying (can't pass ../../.. style strings through to BULK) and keeps the
+  // error messaging consistent with what the frontend knows about.
+  const allowed = await getActiveSymbols();
+  if (!allowed.includes(coin)) {
     return res.status(400).json({ error: `Unsupported market: ${coinParam}` });
   }
 
