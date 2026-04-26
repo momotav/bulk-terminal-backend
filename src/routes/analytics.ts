@@ -2493,6 +2493,85 @@ router.get('/orderbook/:coin', async (req: Request, res: Response) => {
   }
 });
 
+// ============ RISK SURFACES (margin model per coin) ============
+
+// Proxy BULK's /riskSurfaces with caching. The upstream response is heavy
+// (~500KB uncompressed per coin — 2 sides × ~9 regimes × 21 notionals × 50
+// leverages, each cell has 3 numbers), so we cache aggressively. The surfaces
+// themselves change infrequently (the config is tuned per-market and rolled
+// out in discrete upgrades), while the `liveRegime` pointer changes more
+// often but is a small integer the frontend could poll cheaply if needed.
+// A 5-minute TTL balances freshness with cost — at this rate we hit BULK at
+// most 12 times an hour per coin regardless of how many users are looking.
+//
+// We also strip the response down in one small way: numbers arrive as JSON
+// floats (e.g. `0.020000000000000001`), which JSON.stringify serializes at
+// full precision; we round mmrO/mmrE/p to 6 decimals before sending so
+// the payload is ~35% smaller without any visible loss. The surface itself
+// is unchanged.
+router.get('/risk-surfaces/:coin', async (req: Request, res: Response) => {
+  const coinParam = String(req.params.coin || '').toUpperCase();
+  const coin = coinParam.endsWith('-USD') ? coinParam : `${coinParam}-USD`;
+
+  // Same validation pattern as /orderbook — only allow markets BULK actually
+  // lists, prevent arbitrary string injection into the upstream URL.
+  const allowed = await getActiveSymbols();
+  if (!allowed.includes(coin)) {
+    return res.status(400).json({ error: `Unsupported market: ${coinParam}` });
+  }
+
+  const cacheKey = `analytics:risk_surfaces:${coin}`;
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+
+  try {
+    const url = `${BULK_API_BASE}/riskSurfaces?market=${encodeURIComponent(coin)}`;
+    const upstream = await fetch(url);
+    if (!upstream.ok) {
+      console.error(`BULK /riskSurfaces returned ${upstream.status} for ${coin}`);
+      return res.status(502).json({ error: 'Upstream risk surfaces unavailable' });
+    }
+    const raw: any = await upstream.json();
+
+    // Defensive shape check: we require symbol + at least one surface entry.
+    // The surfaces array is regime-indexed; an empty array would render to an
+    // empty heatmap, which is confusing — better to surface an upstream error.
+    if (!raw || typeof raw !== 'object' || !Array.isArray(raw.surfaces) || raw.surfaces.length === 0) {
+      console.error('Unexpected /riskSurfaces shape:', JSON.stringify(raw).slice(0, 200));
+      return res.status(502).json({ error: 'Malformed upstream response' });
+    }
+
+    // Round numeric fields to 6 decimals. JSON.stringify of IEEE-754 floats
+    // like 0.020000000000000001 expands to full precision, which isn't useful
+    // and bloats the payload. 6 decimals == 1e-6 precision == ~100x finer
+    // than any MM value the frontend will render.
+    const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
+    const trimmed = {
+      symbol: String(raw.symbol ?? coin),
+      liveRegime: Number(raw.liveRegime ?? 0),
+      surfaces: raw.surfaces.map((s: any) => ({
+        regime: Number(s.regime),
+        leverage: (s.leverage ?? []).map(Number),
+        notionals: (s.notionals ?? []).map(Number),
+        buy:  (s.buy  ?? []).map((row: any[]) =>
+          row.map((c: any) => ({ mmrO: round6(Number(c.mmrO)), mmrE: round6(Number(c.mmrE)), p: round6(Number(c.p)) }))),
+        sell: (s.sell ?? []).map((row: any[]) =>
+          row.map((c: any) => ({ mmrO: round6(Number(c.mmrO)), mmrE: round6(Number(c.mmrE)), p: round6(Number(c.p)) }))),
+      })),
+      corrs: Array.isArray(raw.corrs) ? raw.corrs : [],
+    };
+
+    // 5-minute cache — surfaces rarely change, liveRegime refreshes acceptably.
+    await setCache(cacheKey, trimmed, 300);
+    return res.json(trimmed);
+  } catch (err) {
+    console.error(`Failed to fetch /riskSurfaces for ${coin}:`, err);
+    return res.status(502).json({ error: 'Failed to fetch risk surfaces' });
+  }
+});
+
 // ============ EXCHANGE INFO (list of all markets from BULK) ============
 
 // Proxy BULK's /exchangeInfo so the frontend doesn't have to hit the external
