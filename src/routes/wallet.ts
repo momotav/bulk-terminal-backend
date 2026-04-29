@@ -3,6 +3,7 @@ import { query, queryOne } from '../db';
 import { bulkApi } from '../services/bulkApi';
 import { requireAuth } from '../middleware/auth';
 import { getCache, setCache } from '../services/cache';
+import { resolveHierarchy } from '../services/accountResolver';
 
 const router = Router();
 
@@ -174,6 +175,174 @@ router.get('/:address/liquidations', async (req: Request, res: Response) => {
     res.status(500).json({ error: error.message || 'Failed to fetch liquidations' });
   }
 });
+
+// GET /wallet/:address/hierarchy - Account hierarchy (master/sub-account/multisig)
+//
+// Returns the hierarchy view PLUS a financial snapshot per account so the
+// frontend can render a single table without N additional round-trips.
+//
+// Response shape:
+//   {
+//     address, kind, parent?, subAccounts, multisigAccounts,
+//     summaries: {
+//       [pubkey]: {
+//         totalBalance, availableBalance, marginUsed, notional,
+//         unrealizedPnl, realizedPnl, positionsCount
+//       }
+//     }
+//   }
+//
+// The hierarchy itself is resolved through accountResolver (24h cache).
+// Per-account summaries are short-lived (60s) since balances drift
+// continuously with mark price.
+router.get('/:address/hierarchy', async (req: Request, res: Response) => {
+  try {
+    const { address } = req.params;
+    if (!address || address.length < 32) {
+      return res.status(400).json({ error: 'Invalid address' });
+    }
+    const hierarchy = await resolveHierarchy(address);
+
+    // Build the list of pubkeys we need balance summaries for. For a master
+    // it's the master itself + each sub-account; for a sub-account it's just
+    // the sub-account (the frontend banner doesn't need the master's
+    // balance). For Unknown/multisig accounts we still try to summarize the
+    // address itself so the frontend has something to display.
+    const pubkeys: string[] = [address];
+    if (hierarchy.kind === 'MasterEOA') {
+      for (const sa of hierarchy.subAccounts) pubkeys.push(sa.pubkey);
+    }
+
+    // Cache key for the per-pubkey financial snapshot. Short TTL because
+    // balances move with mark price.
+    const SUMMARY_TTL = 60;
+    const summaries: Record<string, unknown> = {};
+    await Promise.all(
+      pubkeys.map(async (pk) => {
+        const cacheKey = `wallet:summary:${pk}`;
+        const cached = await getCache<unknown>(cacheKey);
+        if (cached) {
+          summaries[pk] = cached;
+          return;
+        }
+        const acc = await bulkApi.getFullAccount(pk);
+        if (!acc) return;
+        const summary = {
+          totalBalance: acc.margin?.totalBalance ?? 0,
+          availableBalance: acc.margin?.availableBalance ?? 0,
+          marginUsed: acc.margin?.marginUsed ?? 0,
+          // notional/unrealized/realized may not be on the margin object on all
+          // BULK API versions — fall back to summing positions when missing.
+          notional:
+            (acc.margin as any)?.notional ??
+            acc.positions?.reduce((s, p) => s + (p.notional || 0), 0) ??
+            0,
+          unrealizedPnl:
+            acc.margin.unrealizedPnl ??
+            acc.positions?.reduce((s, p) => s + (p.unrealizedPnl || 0), 0) ??
+            0,
+          realizedPnl: acc.margin.realizedPnl ?? 0,
+          positionsCount: acc.positions?.length ?? 0,
+        };
+        await setCache(cacheKey, summary, SUMMARY_TTL);
+        summaries[pk] = summary;
+      })
+    );
+
+    res.json({ ...hierarchy, summaries });
+  } catch (error: any) {
+    console.error('Hierarchy lookup failed:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch hierarchy' });
+  }
+});
+
+// GET /wallet/:address/activity - Activity timeline (deposits, withdrawals,
+// transfers, sub-account events, multisig events).
+//
+// Proxies BULK's `activityHistory` query, then enriches each event by
+// resolving the `from` and `to` pubkeys through accountResolver. This means
+// sub-accounts surface as e.g. "alice's farm" instead of opaque off-curve
+// addresses, which is the whole point of building this on top of the
+// resolver.
+//
+// Caching: 30-second TTL. Activity events are immutable once written, but
+// new events arrive frequently for active wallets so we don't want to cache
+// for too long. 30s is short enough that the timeline feels live without
+// hammering BULK on every page load.
+//
+// The frontend can request `?limit=N` to cap response size; default 50.
+router.get('/:address/activity', async (req: Request, res: Response) => {
+  try {
+    const { address } = req.params;
+    if (!address || address.length < 32) {
+      return res.status(400).json({ error: 'Invalid address' });
+    }
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '50')) || 50, 1), 200);
+
+    // Cache key includes the limit so a request for 200 isn't served the
+    // truncated 50-event response.
+    const cacheKey = `wallet:activity:${address}:${limit}`;
+    const cached = await getCache<unknown>(cacheKey);
+    if (cached) return res.json(cached);
+
+    const events = await bulkApi.getActivityHistory(address);
+    const truncated = events.slice(0, limit);
+
+    // Enrich with resolver labels. We only resolve unique pubkeys to avoid
+    // hammering the resolver cache for repeated counterparties (e.g. a wallet
+    // that received 50 transfers from the same source).
+    const uniqueAddrs = new Set<string>();
+    for (const e of truncated) {
+      if (e.from) uniqueAddrs.add(e.from);
+      if (e.to) uniqueAddrs.add(e.to);
+    }
+    // Skip the system program (Solana's all-1s pubkey) — it's not a real
+    // account and would cost a wasted resolver lookup.
+    uniqueAddrs.delete('11111111111111111111111111111111');
+
+    // Resolve all unique pubkeys in parallel. The resolver caches per-pubkey
+    // for 24h so this is cheap on repeat calls.
+    const labelMap = new Map<string, string>();
+    await Promise.all(
+      Array.from(uniqueAddrs).map(async (pk) => {
+        try {
+          const h = await resolveHierarchy(pk);
+          if (h.kind === 'SubAccount' && h.parent) {
+            // Look up the master to find this sub-account's name.
+            const master = await resolveHierarchy(h.parent);
+            const ref = master.subAccounts.find((s) => s.pubkey === pk);
+            const name = ref?.name ?? 'sub-account';
+            labelMap.set(pk, `${name} (${shortAddr(h.parent)}'s sub-account)`);
+          }
+          // Masters and Unknown accounts use their pubkey as-is — the
+          // frontend formats them via formatAddress() for display.
+        } catch {
+          // Resolver failure is non-fatal — the event still renders, just
+          // without a friendly label.
+        }
+      })
+    );
+
+    const enriched = truncated.map((e) => ({
+      ...e,
+      fromLabel: e.from ? labelMap.get(e.from) : undefined,
+      toLabel: e.to ? labelMap.get(e.to) : undefined,
+    }));
+
+    const response = { address, data: enriched, count: enriched.length };
+    await setCache(cacheKey, response, 30);
+    res.json(response);
+  } catch (error: any) {
+    console.error('Activity lookup failed:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch activity' });
+  }
+});
+
+// Helper used inline above for sub-account label rendering.
+function shortAddr(a: string): string {
+  if (!a || a.length < 12) return a;
+  return `${a.slice(0, 4)}…${a.slice(-4)}`;
+}
 
 // ============ WATCHLIST (requires auth) ============
 
