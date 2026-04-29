@@ -310,7 +310,7 @@ router.get('/:address/activity', async (req: Request, res: Response) => {
           if (h.kind === 'SubAccount' && h.parent) {
             // Look up the master to find this sub-account's name.
             const master = await resolveHierarchy(h.parent);
-            const ref = master.subAccounts.find((s) => s.pubkey === pk);
+            const ref = master.subAccounts.find((s: { pubkey: string; name?: string }) => s.pubkey === pk);
             const name = ref?.name ?? 'sub-account';
             labelMap.set(pk, `${name} (${shortAddr(h.parent)}'s sub-account)`);
           }
