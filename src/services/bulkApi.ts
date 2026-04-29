@@ -28,6 +28,15 @@ export interface Position {
 }
 
 export interface FullAccount {
+  // v1.0.14 hierarchy fields. Optional on the type because BULK omits them
+  // when not applicable (e.g. masters with no sub-accounts have no
+  // `subAccounts` field at all rather than an empty array).
+  kind?: 'MasterEOA' | 'SubAccount';
+  parent?: string;                          // present on sub-accounts only
+  subAccounts?: { pubkey: string; name?: string }[]; // present on masters with children
+  multisigAccounts?: string[];              // multisigs this account is a member of
+  authorizedAgentWallets?: string[];
+
   margin: {
     totalBalance: number;
     availableBalance: number;
@@ -43,6 +52,40 @@ interface AccountResponse {
   fullAccount?: FullAccount;
   orderHistory?: unknown;
   fills?: unknown[];
+  activityHistory?: ActivityEvent;
+}
+
+// Single row from BULK's `activityHistory` query. One physical event per row,
+// wrapped in a single-key envelope by the upstream API.
+//
+// Possible activityType values (v1.0.14, may grow over time):
+//   - "deposit"          : on-chain deposit landed (from = system program)
+//   - "withdrawal"       : tokens left the protocol
+//   - "transfer"         : protocol-native internal/external transfer
+//   - "createSubAccount" : sub-account created under master
+//   - "removeSubAccount" : sub-account removed (auto-sweeps balance to master)
+//   - "renameSubAccount" : sub-account renamed (pubkey preserved)
+//   - "multisigCreated"  : new multisig account created
+//   - "proposalCreated", "proposalApproved", "proposalReadyForExecution",
+//     "proposalExecuted", "proposalFailed", "proposalExpired",
+//     "proposalCancelled", "proposalRejected" : multisig proposal lifecycle
+//
+// We model `activityType` as `string` to forward-compat unknown future events
+// rather than coercing them into an enum that breaks on new values.
+export interface ActivityEvent {
+  activityType: string;
+  status: string;             // "completed" | "failed" | etc.
+  from?: string;              // source pubkey (system program "1111...111" for deposits)
+  to?: string;                // destination pubkey
+  symbol?: string;            // token symbol for transfers (e.g. "USDC")
+  amount?: number;
+  iso?: boolean;
+  slot?: number;              // Solana slot number
+  timestamp: number;          // nanoseconds (BULK convention)
+  sequence?: number;
+  // Multisig-specific fields likely appear here once that flow is active.
+  // We pass them through untyped via a [k:string]:unknown index signature on
+  // consumers when needed.
 }
 
 class BulkApiService {
@@ -146,6 +189,33 @@ class BulkApiService {
     } catch (error) {
       console.error(`Failed to fetch account for ${walletAddress}:`, error);
       return null;
+    }
+  }
+
+  // Fetch activity history (deposits, withdrawals, transfers, sub-account
+  // events, multisig events) for a wallet.
+  //
+  // BULK returns these wrapped in single-key envelopes:
+  //   [{ "activityHistory": {...event...} }, ...]
+  // We unwrap to a flat ActivityEvent[] and trust BULK's ordering. If BULK
+  // truncates / paginates we handle it at the caller; this method just hands
+  // back what came down the wire.
+  async getActivityHistory(walletAddress: string): Promise<ActivityEvent[]> {
+    try {
+      const res = await fetch(`${this.baseUrl}/account`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'activityHistory', user: walletAddress }),
+      });
+      if (!res.ok) return [];
+      const data = await res.json() as AccountResponse[];
+      if (!Array.isArray(data)) return [];
+      return data
+        .map((row) => row.activityHistory)
+        .filter((e): e is ActivityEvent => Boolean(e));
+    } catch (error) {
+      console.error(`Failed to fetch activity history for ${walletAddress}:`, error);
+      return [];
     }
   }
 
