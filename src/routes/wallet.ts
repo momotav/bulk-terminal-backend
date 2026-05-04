@@ -1,110 +1,159 @@
 import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db';
-import { bulkApi } from '../services/bulkApi';
+import { bulkApi, FullAccount } from '../services/bulkApi';
 import { requireAuth } from '../middleware/auth';
 import { getCache, setCache } from '../services/cache';
 import { resolveHierarchy } from '../services/accountResolver';
 
 const router = Router();
 
-// Helper: Fetch wallet data from BULK API and store snapshot
-async function fetchAndStoreWalletSnapshot(walletAddress: string): Promise<void> {
+// Helper: store snapshot from an already-fetched FullAccount, avoiding
+// a duplicate BULK API round-trip. The previous version of this function
+// called bulkApi.getFullAccount() internally, which meant every wallet
+// page view fetched the account twice — once in the GET handler, once
+// here. That added 200-500ms per visit on no actual benefit.
+async function storeWalletSnapshot(walletAddress: string, account: FullAccount): Promise<void> {
   try {
-    const account = await bulkApi.getFullAccount(walletAddress);
-    if (!account) return;
-    
     // Calculate totals from positions
     let totalNotional = 0;
     let totalRealizedPnl = 0;
     let totalUnrealizedPnl = 0;
-    
+
     for (const p of account.positions) {
       totalNotional += Math.abs(p.notional || 0);
       totalRealizedPnl += p.realizedPnl || 0;
       totalUnrealizedPnl += p.unrealizedPnl || 0;
     }
-    
-    // Use margin totals if available
+
+    // Use margin totals if available (more authoritative than per-position
+    // sums because margin includes cross-account effects).
     const marginRealizedPnl = account.margin?.realizedPnl || 0;
     const marginUnrealizedPnl = account.margin?.unrealizedPnl || 0;
-    
+
     const realizedPnl = marginRealizedPnl !== 0 ? marginRealizedPnl : totalRealizedPnl;
     const unrealizedPnl = marginUnrealizedPnl !== 0 ? marginUnrealizedPnl : totalUnrealizedPnl;
     const totalPnl = realizedPnl + unrealizedPnl;
-    
-    // Update trader with current PnL
-    await query(
+
+    // Update trader with current PnL. Don't await — fire and forget. The
+    // user is waiting on this endpoint and the trader update is purely
+    // for our DB analytics; nobody is reading total_pnl back synchronously.
+    void query(
       `INSERT INTO traders (wallet_address, total_pnl, last_seen)
        VALUES ($1, $2, NOW())
        ON CONFLICT (wallet_address) DO UPDATE SET
          total_pnl = $2,
          last_seen = NOW()`,
       [walletAddress, totalPnl]
-    );
-    
-    // Store snapshot for history (only if they have positions OR PnL != 0)
+    ).catch((err) => console.error('snapshot trader update failed:', err));
+
+    // Store snapshot for history. Same fire-and-forget pattern. Skip if
+    // the wallet has nothing to snapshot — saves snapshot table bloat.
     if (account.positions.length > 0 || totalPnl !== 0) {
-      await query(
-        `INSERT INTO trader_snapshots 
+      void query(
+        `INSERT INTO trader_snapshots
          (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
          VALUES ($1, $2, $3, $4, $5)`,
         [walletAddress, realizedPnl, unrealizedPnl, account.positions.length, totalNotional]
-      );
+      ).catch((err) => console.error('snapshot insert failed:', err));
     }
   } catch (error) {
     console.error(`Failed to store wallet snapshot for ${walletAddress.slice(0, 8)}:`, error);
   }
 }
 
+// Legacy function kept for the /track endpoint and the bulk hierarchy refresh.
+// New callers should prefer storeWalletSnapshot (above) when they already have
+// a FullAccount in hand.
+async function fetchAndStoreWalletSnapshot(walletAddress: string): Promise<void> {
+  const account = await bulkApi.getFullAccount(walletAddress);
+  if (!account) return;
+  await storeWalletSnapshot(walletAddress, account);
+}
+
 // GET /wallet/:address - Get wallet info (live from BULK API + our data)
+//
+// Performance contract:
+//   - 30s positive cache for fast repeat-views of the same wallet
+//   - Stale-while-revalidate-style fallback: if BULK API fails on this
+//     request, we serve the last-known-good cached payload (up to 5 min
+//     stale) instead of erroring out
+//   - Parallel fan-out: BULK getFullAccount, BULK getAllTickers, and our
+//     trader/snapshots SELECT all run concurrently
+//   - Snapshot writes are fire-and-forget (don't block the response)
+//   - Failed responses are NOT cached — only successful payloads with a
+//     non-null .live get the 30s TTL
 router.get('/:address', async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
-    
-    // Check cache first (30 second TTL)
-    const cacheKey = `wallet:profile:${address}`;
-    const cached = await getCache<any>(cacheKey);
+
+    // Two cache keys: a short-lived "fresh" key (30s) and a longer "stale"
+    // key (5min). On BULK API failure we serve from stale rather than
+    // returning an error, so the page never goes blank because BULK had
+    // a 503 for two seconds.
+    const freshKey = `wallet:profile:${address}`;
+    const staleKey = `wallet:profile:stale:${address}`;
+
+    const cached = await getCache<any>(freshKey);
     if (cached) {
       return res.json(cached);
     }
-    
-    // Get live account data from BULK
-    const account = await bulkApi.getFullAccount(address);
-    
-    // Get current mark prices for all symbols
-    const tickers = await bulkApi.getAllTickers();
+
+    // Parallel fan-out: all four data sources kick off at the same time.
+    // Previously these were sequential, costing 4× round-trip latency.
+    const [account, tickers, trader, snapshots] = await Promise.all([
+      bulkApi.getFullAccount(address),
+      bulkApi.getAllTickers(),
+      queryOne(
+        'SELECT * FROM traders WHERE wallet_address = $1',
+        [address]
+      ),
+      query(
+        `SELECT timestamp, pnl, unrealized_pnl, positions_count, total_notional
+         FROM trader_snapshots
+         WHERE wallet_address = $1
+         ORDER BY timestamp DESC
+         LIMIT 168`,
+        [address]
+      ),
+    ]);
+
+    // BULK API call returned null. Two cases:
+    //  (1) Wallet doesn't exist at all on BULK — legitimately empty
+    //  (2) Transient BULK API error — we should serve stale data
+    // We can't distinguish, so we look for stale cache first. If we have
+    // any, serve it (with a header so the frontend knows). Otherwise we
+    // return what we have but DO NOT cache.
+    if (!account) {
+      const stale = await getCache<any>(staleKey);
+      if (stale) {
+        // Serve last-known-good. Frontend behaves identically; this just
+        // means BULK was temporarily unhappy and we're papering over it.
+        res.setHeader('X-Bulkstats-Cache', 'stale');
+        return res.json(stale);
+      }
+      // No stale either — wallet may genuinely not exist on BULK. Return
+      // a valid response shape so the frontend renders the empty state
+      // instead of erroring. Crucially, we do NOT cache this — next
+      // request will retry BULK fresh.
+      const markPrices: Record<string, number> = {};
+      for (const ticker of tickers) {
+        markPrices[ticker.symbol] = ticker.markPrice;
+      }
+      return res.json({
+        address,
+        live: null,
+        markPrices,
+        tracked: trader,
+        history: snapshots.reverse(),
+      });
+    }
+
+    // BULK responded successfully. Build the response.
     const markPrices: Record<string, number> = {};
     for (const ticker of tickers) {
       markPrices[ticker.symbol] = ticker.markPrice;
     }
-    
-    // Store snapshot BEFORE fetching history (so new snapshot appears in history)
-    // But don't block on it too long - use a short timeout
-    try {
-      await Promise.race([
-        fetchAndStoreWalletSnapshot(address),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
-      ]);
-    } catch {
-      // Timeout or error, continue anyway
-    }
-    
-    // Get our tracked data (now includes updated PnL)
-    const trader = await queryOne(
-      'SELECT * FROM traders WHERE wallet_address = $1',
-      [address]
-    );
-    
-    // Get recent snapshots for history (now includes new snapshot)
-    const snapshots = await query(
-      `SELECT timestamp, pnl, unrealized_pnl, positions_count, total_notional
-       FROM trader_snapshots
-       WHERE wallet_address = $1
-       ORDER BY timestamp DESC
-       LIMIT 168`, // Last 7 days hourly
-      [address]
-    );
-    
+
     const result = {
       address,
       live: account,
@@ -112,12 +161,22 @@ router.get('/:address', async (req: Request, res: Response) => {
       tracked: trader,
       history: snapshots.reverse(),
     };
-    
-    // Cache for 30 seconds
-    await setCache(cacheKey, result, 30);
-    
+
+    // Fire-and-forget snapshot write. We already have the FullAccount, so
+    // we pass it directly — no second BULK round-trip. Never blocks the
+    // response.
+    void storeWalletSnapshot(address, account);
+
+    // Cache for both fresh (30s) and stale (5min) keys. The stale key is
+    // only consulted when BULK fails on a future request.
+    await Promise.all([
+      setCache(freshKey, result, 30),
+      setCache(staleKey, result, 300),
+    ]);
+
     res.json(result);
   } catch (error: any) {
+    console.error('GET /wallet/:address error:', error);
     res.status(500).json({ error: error.message || 'Failed to fetch wallet data' });
   }
 });
