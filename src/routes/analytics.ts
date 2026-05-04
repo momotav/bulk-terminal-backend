@@ -2622,4 +2622,53 @@ router.get('/exchange-info', async (_req: Request, res: Response) => {
   }
 });
 
+// ----------------------------------------------------------------------------
+// GET /candles/:symbol?interval=1h&limit=100
+//
+// Thin proxy + cache around BULK's /klines endpoint. The frontend uses this
+// to render a price chart inside the position-detail modal on the wallet
+// page (with entry, mark, and liquidation prices drawn as horizontal lines).
+//
+// We do NOT hit BULK directly from the frontend because:
+//   - frontend doesn't know which interval/limit defaults are sane
+//   - we want a small cache so the same market opened repeatedly during a
+//     stream doesn't hammer BULK's API
+//
+// 30-second cache. Candles update slowly, but we don't want stale data
+// during a live stream where the chart is on screen for minutes.
+// ----------------------------------------------------------------------------
+router.get('/candles/:symbol', async (req: Request, res: Response) => {
+  const rawSymbol = String(req.params.symbol || '').toUpperCase();
+  const symbol = rawSymbol.endsWith('-USD') ? rawSymbol : `${rawSymbol}-USD`;
+
+  // Validate against active markets so we can't be turned into an open
+  // proxy for arbitrary BULK requests.
+  const allowed = await getActiveSymbols();
+  if (!allowed.includes(symbol)) {
+    return res.status(400).json({ error: `Unsupported market: ${rawSymbol}` });
+  }
+
+  // Constrain interval/limit to documented BULK values.
+  const validIntervals = new Set(['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']);
+  const interval = validIntervals.has(String(req.query.interval || ''))
+    ? String(req.query.interval)
+    : '1h';
+  const limitNum = parseInt(String(req.query.limit ?? '100'), 10);
+  const limit = Math.min(Math.max(Number.isFinite(limitNum) ? limitNum : 100, 1), 500);
+
+  const cacheKey = `analytics:candles:${symbol}:${interval}:${limit}`;
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const klines = await fetchKlines(symbol, interval, limit);
+    const result = { symbol, interval, limit, candles: klines };
+    await setCache(cacheKey, result, 30); // 30-second TTL
+    res.json(result);
+  } catch (error: any) {
+    console.error('Error fetching candles for', symbol, ':', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch candles' });
+  }
+});
+
 export default router;
