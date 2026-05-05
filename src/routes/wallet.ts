@@ -264,10 +264,20 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
     // here because the BULK SDK returns `unknown[]` and we don't want to
     // hard-fail the route on a schema change — better to skip malformed
     // entries than 500 the whole response.
+    //
+    // Symbol matching is tolerant of both formats: BULK's fills API has
+    // historically returned the bare coin ("BTC") in some payloads and
+    // the full pair ("BTC-USD") in others. We accept either by comparing
+    // both shapes — same defensive pattern we use for /regime.
+    const bareCoin = symbol ? symbol.replace(/-USD$/, '') : null;
     const filtered: any[] = [];
     for (const f of allFills as any[]) {
       if (!f || typeof f !== 'object') continue;
-      if (symbol && f.symbol !== symbol) continue;
+      if (symbol) {
+        const fSym = String(f.symbol || '');
+        const matches = fSym === symbol || fSym === bareCoin;
+        if (!matches) continue;
+      }
       filtered.push(f);
       if (filtered.length >= limit) break;
     }
