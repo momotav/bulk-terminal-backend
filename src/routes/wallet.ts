@@ -265,18 +265,43 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
     // hard-fail the route on a schema change — better to skip malformed
     // entries than 500 the whole response.
     //
-    // Symbol matching is tolerant of both formats: BULK's fills API has
-    // historically returned the bare coin ("BTC") in some payloads and
-    // the full pair ("BTC-USD") in others. We accept either by comparing
-    // both shapes — same defensive pattern we use for /regime.
+    // Field-name and symbol-format tolerance:
+    //   - Per BULK's v1.0.13 changelog, WS uses compact field names
+    //     (`sym` instead of `symbol`). REST may follow the same convention
+    //     so we accept either.
+    //   - BULK's APIs have historically returned the bare coin ("BTC") in
+    //     some payloads and the full pair ("BTC-USD") in others. We accept
+    //     either by comparing both shapes.
+    //
+    // The first time we get a non-matching fill, we log its raw field set
+    // so it's easy to spot if BULK changes the shape again — the missing
+    // markers showed up because of exactly this kind of silent schema drift.
     const bareCoin = symbol ? symbol.replace(/-USD$/, '') : null;
     const filtered: any[] = [];
+    let firstSampleLogged = false;
     for (const f of allFills as any[]) {
       if (!f || typeof f !== 'object') continue;
+
+      // Read symbol from either field name. Future BULK versions may
+      // converge on one — when that happens, drop the alternative.
+      const fSym = String(f.symbol ?? f.sym ?? '');
+
       if (symbol) {
-        const fSym = String(f.symbol || '');
         const matches = fSym === symbol || fSym === bareCoin;
-        if (!matches) continue;
+        if (!matches) {
+          // Log the first non-matching fill so Railway shows us exactly
+          // what shape BULK is returning. After the first one, stay
+          // silent to avoid log spam.
+          if (!firstSampleLogged) {
+            firstSampleLogged = true;
+            console.log(
+              `[fills filter] no match for "${symbol}" (or "${bareCoin}"). ` +
+                `First fill keys: [${Object.keys(f).join(', ')}], ` +
+                `symbol field: "${fSym}"`
+            );
+          }
+          continue;
+        }
       }
       filtered.push(f);
       if (filtered.length >= limit) break;
