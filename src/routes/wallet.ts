@@ -215,6 +215,72 @@ router.get('/:address/trades', async (req: Request, res: Response) => {
   }
 });
 
+// ============================================================================
+// GET /wallet/:address/fills - Live fills from BULK API for chart overlay
+//
+// Used by the position chart modal to draw markers showing every entry the
+// wallet made on a given market. We pull from BULK directly (not our DB)
+// because users want the freshest data possible — fills that happened
+// 30 seconds ago should show up.
+//
+// Filters by symbol when provided so we don't ship hundreds of unrelated
+// fills to the frontend just to render markers for one market.
+// Cached 60s — fills don't change retroactively, so a minute-stale set is
+// fine even on a stream.
+//
+// Response shape (each fill):
+//   {
+//     timestamp: number (ms),
+//     price: number,
+//     size: number (positive),
+//     isBuy: boolean,
+//     symbol: string,
+//     orderIdMaker?: string,
+//     orderIdTaker?: string,
+//     reasonCode?: string  // e.g. "trade", "liq", "adl"
+//   }
+// ============================================================================
+router.get('/:address/fills', async (req: Request, res: Response) => {
+  try {
+    const { address } = req.params;
+    const symbol = (req.query.symbol as string) || null;
+    // Hard cap to keep payloads sane. 500 fills is plenty for a chart
+    // overlay — beyond that, markers stack and become unreadable anyway.
+    const limit = Math.min(parseInt(req.query.limit as string) || 500, 1000);
+
+    const cacheKey = `wallet:fills:${address}:${symbol || 'all'}:${limit}`;
+    const cached = await getCache<{ fills: unknown[] }>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    // BULK's `fills` API returns the wallet's full fill history with no
+    // server-side symbol filter. We slice it client-side here. The history
+    // is sorted newest-first by BULK; we keep that ordering so the chart
+    // sees the most recent fills if it has to truncate.
+    const allFills = await bulkApi.getFills(address);
+
+    // Each fill has the shape described in the JSDoc above. Type loosely
+    // here because the BULK SDK returns `unknown[]` and we don't want to
+    // hard-fail the route on a schema change — better to skip malformed
+    // entries than 500 the whole response.
+    const filtered: any[] = [];
+    for (const f of allFills as any[]) {
+      if (!f || typeof f !== 'object') continue;
+      if (symbol && f.symbol !== symbol) continue;
+      filtered.push(f);
+      if (filtered.length >= limit) break;
+    }
+
+    const payload = { fills: filtered };
+    await setCache(cacheKey, payload, 60);
+    res.json(payload);
+  } catch (error: any) {
+    console.error('GET /wallet/:address/fills error:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch fills' });
+  }
+});
+
 // GET /wallet/:address/liquidations - Get liquidation history
 router.get('/:address/liquidations', async (req: Request, res: Response) => {
   try {
