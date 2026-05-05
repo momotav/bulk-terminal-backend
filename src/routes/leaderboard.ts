@@ -241,16 +241,16 @@ router.get('/bulk', async (req: Request, res: Response) => {
     url.searchParams.set('page', String(page));
     url.searchParams.set('page_size', String(pageSize));
 
-    let bulkRes: Response | null = null;
+    let bulkRes: globalThis.Response | null = null;
     try {
       // 5s timeout; BULK indexer is fast (<300ms typical) so anything past
       // 5s is a problem and we should fall back to stale.
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
-      bulkRes = (await fetch(url.toString(), {
+      bulkRes = await fetch(url.toString(), {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
-      })) as unknown as Response;
+      });
       clearTimeout(timer);
     } catch (err) {
       console.error('BULK indexer fetch failed:', err);
