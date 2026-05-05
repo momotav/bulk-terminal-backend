@@ -282,29 +282,39 @@ class BulkApiService {
         );
         return [];
       }
-      const data = await res.json() as AccountResponse[] | unknown[];
+      const data = await res.json() as unknown[];
       const results: unknown[] = [];
 
-      // BULK's docs say the response is "an array of objects with a single
-      // key per item" — for fills, that should be [{ fills: [...] }]. But
-      // we've seen empty extractions even when fills exist, so handle two
-      // possible shapes:
-      //   1. Wrapped:  [{ fills: [fill, fill, ...] }, ...]  (per docs)
-      //   2. Flat:     [fill, fill, fill, ...]              (compact form)
-      // We detect by sampling the first element. If it has a `fills` key
-      // we use shape 1; otherwise we treat data itself as the fill array.
-      if (Array.isArray(data) && data.length > 0) {
-        const first = data[0] as { fills?: unknown };
-        if (first && typeof first === 'object' && 'fills' in first) {
-          // Wrapped shape — extract from each item's `.fills`.
-          for (const item of data as AccountResponse[]) {
-            if (item && item.fills && Array.isArray(item.fills)) {
-              results.push(...item.fills);
-            }
+      // Real BULK fills response shape (verified from production logs):
+      //   [
+      //     { "fills": { ...one fill object... } },   ← .fills is an OBJECT
+      //     { "fills": { ...one fill object... } },     not an array
+      //     ...
+      //   ]
+      // i.e. each array element wraps exactly one fill under the "fills"
+      // key. Earlier we assumed `.fills` was an array per item — that
+      // assumption silently dropped every fill.
+      //
+      // We also defensively handle two alternate shapes seen in older
+      // BULK versions:
+      //   - Wrapped-array:  [{ fills: [fill, fill, ...] }]
+      //   - Flat:           [fill, fill, ...]
+      // Detection is by inspecting each item's `.fills` value.
+      if (Array.isArray(data)) {
+        for (const raw of data) {
+          if (!raw || typeof raw !== 'object') continue;
+          const item = raw as { fills?: unknown };
+          const f = item.fills;
+          if (Array.isArray(f)) {
+            // wrapped-array shape
+            results.push(...f);
+          } else if (f && typeof f === 'object') {
+            // single-object shape (current production behavior)
+            results.push(f);
+          } else if (!('fills' in item)) {
+            // flat shape — the element itself is the fill
+            results.push(raw);
           }
-        } else {
-          // Flat shape — every element IS a fill. Trust the array directly.
-          results.push(...data);
         }
       }
       // If extraction found nothing, dump the raw BULK response so we
