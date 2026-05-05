@@ -255,15 +255,33 @@ class BulkApiService {
     }
   }
 
-  // Fetch fills (executed trades) for a wallet
+  // Fetch fills (executed trades) for a wallet.
+  //
+  // Heavy wallets (high-volume traders) can have thousands of fills, and
+  // BULK occasionally takes 5-10s to return the full set. We add an
+  // explicit timeout so a slow fills response doesn't bottleneck the
+  // wallet page or chart modal.
+  //
+  // On any error we still return [] so callers don't have to special-case
+  // failures, but we log loudly so Railway logs show the actual reason
+  // when fills appear missing on the frontend.
   async getFills(walletAddress: string): Promise<unknown[]> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
     try {
       const res = await fetch(`${this.baseUrl}/account`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'fills', user: walletAddress }),
+        signal: controller.signal,
       });
-      if (!res.ok) return [];
+      clearTimeout(timer);
+      if (!res.ok) {
+        console.warn(
+          `[bulkApi.getFills] BULK returned ${res.status} for ${walletAddress.slice(0, 8)}…`
+        );
+        return [];
+      }
       const data = await res.json() as AccountResponse[];
       const results: unknown[] = [];
       for (const item of data) {
@@ -271,9 +289,24 @@ class BulkApiService {
           results.push(...item.fills);
         }
       }
+      // Log the count + first symbol so Railway logs make it obvious
+      // whether the issue is "no fills" vs "wrong symbol shape" vs
+      // "BULK timed out".
+      const sample = results[0] as { symbol?: string } | undefined;
+      console.log(
+        `[bulkApi.getFills] ${walletAddress.slice(0, 8)}… → ${results.length} fills` +
+          (sample?.symbol ? ` (sample symbol: "${sample.symbol}")` : '')
+      );
       return results;
-    } catch (error) {
-      console.error(`Failed to fetch fills for ${walletAddress}:`, error);
+    } catch (error: any) {
+      clearTimeout(timer);
+      const reason =
+        error?.name === 'AbortError'
+          ? 'timed out after 8s'
+          : error?.message || 'unknown error';
+      console.error(
+        `[bulkApi.getFills] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
+      );
       return [];
     }
   }
