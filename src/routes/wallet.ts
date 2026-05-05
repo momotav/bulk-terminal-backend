@@ -362,6 +362,119 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
   }
 });
 
+// ============================================================================
+// GET /wallet/:address/closed-positions
+//
+// Returns the wallet's closed-position history from BULK. Each entry is one
+// open→close lifecycle: a position that was opened, possibly added to /
+// reduced over time, and then fully closed. BULK pre-computes realized PnL
+// (net of fees and funding) and exposes both the open and close timestamps.
+//
+// This is what powers the wallet page's "Recent Trades" / "Closed Positions"
+// list — far more useful than raw fills because each row is one decision
+// the trader committed to (entered, exited, here's how it played out).
+//
+// Optional ?symbol filter for symbol-scoped views (e.g. position chart
+// modal might want closed-positions for just BTC-USD).
+//
+// Caching: 60s. Closed positions are immutable (closed = closed) so we
+// can cache aggressively without staleness concerns. Background data
+// collectors might add new closed positions over time, but a 60s
+// freshness window is fine for that.
+// ============================================================================
+router.get('/:address/closed-positions', async (req: Request, res: Response) => {
+  try {
+    const { address } = req.params;
+    const symbol = (req.query.symbol as string) || null;
+    const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
+
+    const cacheKey = `wallet:closed-positions:${address}:${symbol || 'all'}:${limit}`;
+    const cached = await getCache<{ positions: unknown[] }>(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const allPositions = await bulkApi.getClosedPositions(address);
+
+    // Normalize each position to a stable shape. Same defensive approach as
+    // the /fills route: we don't know exactly what fields BULK uses, so we
+    // try common alternatives and log mismatches. After the first real
+    // response in production, we narrow this down to actual field names.
+    function normalizePosition(p: any): any {
+      // Timestamps — likely nanoseconds based on /fills precedent
+      const openTs = Number(p.openTime ?? p.opened ?? p.openTimestamp ?? 0);
+      const closeTs = Number(p.closeTime ?? p.closed ?? p.closeTimestamp ?? 0);
+      const toMs = (ns: number): number =>
+        ns > 1e14 ? Math.floor(ns / 1e6) :
+        ns > 1e11 ? ns :
+        ns * 1000;
+
+      // Size: BULK uses signed sizes for positions. A negative size means
+      // the position was a short. We expose absolute size + a side string
+      // so the frontend doesn't need to know the convention.
+      const rawSize = Number(p.size ?? p.amount ?? 0);
+      const side: 'long' | 'short' =
+        p.side
+          ? String(p.side).toLowerCase() === 'short' ? 'short' : 'long'
+          : rawSize < 0 ? 'short' : 'long';
+
+      return {
+        symbol: String(p.symbol ?? p.sym ?? ''),
+        side,
+        size: Math.abs(rawSize),
+        openPrice: Number(p.openPrice ?? p.entryPrice ?? p.price ?? 0),
+        closePrice: Number(p.closePrice ?? p.exitPrice ?? 0),
+        openedAt: toMs(openTs),
+        closedAt: toMs(closeTs),
+        realizedPnl: Number(p.realizedPnl ?? p.pnl ?? 0),
+        fees: Number(p.fees ?? 0),
+        funding: Number(p.funding ?? 0),
+        leverage: Number(p.leverage ?? 0),
+        // Pass through anything else BULK provides — frontend can ignore
+        // fields it doesn't use.
+        notional: p.notional !== undefined ? Number(p.notional) : undefined,
+        liquidated: Boolean(p.liquidated ?? false),
+      };
+    }
+
+    const bareCoin = symbol ? symbol.replace(/-USD$/, '') : null;
+    const filtered: any[] = [];
+    let firstSampleLogged = false;
+    for (const raw of allPositions as any[]) {
+      if (!raw || typeof raw !== 'object') continue;
+      const p = normalizePosition(raw);
+
+      if (symbol) {
+        const matches = p.symbol === symbol || p.symbol === bareCoin;
+        if (!matches) {
+          if (!firstSampleLogged) {
+            firstSampleLogged = true;
+            console.log(
+              `[closed-positions filter] no match for "${symbol}". ` +
+                `Raw symbol field: "${raw.symbol ?? raw.sym ?? '(missing)'}", ` +
+                `keys: [${Object.keys(raw).join(', ')}]`
+            );
+          }
+          continue;
+        }
+      }
+      filtered.push(p);
+      if (filtered.length >= limit) break;
+    }
+
+    // Sort newest-close first — that's how users expect a "recent" list to
+    // be ordered, and BULK's response order isn't guaranteed.
+    filtered.sort((a, b) => b.closedAt - a.closedAt);
+
+    const payload = { positions: filtered };
+    await setCache(cacheKey, payload, 60);
+    res.json(payload);
+  } catch (error: any) {
+    console.error('GET /wallet/:address/closed-positions error:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch closed positions' });
+  }
+});
+
 // GET /wallet/:address/liquidations - Get liquidation history
 router.get('/:address/liquidations', async (req: Request, res: Response) => {
   try {
