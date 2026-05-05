@@ -276,28 +276,74 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
     // The first time we get a non-matching fill, we log its raw field set
     // so it's easy to spot if BULK changes the shape again — the missing
     // markers showed up because of exactly this kind of silent schema drift.
+    // Normalize each fill to a stable shape so the frontend doesn't need
+    // to know about BULK's quirks. Two important conversions:
+    //   1. timestamp: BULK returns nanoseconds (e.g. 1.77e18). We divide
+    //      by 1e6 to get milliseconds, which is what JS Date and our
+    //      chart library expect.
+    //   2. size: BULK uses `amount` for fill quantity (the position
+    //      schema uses `size`). We expose it as `size` for consistency
+    //      with our type definition.
+    //   3. reasonCode: BULK returns a numeric code AND a string `reason`.
+    //      We pass the string through as `reasonCode` since that's what
+    //      the chart marker logic switches on ("trade" vs "liq" vs "adl").
+    function normalizeFill(f: any): any {
+      const tsRaw = Number(f.timestamp ?? f.time ?? 0);
+      // Heuristic: BULK timestamps are nanoseconds (16+ digits when
+      // looked at as ms). If the value is greater than ~year 5000 in
+      // ms (~1e14), it's nanoseconds and needs scaling down by 1e6.
+      // Anything else we trust as ms or seconds.
+      const tsMs =
+        tsRaw > 1e14 ? Math.floor(tsRaw / 1e6) :
+        tsRaw > 1e11 ? tsRaw : // already ms
+        tsRaw * 1000; // seconds → ms
+
+      return {
+        timestamp: tsMs,
+        symbol: String(f.symbol ?? f.sym ?? ''),
+        price: Number(f.price ?? f.px ?? 0),
+        size: Number(f.amount ?? f.size ?? f.sz ?? 0),
+        isBuy: Boolean(f.isBuy ?? false),
+        // Prefer the string `reason` ("liquidation", "trade") over the
+        // numeric `reasonCode` since the frontend marker logic compares
+        // strings. Map to our standard tokens.
+        reasonCode: ((): string => {
+          const reason = String(f.reason ?? '').toLowerCase();
+          if (reason.includes('liq')) return 'liq';
+          if (reason.includes('adl')) return 'adl';
+          // Numeric fallback when string is missing — based on observed
+          // BULK behavior: 0 = trade, 1 = liq, 2 = adl.
+          const code = Number(f.reasonCode ?? 0);
+          if (code === 1) return 'liq';
+          if (code === 2) return 'adl';
+          return 'trade';
+        })(),
+        // Pass through identifiers in case the frontend needs them later.
+        orderIdMaker: f.orderIdMaker,
+        orderIdTaker: f.orderIdTaker,
+        maker: f.maker,
+        taker: f.taker,
+        iso: Boolean(f.iso ?? false),
+        counterpartyHint: f.counterpartyHint,
+      };
+    }
+
     const bareCoin = symbol ? symbol.replace(/-USD$/, '') : null;
     const filtered: any[] = [];
     let firstSampleLogged = false;
-    for (const f of allFills as any[]) {
-      if (!f || typeof f !== 'object') continue;
-
-      // Read symbol from either field name. Future BULK versions may
-      // converge on one — when that happens, drop the alternative.
-      const fSym = String(f.symbol ?? f.sym ?? '');
+    for (const raw of allFills as any[]) {
+      if (!raw || typeof raw !== 'object') continue;
+      const f = normalizeFill(raw);
 
       if (symbol) {
-        const matches = fSym === symbol || fSym === bareCoin;
+        const matches = f.symbol === symbol || f.symbol === bareCoin;
         if (!matches) {
-          // Log the first non-matching fill so Railway shows us exactly
-          // what shape BULK is returning. After the first one, stay
-          // silent to avoid log spam.
           if (!firstSampleLogged) {
             firstSampleLogged = true;
             console.log(
               `[fills filter] no match for "${symbol}" (or "${bareCoin}"). ` +
-                `First fill keys: [${Object.keys(f).join(', ')}], ` +
-                `symbol field: "${fSym}"`
+                `Raw symbol field: "${raw.symbol ?? raw.sym ?? '(missing)'}", ` +
+                `keys: [${Object.keys(raw).join(', ')}]`
             );
           }
           continue;
