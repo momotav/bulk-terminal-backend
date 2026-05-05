@@ -355,6 +355,95 @@ class BulkApiService {
       return [];
     }
   }
+
+  // Fetch closed-position history for a wallet.
+  //
+  // Per BULK docs, `positions` returns the last 5000 closed positions —
+  // each one is a full open→close lifecycle with realized PnL already
+  // computed (with fees and funding accounted for). This is what we
+  // surface as "Recent Trades" on the wallet page: real position-level
+  // events the user cares about, not individual fills.
+  //
+  // Same shape-tolerance and logging strategy as getFills since BULK has
+  // a habit of wrapping responses inconsistently (single-object .X vs
+  // array .X vs flat). The response shape isn't documented yet, so we
+  // dump raw on empty for fast diagnosis.
+  async getClosedPositions(walletAddress: string): Promise<unknown[]> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(`${this.baseUrl}/account`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'positions', user: walletAddress }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        console.warn(
+          `[bulkApi.getClosedPositions] BULK returned ${res.status} for ${walletAddress.slice(0, 8)}…`
+        );
+        return [];
+      }
+      const data = await res.json() as unknown[];
+      const results: unknown[] = [];
+
+      // Try the same three shapes we've seen on /fills. Likely BULK uses
+      // [{ position: {...} }] or [{ positions: [...] }] or flat
+      // [position, ...]. Once we see a real response in the logs, we can
+      // narrow this down.
+      const wrapperKeys = ['position', 'positions', 'closedPosition'];
+      if (Array.isArray(data)) {
+        for (const raw of data) {
+          if (!raw || typeof raw !== 'object') continue;
+          const obj = raw as Record<string, unknown>;
+          let extracted = false;
+          for (const k of wrapperKeys) {
+            if (k in obj) {
+              const v = obj[k];
+              if (Array.isArray(v)) {
+                results.push(...v);
+              } else if (v && typeof v === 'object') {
+                results.push(v);
+              }
+              extracted = true;
+              break;
+            }
+          }
+          if (!extracted) {
+            // Flat shape — the element itself is the position
+            results.push(raw);
+          }
+        }
+      }
+      if (results.length === 0) {
+        try {
+          const preview = JSON.stringify(data).slice(0, 500);
+          console.warn(
+            `[bulkApi.getClosedPositions] EMPTY for ${walletAddress.slice(0, 8)}… — ` +
+              `data type: ${Array.isArray(data) ? `array(${data.length})` : typeof data}, ` +
+              `raw preview: ${preview}`
+          );
+        } catch { /* ignore */ }
+      }
+      const sample = results[0] as { symbol?: string } | undefined;
+      console.log(
+        `[bulkApi.getClosedPositions] ${walletAddress.slice(0, 8)}… → ${results.length} positions` +
+          (sample?.symbol ? ` (sample symbol: "${sample.symbol}")` : '')
+      );
+      return results;
+    } catch (error: any) {
+      clearTimeout(timer);
+      const reason =
+        error?.name === 'AbortError'
+          ? 'timed out after 8s'
+          : error?.message || 'unknown error';
+      console.error(
+        `[bulkApi.getClosedPositions] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
+      );
+      return [];
+    }
+  }
 }
 
 export const bulkApi = new BulkApiService();
