@@ -282,11 +282,46 @@ class BulkApiService {
         );
         return [];
       }
-      const data = await res.json() as AccountResponse[];
+      const data = await res.json() as AccountResponse[] | unknown[];
       const results: unknown[] = [];
-      for (const item of data) {
-        if (item && item.fills && Array.isArray(item.fills)) {
-          results.push(...item.fills);
+
+      // BULK's docs say the response is "an array of objects with a single
+      // key per item" — for fills, that should be [{ fills: [...] }]. But
+      // we've seen empty extractions even when fills exist, so handle two
+      // possible shapes:
+      //   1. Wrapped:  [{ fills: [fill, fill, ...] }, ...]  (per docs)
+      //   2. Flat:     [fill, fill, fill, ...]              (compact form)
+      // We detect by sampling the first element. If it has a `fills` key
+      // we use shape 1; otherwise we treat data itself as the fill array.
+      if (Array.isArray(data) && data.length > 0) {
+        const first = data[0] as { fills?: unknown };
+        if (first && typeof first === 'object' && 'fills' in first) {
+          // Wrapped shape — extract from each item's `.fills`.
+          for (const item of data as AccountResponse[]) {
+            if (item && item.fills && Array.isArray(item.fills)) {
+              results.push(...item.fills);
+            }
+          }
+        } else {
+          // Flat shape — every element IS a fill. Trust the array directly.
+          results.push(...data);
+        }
+      }
+      // If extraction found nothing, dump the raw BULK response so we
+      // can see whether it's truly empty or whether the response shape
+      // doesn't match `[{ fills: [...] }]` (e.g. it might be a flat
+      // array, or use a different wrapper key). Without this, an empty
+      // result is indistinguishable from a parse failure.
+      if (results.length === 0) {
+        try {
+          const preview = JSON.stringify(data).slice(0, 500);
+          console.warn(
+            `[bulkApi.getFills] EMPTY for ${walletAddress.slice(0, 8)}… — ` +
+              `data type: ${Array.isArray(data) ? `array(${data.length})` : typeof data}, ` +
+              `raw preview: ${preview}`
+          );
+        } catch {
+          /* serialization failure shouldn't crash the route */
         }
       }
       // Log the count + first symbol so Railway logs make it obvious
