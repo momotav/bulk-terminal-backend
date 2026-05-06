@@ -401,39 +401,69 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
     // try common alternatives and log mismatches. After the first real
     // response in production, we narrow this down to actual field names.
     function normalizePosition(p: any): any {
-      // Timestamps — likely nanoseconds based on /fills precedent
-      const openTs = Number(p.openTime ?? p.opened ?? p.openTimestamp ?? 0);
-      const closeTs = Number(p.closeTime ?? p.closed ?? p.closeTimestamp ?? 0);
+      // Timestamps — likely nanoseconds based on /fills precedent. Try
+      // every plausible name; ts-in-ns gets normalized below.
+      const openTs = Number(
+        p.openTime ?? p.opened ?? p.openTimestamp ??
+        p.openedAt ?? p.entryTime ?? p.startTime ?? p.openTs ?? 0
+      );
+      const closeTs = Number(
+        p.closeTime ?? p.closed ?? p.closeTimestamp ??
+        p.closedAt ?? p.exitTime ?? p.endTime ?? p.closeTs ?? 0
+      );
       const toMs = (ns: number): number =>
         ns > 1e14 ? Math.floor(ns / 1e6) :
         ns > 1e11 ? ns :
         ns * 1000;
 
-      // Size: BULK uses signed sizes for positions. A negative size means
-      // the position was a short. We expose absolute size + a side string
-      // so the frontend doesn't need to know the convention.
-      const rawSize = Number(p.size ?? p.amount ?? 0);
+      // Size: BULK has used many variants across endpoints. Signed sizes
+      // are a strong convention (negative = short) so we honor that as
+      // the side fallback when no explicit `side` field is present.
+      const rawSize = Number(
+        p.size ?? p.amount ?? p.qty ?? p.quantity ??
+        p.sz ?? p.signedSize ?? p.totalSize ?? 0
+      );
       const side: 'long' | 'short' =
         p.side
           ? String(p.side).toLowerCase() === 'short' ? 'short' : 'long'
           : rawSize < 0 ? 'short' : 'long';
 
+      // Entry/close prices — try every plausible name. The wide set
+      // includes compact (op/cp), camelCase, snake_case, vwap variants,
+      // and "average" variants. After we see real BULK output in logs
+      // we can narrow this down.
+      const openPrice = Number(
+        p.openPrice ?? p.open_price ??
+        p.entryPrice ?? p.entry_price ?? p.entry ??
+        p.avgEntryPrice ?? p.avgEntry ?? p.entryVwap ?? p.vwapEntry ??
+        p.op ?? p.openVwap ?? p.price ?? 0
+      );
+      const closePrice = Number(
+        p.closePrice ?? p.close_price ??
+        p.exitPrice ?? p.exit_price ?? p.exit ??
+        p.avgClosePrice ?? p.avgExit ?? p.exitVwap ?? p.vwapExit ??
+        p.cp ?? p.closeVwap ?? 0
+      );
+
       return {
-        symbol: String(p.symbol ?? p.sym ?? ''),
+        symbol: String(p.symbol ?? p.sym ?? p.c ?? ''),
         side,
         size: Math.abs(rawSize),
-        openPrice: Number(p.openPrice ?? p.entryPrice ?? p.price ?? 0),
-        closePrice: Number(p.closePrice ?? p.exitPrice ?? 0),
+        openPrice,
+        closePrice,
         openedAt: toMs(openTs),
         closedAt: toMs(closeTs),
-        realizedPnl: Number(p.realizedPnl ?? p.pnl ?? 0),
-        fees: Number(p.fees ?? 0),
+        realizedPnl: Number(p.realizedPnl ?? p.pnl ?? p.realized_pnl ?? p.realized ?? 0),
+        fees: Number(p.fees ?? p.fee ?? 0),
         funding: Number(p.funding ?? 0),
-        leverage: Number(p.leverage ?? 0),
-        // Pass through anything else BULK provides — frontend can ignore
-        // fields it doesn't use.
+        leverage: Number(p.leverage ?? p.lev ?? 0),
         notional: p.notional !== undefined ? Number(p.notional) : undefined,
-        liquidated: Boolean(p.liquidated ?? false),
+        liquidated:
+          Boolean(p.liquidated ?? false) ||
+          // BULK often signals forced exits via reasonCode rather than a
+          // dedicated flag. Treat both presentations as "liquidated".
+          String(p.reason ?? '').toLowerCase().includes('liq') ||
+          Number(p.reasonCode ?? 0) === 1,
       };
     }
 
