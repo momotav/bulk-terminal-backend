@@ -431,6 +431,24 @@ class BulkApiService {
         `[bulkApi.getClosedPositions] ${walletAddress.slice(0, 8)}… → ${results.length} positions` +
           (sample?.symbol ? ` (sample symbol: "${sample.symbol}")` : '')
       );
+      // One-time dump of the first raw position's full shape so we can see
+      // which field names BULK actually uses for entry/close/size. Only
+      // logged when results > 0 (no point dumping when EMPTY already
+      // dumped). We log keys + the full JSON of the first item, capped to
+      // 800 chars so Railway logs stay readable.
+      if (results.length > 0) {
+        try {
+          const first = results[0] as Record<string, unknown>;
+          const keys = Object.keys(first).join(', ');
+          const preview = JSON.stringify(first).slice(0, 800);
+          console.log(
+            `[bulkApi.getClosedPositions] sample keys: [${keys}]\n` +
+              `  full sample: ${preview}`
+          );
+        } catch {
+          /* serialization failure shouldn't crash the route */
+        }
+      }
       return results;
     } catch (error: any) {
       clearTimeout(timer);
