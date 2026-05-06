@@ -401,8 +401,20 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
     // try common alternatives and log mismatches. After the first real
     // response in production, we narrow this down to actual field names.
     function normalizePosition(p: any): any {
-      // Timestamps — likely nanoseconds based on /fills precedent. Try
-      // every plausible name; ts-in-ns gets normalized below.
+      // Real BULK response shape (verified from production logs):
+      //   {
+      //     owner, symbol, quantity, maxQuantity, totalVolume,
+      //     avgOpenPrice, avgClosePrice, realizedPnl, fees, funding,
+      //     openTime, closeTime, closeReason, iso
+      //   }
+      //
+      // We keep alternate-name fallbacks below for forward compatibility
+      // (BULK has changed field names before — see the /fills bug we hit
+      // earlier). The real names appear first in each `??` chain.
+
+      // Timestamps. BULK uses nanoseconds for fills; closed positions
+      // appear to use ms (the live values 1777985752181 ≈ Nov 2026 in ms).
+      // The toMs heuristic handles both safely.
       const openTs = Number(
         p.openTime ?? p.opened ?? p.openTimestamp ??
         p.openedAt ?? p.entryTime ?? p.startTime ?? p.openTs ?? 0
@@ -416,11 +428,10 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
         ns > 1e11 ? ns :
         ns * 1000;
 
-      // Size: BULK has used many variants across endpoints. Signed sizes
-      // are a strong convention (negative = short) so we honor that as
-      // the side fallback when no explicit `side` field is present.
+      // Size — BULK uses `quantity` for closed positions. Sometimes signed,
+      // sometimes absolute; we always expose absolute + a side string.
       const rawSize = Number(
-        p.size ?? p.amount ?? p.qty ?? p.quantity ??
+        p.quantity ?? p.size ?? p.amount ?? p.qty ??
         p.sz ?? p.signedSize ?? p.totalSize ?? 0
       );
       const side: 'long' | 'short' =
@@ -428,22 +439,30 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
           ? String(p.side).toLowerCase() === 'short' ? 'short' : 'long'
           : rawSize < 0 ? 'short' : 'long';
 
-      // Entry/close prices — try every plausible name. The wide set
-      // includes compact (op/cp), camelCase, snake_case, vwap variants,
-      // and "average" variants. After we see real BULK output in logs
-      // we can narrow this down.
+      // Prices — `avgOpenPrice` and `avgClosePrice` are the real BULK
+      // names. Other names kept as fallbacks for forward compatibility.
       const openPrice = Number(
-        p.openPrice ?? p.open_price ??
+        p.avgOpenPrice ?? p.openPrice ?? p.open_price ??
         p.entryPrice ?? p.entry_price ?? p.entry ??
         p.avgEntryPrice ?? p.avgEntry ?? p.entryVwap ?? p.vwapEntry ??
         p.op ?? p.openVwap ?? p.price ?? 0
       );
       const closePrice = Number(
-        p.closePrice ?? p.close_price ??
+        p.avgClosePrice ?? p.closePrice ?? p.close_price ??
         p.exitPrice ?? p.exit_price ?? p.exit ??
-        p.avgClosePrice ?? p.avgExit ?? p.exitVwap ?? p.vwapExit ??
+        p.avgExit ?? p.exitVwap ?? p.vwapExit ??
         p.cp ?? p.closeVwap ?? 0
       );
+
+      // Liquidation detection. BULK uses `closeReason` (string) on closed
+      // positions, not `reason` or numeric `reasonCode`. Common values
+      // observed: "liquidation", "trade", "adl". Match flexibly so we
+      // don't miss variants like "Liquidation" or "liquidated".
+      const closeReason = String(p.closeReason ?? p.reason ?? '').toLowerCase();
+      const liquidated =
+        Boolean(p.liquidated ?? false) ||
+        closeReason.includes('liq') ||
+        Number(p.reasonCode ?? 0) === 1;
 
       return {
         symbol: String(p.symbol ?? p.sym ?? p.c ?? ''),
@@ -456,14 +475,18 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
         realizedPnl: Number(p.realizedPnl ?? p.pnl ?? p.realized_pnl ?? p.realized ?? 0),
         fees: Number(p.fees ?? p.fee ?? 0),
         funding: Number(p.funding ?? 0),
+        // Leverage isn't included on closed-position responses — BULK
+        // only exposes it on the live position object. We'd have to
+        // compute it from totalVolume / margin, which we don't have.
+        // Pass through if BULK does include it; otherwise 0 (frontend
+        // hides the badge when leverage=0).
         leverage: Number(p.leverage ?? p.lev ?? 0),
         notional: p.notional !== undefined ? Number(p.notional) : undefined,
-        liquidated:
-          Boolean(p.liquidated ?? false) ||
-          // BULK often signals forced exits via reasonCode rather than a
-          // dedicated flag. Treat both presentations as "liquidated".
-          String(p.reason ?? '').toLowerCase().includes('liq') ||
-          Number(p.reasonCode ?? 0) === 1,
+        liquidated,
+        // Pass through the close reason as a debug aid + so the frontend
+        // can show "ADL" vs "LIQ" vs other distinctly if we want to
+        // expand later. Empty string when missing.
+        closeReason,
       };
     }
 
