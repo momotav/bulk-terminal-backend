@@ -294,4 +294,129 @@ router.get('/bulk', async (req: Request, res: Response) => {
 });
 
 
+// GET /leaderboard/bulk/rank/:address - Find a wallet's rank on the BULK
+// indexer leaderboard for a specific window+metric.
+//
+// Strategy: paginate through the BULK indexer (page_size=100) until we
+// either find the wallet or hit a sane cap. The cap exists because beyond
+// ~2000 traders the rank doesn't carry much signal — anyone past rank 2000
+// is not "ranked" in a meaningful sense, and we'd rather return found=false
+// than spend 30 paged calls confirming someone's rank #4731.
+//
+// Response shape:
+//   { found: true,  rank, total, metric, window, wallet, row }   // hit
+//   { found: false, total, metric, window, wallet, scannedPages } // miss
+//
+// Cache: 60s fresh, 5min stale, same as the main leaderboard route. Keyed
+// per-(wallet, window, metric) so different lookups don't collide.
+router.get('/bulk/rank/:address', async (req: Request, res: Response) => {
+  try {
+    const address = String(req.params.address || '').trim();
+    const window = (req.query.window as string) || '24h';
+    const metric = (req.query.metric as string) || 'cashflow_adjusted_roi';
+
+    if (!address) {
+      return res.status(400).json({ error: 'address required' });
+    }
+    if (!BULK_WINDOWS.includes(window as BulkWindow)) {
+      return res.status(400).json({
+        error: `Invalid window. Must be one of: ${BULK_WINDOWS.join(', ')}`,
+      });
+    }
+    if (!BULK_METRICS.includes(metric as BulkMetric)) {
+      return res.status(400).json({
+        error: `Invalid metric. Must be one of: ${BULK_METRICS.join(', ')}`,
+      });
+    }
+
+    const cacheKey = `bulk-leaderboard-rank:${address}:${window}:${metric}`;
+    const staleKey = `bulk-leaderboard-rank:stale:${address}:${window}:${metric}`;
+    const cached = await getCache<unknown>(cacheKey);
+    if (cached) {
+      res.setHeader('X-Bulkstats-Cache', 'fresh');
+      return res.json(cached);
+    }
+
+    // Walk pages. BULK indexer accepts page_size up to 100. We scan up
+    // to 20 pages = top 2000 traders. Past that, rank is meaningless
+    // for our use case.
+    const PAGE_SIZE = 100;
+    const MAX_PAGES = 20;
+    let totalRows = 0;
+    let foundRow: BulkLeaderboardRow | null = null;
+    let foundRank = 0;
+    let scannedPages = 0;
+
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const url = new URL(BULK_INDEXER_URL);
+      url.searchParams.set('window', window);
+      url.searchParams.set('metric', metric);
+      url.searchParams.set('page', String(page));
+      url.searchParams.set('page_size', String(PAGE_SIZE));
+
+      let bulkRes: globalThis.Response | null = null;
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        bulkRes = await fetch(url.toString(), {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        });
+        clearTimeout(timer);
+      } catch (err) {
+        console.error(`BULK indexer fetch failed on page ${page}:`, err);
+        break;
+      }
+
+      if (!bulkRes || !bulkRes.ok) break;
+
+      const data = (await bulkRes.json()) as BulkLeaderboardResponse;
+      scannedPages = page;
+      totalRows = data.total ?? totalRows;
+
+      const hit = data.rows.find((r) => r.wallet === address);
+      if (hit) {
+        foundRow = hit;
+        foundRank = hit.rank;
+        break;
+      }
+      if (!data.has_next) break;
+    }
+
+    const result = foundRow
+      ? {
+          found: true as const,
+          rank: foundRank,
+          total: totalRows,
+          metric,
+          window,
+          wallet: address,
+          row: foundRow,
+        }
+      : {
+          found: false as const,
+          total: totalRows,
+          metric,
+          window,
+          wallet: address,
+          scannedPages,
+        };
+
+    // Cache both fresh and stale. Misses cache too — re-scanning 20 pages
+    // every render for a wallet that's not on the leaderboard would be
+    // wasteful. Hits and misses both expire in 60s/5min.
+    await Promise.all([
+      setCache(cacheKey, result, 60),
+      setCache(staleKey, result, 300),
+    ]);
+
+    res.setHeader('X-Bulkstats-Cache', 'miss');
+    return res.json(result);
+  } catch (error: any) {
+    console.error('GET /leaderboard/bulk/rank error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to fetch rank' });
+  }
+});
+
+
 export default router;
