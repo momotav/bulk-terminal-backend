@@ -67,9 +67,30 @@ interface BulkKline {
 }
 
 // Fetch klines from BULK API for a symbol
-async function fetchKlines(symbol: string, interval: string = '1h', limit: number = 100): Promise<BulkKline[]> {
+async function fetchKlines(
+  symbol: string,
+  interval: string = '1h',
+  limit: number = 100,
+  // Optional time window — when provided, BULK returns candles within
+  // [startTime, endTime] (both ms epoch). Used by the closed-position
+  // chart modal to fetch candles around a specific historical trade
+  // window rather than always pulling the most recent N candles.
+  startTime?: number,
+  endTime?: number,
+): Promise<BulkKline[]> {
   try {
-    const url = `${BULK_API_BASE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const params = new URLSearchParams({
+      symbol,
+      interval,
+      limit: String(limit),
+    });
+    if (typeof startTime === 'number' && Number.isFinite(startTime)) {
+      params.set('startTime', String(Math.floor(startTime)));
+    }
+    if (typeof endTime === 'number' && Number.isFinite(endTime)) {
+      params.set('endTime', String(Math.floor(endTime)));
+    }
+    const url = `${BULK_API_BASE}/klines?${params.toString()}`;
     const response = await fetch(url);
     if (!response.ok) return [];
     return await response.json() as BulkKline[];
@@ -401,6 +422,14 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
   const isAllTime = hours >= 8760; // 1 year or more = ALL time
 
+  // Cache check. Previously this endpoint hit BULK's /klines once per
+  // symbol on every call, which adds up fast on a page that fetches the
+  // 24h window AND the all-time window. With ~5 symbols × 1000 klines per
+  // call, the network and parse overhead was dominating page load.
+  const cacheKey = `analytics:volume_chart_api:${hours}`;
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
   try {
     const now = Date.now();
     const startTime = isAllTime ? 0 : now - (hours * 60 * 60 * 1000);
@@ -485,7 +514,12 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
       });
 
     console.log(`📊 Volume chart (${isAllTime ? 'ALL' : hours + 'h'}): ${data.length} bars, ${symbols.length} coins, cumulative: $${(cumulative/1e9).toFixed(2)}B`);
-    res.json({ data });
+    const result = { data };
+    // 1h TTL for all-time (klines from years ago don't change), 60s for
+    // recent windows (last hour's bar is still in flight).
+    const ttl = isAllTime ? 3600 : 60;
+    await setCache(cacheKey, result, ttl);
+    res.json(result);
   } catch (error) {
     console.error('Error fetching volume chart from API:', error);
     res.status(500).json({ error: 'Failed to fetch volume chart' });
@@ -986,8 +1020,14 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
     const data = transformToChartData(visibleRows, historicalCumulative);
     const result = { data };
     
-    // Cache for 60 seconds
-    await setCache(cacheKey, result, 60);
+    // Cache TTL: short for windowed queries (data evolves), long for
+    // all-time queries (the answer barely changes from one minute to the
+    // next — daily-aggregated counts of years of data move slowly). The
+    // analytics page polls all-time every 5 minutes which used to blow
+    // the cache and force a fresh ~5-second DB scan every time. With a
+    // 1-hour TTL on all-time, the same scan only happens once per hour.
+    const ttl = isAllTime ? 3600 : 60;
+    await setCache(cacheKey, result, ttl);
     
     res.json(result);
   } catch (error) {
@@ -1045,8 +1085,9 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
     const data = transformToChartData(visibleRows, historicalCumulative);
     const result = { data };
     
-    // Cache for 60 seconds
-    await setCache(cacheKey, result, 60);
+    // See trades-chart endpoint above for cache-TTL rationale.
+    const ttl = isAllTime ? 3600 : 60;
+    await setCache(cacheKey, result, ttl);
     
     res.json(result);
   } catch (error) {
@@ -2141,31 +2182,49 @@ router.get('/fee-tiers', async (req: Request, res: Response) => {
   }
   
   try {
-    const feeRes = await fetch(`${BULK_API_BASE}/feeState`);
+    // Add explicit timeout — without this the request can hang indefinitely
+    // if BULK is slow/unreachable, blocking the page load and producing
+    // confusing 5+ second 500s instead of fast failures.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    let feeRes: globalThis.Response;
+    try {
+      feeRes = await fetch(`${BULK_API_BASE}/feeState`, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!feeRes.ok) {
       throw new Error('Failed to fetch fee state from BULK API');
     }
-    
+
     const feeState = await feeRes.json() as any;
-    
-    // Extract global fee tiers
+
+    // BULK changed `/feeState` field names to camelCase in late April 2026
+    // (the snake_case names below stopped returning data and broke the
+    // fees chart's daily collection job too). We try both for forward
+    // compatibility — newer responses will come through camelCase, older
+    // ones (or any cached/proxied variants) still work via snake_case.
     const globalScope = feeState.scopes?.find((s: any) => s.instrument === 'global');
-    const tiers = globalScope?.active_policy?.tiers || [];
-    
+    const tiers = globalScope?.active_policy?.tiers || globalScope?.activePolicy?.tiers || [];
+
     const result = {
       timestamp: feeState.stamp,
-      windowDays: globalScope?.active_policy?.window_days || 15,
+      windowDays:
+        globalScope?.active_policy?.window_days ??
+        globalScope?.activePolicy?.windowDays ??
+        15,
       tiers: tiers.map((t: any) => ({
-        thresholdVolume: t.threshold_volume,
-        makerBps: t.maker_bps,
-        takerBps: t.taker_bps
+        thresholdVolume: t.threshold_volume ?? t.thresholdVolume ?? 0,
+        makerBps: t.maker_bps ?? t.makerBps ?? 0,
+        takerBps: t.taker_bps ?? t.takerBps ?? 0,
       })),
-      totalMakerFees: feeState.total_maker_fees || 0,
-      totalTakerFees: feeState.total_taker_fees || 0,
-      totalProtocolSettlement: feeState.total_protocol_settlement || 0,
-      settledFills: feeState.settled_fills || 0
+      totalMakerFees: feeState.totalMakerFees ?? feeState.total_maker_fees ?? 0,
+      totalTakerFees: feeState.totalTakerFees ?? feeState.total_taker_fees ?? 0,
+      totalProtocolSettlement:
+        feeState.totalProtocolSettlement ?? feeState.total_protocol_settlement ?? 0,
+      settledFills: feeState.settledFills ?? feeState.settled_fills ?? 0,
     };
-    
+
     await setCache(cacheKey, result, 300); // 5 min cache
     res.json(result);
   } catch (error) {
@@ -2656,14 +2715,35 @@ router.get('/candles/:symbol', async (req: Request, res: Response) => {
   const limitNum = parseInt(String(req.query.limit ?? '100'), 10);
   const limit = Math.min(Math.max(Number.isFinite(limitNum) ? limitNum : 100, 1), 500);
 
-  const cacheKey = `analytics:candles:${symbol}:${interval}:${limit}`;
+  // Optional time-window params for fetching candles around a specific
+  // historical trade (rather than the most recent N candles). Both are
+  // in ms epoch; BULK validates them server-side. When omitted, behavior
+  // is unchanged (returns the most recent `limit` candles).
+  const startTimeRaw = req.query.startTime;
+  const endTimeRaw = req.query.endTime;
+  const startTime =
+    startTimeRaw !== undefined && startTimeRaw !== ''
+      ? Number(startTimeRaw)
+      : undefined;
+  const endTime =
+    endTimeRaw !== undefined && endTimeRaw !== ''
+      ? Number(endTimeRaw)
+      : undefined;
+  const startKey = startTime ?? 'now';
+  const endKey = endTime ?? 'now';
+
+  const cacheKey = `analytics:candles:${symbol}:${interval}:${limit}:${startKey}:${endKey}`;
   const cached = await getCache<unknown>(cacheKey);
   if (cached) return res.json(cached);
 
   try {
-    const klines = await fetchKlines(symbol, interval, limit);
+    const klines = await fetchKlines(symbol, interval, limit, startTime, endTime);
     const result = { symbol, interval, limit, candles: klines };
-    await setCache(cacheKey, result, 30); // 30-second TTL
+    // Historical windows can cache forever (closed candles don't change).
+    // Recent (no time bound) windows still need a short TTL because the
+    // last candle is in-flight.
+    const ttl = startTime !== undefined && endTime !== undefined ? 3600 : 30;
+    await setCache(cacheKey, result, ttl);
     res.json(result);
   } catch (error: any) {
     console.error('Error fetching candles for', symbol, ':', error);
