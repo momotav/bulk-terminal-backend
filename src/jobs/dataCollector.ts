@@ -375,10 +375,16 @@ async function collectFeeSnapshot(): Promise<void> {
     
     const feeState = await res.json() as any;
     
-    const totalMakerFees = feeState.total_maker_fees || 0;
-    const totalTakerFees = feeState.total_taker_fees || 0;
-    const totalProtocolSettlement = feeState.total_protocol_settlement || 0;
-    const settledFills = feeState.settled_fills || 0;
+    // BULK changed `/feeState` field names to camelCase in late April 2026.
+    // The cron silently inserted zero rows for 9 days (April 27 → May 6)
+    // because these reads returned undefined → fallback to 0. We now try
+    // both camelCase first (current) and snake_case as fallback (so this
+    // continues working if BULK ever reverts or proxies cache stale data).
+    const totalMakerFees = feeState.totalMakerFees ?? feeState.total_maker_fees ?? 0;
+    const totalTakerFees = feeState.totalTakerFees ?? feeState.total_taker_fees ?? 0;
+    const totalProtocolSettlement =
+      feeState.totalProtocolSettlement ?? feeState.total_protocol_settlement ?? 0;
+    const settledFills = feeState.settledFills ?? feeState.settled_fills ?? 0;
     
     await query(
       `INSERT INTO fee_snapshots (total_maker_fees, total_taker_fees, total_protocol_settlement, settled_fills, timestamp)
