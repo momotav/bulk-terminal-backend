@@ -154,6 +154,13 @@ export async function recordLiquidation(
 // (it reads volume/trades from BULK's indexer directly). Those two writes
 // were responsible for most of the per-trade DB load and added zero user
 // value. Dropped.
+//
+// We DO maintain a single global counter (`global_stats.total_trades_since_baseline`)
+// because the analytics page's "Total Trades" stat used to read
+// `COUNT(*) FROM trades` — which became inaccurate when we added 2-day
+// retention. The persistent counter + a frozen baseline (set once at
+// rollout to 35,160,034) lets us show the true ever-growing count
+// without depending on the trades table size.
 export async function recordTrade(
   wallet: string | null,
   symbol: string,
@@ -170,6 +177,21 @@ export async function recordTrade(
      VALUES ($1, $2, $3, $4, $5, $6)`,
     [wallet, symbol, side, size, price, value]
   );
+
+  // Increment the persistent global trade counter. Single row in
+  // global_stats with id=1 (enforced by a CHECK constraint). We use
+  // ON CONFLICT to make this idempotent during rollout: if the row
+  // doesn't exist yet (first run before the migration was applied),
+  // we silently no-op rather than crash the WS listener.
+  await query(
+    `UPDATE global_stats
+     SET total_trades_since_baseline = total_trades_since_baseline + 1
+     WHERE id = 1`
+  ).catch((err: unknown) => {
+    // Table might not exist yet during initial deploy. Don't crash;
+    // the next deploy after migration is applied will start counting.
+    console.error('global_stats increment failed (migration pending?):', err);
+  });
 }
 
 // Clean up old data
