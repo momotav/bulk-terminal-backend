@@ -170,7 +170,7 @@ router.get('/ticker/:symbol', async (req: Request, res: Response) => {
 router.get('/exchange-stats', async (req: Request, res: Response) => {
   const cacheKey = 'analytics:exchange_stats';
   
-  // Check cache first (cache for 30 seconds)
+  // Check cache first (cache for 60 seconds — see setCache below for why)
   const cached = await getCache<any>(cacheKey);
   if (cached) {
     return res.json(cached);
@@ -180,44 +180,87 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     let totalVolume24h = 0;
     let totalOpenInterest = 0;
     let timestamp = Date.now();
-    
-    // First try /stats endpoint (with timeout)
+
+    // True rolling-24h volume from BULK klines.
+    //
+    // BULK's `/stats?period=1d` endpoint is misleadingly named — it
+    // returns "volume since UTC midnight today," not "rolling 24-hour
+    // volume." Right after UTC midnight the number is near zero and
+    // grows through the day, then resets. Our dashboard label says
+    // "24H VOLUME" so users reasonably expect a true rolling window.
+    //
+    // We compute it ourselves: for each active symbol, fetch hourly
+    // klines and sum (volume × close) over the last 24 hours.
+    //
+    // Note: BULK's klines endpoint ignores the `limit` query param and
+    // returns ~95-100 hourly candles (their full retention). We slice
+    // to the last 24 entries client-side to get a real 24h window.
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
-      
-      const response = await fetch(`${BULK_API_BASE}/stats?period=1d`, {
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-      
-      if (response.ok) {
-        const bulkStats = await response.json() as BulkStatsResponse;
-        timestamp = bulkStats.timestamp || Date.now();
-        
-        // Calculate from markets if available
-        if (bulkStats?.markets && bulkStats.markets.length > 0) {
-          for (const market of bulkStats.markets) {
-            totalVolume24h += market.quoteVolume || 0;
-            totalOpenInterest += (market.openInterest || 0) * (market.markPrice || 0);
+      const symbols = await getActiveSymbols();
+
+      const klineResults = await Promise.allSettled(
+        symbols.map(async (symbol) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 5000);
+          try {
+            const r = await fetch(
+              `${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=24`,
+              { signal: controller.signal }
+            );
+            if (!r.ok) return [];
+            return (await r.json()) as Array<{ v?: number; c?: number; t?: number }>;
+          } finally {
+            clearTimeout(timer);
           }
-        }
-        
-        // Use totals if available
-        if (bulkStats?.volume?.totalUsd && bulkStats.volume.totalUsd > 0) {
-          totalVolume24h = bulkStats.volume.totalUsd;
-        }
-        if (bulkStats?.openInterest?.totalUsd && bulkStats.openInterest.totalUsd > 0) {
-          totalOpenInterest = bulkStats.openInterest.totalUsd;
+        })
+      );
+
+      for (const res of klineResults) {
+        if (res.status !== 'fulfilled') continue;
+        const klines = res.value;
+        // Take the last 24 entries (newest). BULK returns chronological
+        // ascending, so .slice(-24) gives us the trailing 24h window.
+        const last24 = klines.slice(-24);
+        for (const k of last24) {
+          const v = k.v || 0;
+          const c = k.c || 0;
+          if (v > 0 && c > 0) totalVolume24h += v * c;
         }
       }
     } catch (e) {
-      console.error('Failed to fetch BULK stats:', e);
+      console.error('Failed to compute rolling 24h volume from klines:', e);
     }
-    
-    // FALLBACK: If /stats returned 0s, fetch from individual tickers
+
+    // Open interest stays from BULK's /stats — OI is a live point-in-time
+    // value, not a windowed sum, so /stats's OI is correct as-is.
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const response = await fetch(`${BULK_API_BASE}/stats?period=1d`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      if (response.ok) {
+        const bulkStats = (await response.json()) as BulkStatsResponse;
+        timestamp = bulkStats.timestamp || Date.now();
+
+        // Sum OI across markets if `totalUsd` isn't provided.
+        if (bulkStats?.openInterest?.totalUsd && bulkStats.openInterest.totalUsd > 0) {
+          totalOpenInterest = bulkStats.openInterest.totalUsd;
+        } else if (bulkStats?.markets) {
+          for (const market of bulkStats.markets) {
+            totalOpenInterest += (market.openInterest || 0) * (market.markPrice || 0);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to fetch BULK OI from /stats:', e);
+    }
+
+    // FALLBACK: if everything failed, use the per-ticker helper
     if (totalVolume24h === 0 && totalOpenInterest === 0) {
-      console.log('⚠️ /stats returned 0s, falling back to individual tickers...');
+      console.log('⚠️ Rolling 24h + /stats both empty, falling back to individual tickers...');
       try {
         const tickerStats = await fetchTickersForStats();
         totalVolume24h = tickerStats.volume24h;
@@ -282,8 +325,11 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       liquidations24h,
     };
     
-    // Cache for 30 seconds
-    await setCache(cacheKey, result, 30);
+    // Cache for 60 seconds. We now fetch one kline series per active
+    // symbol to compute true rolling 24h volume — that's ~10 BULK API
+    // calls per cold-cache request. 60s TTL keeps load on BULK low
+    // while still feeling near-real-time on the dashboard.
+    await setCache(cacheKey, result, 60);
     
     res.json(result);
   } catch (error) {
