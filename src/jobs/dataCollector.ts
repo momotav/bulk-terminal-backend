@@ -84,13 +84,11 @@ async function updateTraderSnapshots(): Promise<void> {
         const unrealizedPnl = account.margin?.unrealizedPnl || 0;
         const totalPnl = realizedPnl + unrealizedPnl;
         
-        // Update trader with current PnL
-        await query(
-          `UPDATE traders SET 
-             total_pnl = $2
-           WHERE wallet_address = $1`,
-          [wallet, totalPnl]
-        );
+        // Note: we no longer write `total_pnl` back to the `traders` table
+        // here — the wallet page reads realized PnL from BULK's indexer
+        // directly. We only keep the trader_snapshots history below
+        // (powers the wallet page's PnL history chart, which BULK doesn't
+        // expose).
         
         // Create snapshot (even if no positions, to track PnL changes)
         if (account.positions.length > 0 || totalPnl !== 0) {
@@ -145,6 +143,17 @@ export async function recordLiquidation(
 }
 
 // Record a trade event
+//
+// Inserts the trade row into the `trades` table for daily-aggregate
+// computation (powers the unique-traders / new-users charts on the
+// analytics page). Old rows are pruned by `cleanupOldData` after
+// aggregation, so this table stays small.
+//
+// We used to ALSO update `traders.total_trades` and `traders.total_volume`
+// here on every event, but the wallet page no longer reads those columns
+// (it reads volume/trades from BULK's indexer directly). Those two writes
+// were responsible for most of the per-trade DB load and added zero user
+// value. Dropped.
 export async function recordTrade(
   wallet: string | null,
   symbol: string,
@@ -161,16 +170,6 @@ export async function recordTrade(
      VALUES ($1, $2, $3, $4, $5, $6)`,
     [wallet, symbol, side, size, price, value]
   );
-  
-  if (wallet) {
-    await query(
-      `UPDATE traders 
-       SET total_trades = total_trades + 1,
-           total_volume = total_volume + $1
-       WHERE wallet_address = $2`,
-      [value, wallet]
-    );
-  }
 }
 
 // Clean up old data
@@ -178,7 +177,52 @@ async function cleanupOldData(): Promise<void> {
   try {
     await query(`DELETE FROM market_stats WHERE timestamp < NOW() - INTERVAL '30 days'`);
     await query(`DELETE FROM trader_snapshots WHERE timestamp < NOW() - INTERVAL '30 days'`);
-    console.log('🧹 Cleaned up old data');
+
+    // Trades retention: 2 days.
+    //
+    // The trades table feeds (a) live activity feed (last ~50 rows) and
+    // (b) daily aggregates (`aggregateDailyStats`) which compute unique
+    // traders / new users per day. Once a day's trades have been
+    // aggregated into `daily_stats` and `daily_unique_traders`, the
+    // raw rows have no further purpose.
+    //
+    // Two days = "today still aggregating" + "yesterday safety buffer
+    // in case the cron missed a run." Wallet page stats no longer read
+    // from this table at all (those moved to BULK indexer in Phase 1).
+    //
+    // Expected impact: trades table shrinks from ~4 GB → ~250 MB after
+    // first run. Index storage shrinks proportionally (~5 GB freed).
+    //
+    // Batched delete: the first run will need to delete ~30M rows
+    // (we're catching up on weeks of accumulated data). Doing it in
+    // one DELETE would lock the table and stall WS-listener writes.
+    // 50k rows per batch keeps each transaction short while still
+    // making progress quickly. Loops until no more old rows remain
+    // OR the safety cap is reached.
+    //
+    // Safety cap: 1000 batches * 50k = 50M rows per run. Today's
+    // table only has ~35M rows total, so the cap is well above what
+    // we'd ever need. Mostly it's there to guarantee the cron doesn't
+    // hang forever if something goes wrong.
+    let totalDeleted = 0;
+    for (let i = 0; i < 1000; i++) {
+      const batch = await query<{ count: string }>(
+        `WITH deleted AS (
+           DELETE FROM trades
+           WHERE id IN (
+             SELECT id FROM trades
+             WHERE timestamp < NOW() - INTERVAL '2 days'
+             LIMIT 50000
+           )
+           RETURNING 1
+         )
+         SELECT COUNT(*) AS count FROM deleted`
+      );
+      const batchCount = parseInt(batch[0]?.count || '0');
+      totalDeleted += batchCount;
+      if (batchCount < 50000) break;  // last batch was partial → done
+    }
+    console.log(`🧹 Cleaned up old data (deleted ${totalDeleted} trade rows older than 2d)`);
   } catch (error) {
     console.error('❌ Failed to cleanup old data:', error);
   }
