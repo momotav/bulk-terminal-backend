@@ -1178,15 +1178,24 @@ router.get('/stats', async (req: Request, res: Response) => {
       totalVolume = tickerStats.volume24h;
     }
 
-    const [tradesResult, liqResult, tradersResult] = await Promise.all([
-      query(`SELECT COUNT(*) as count FROM trades`).catch(() => [{ count: 0 }]),
+    // Total trade count comes from the persistent global_stats counter
+    // (baseline frozen at deletion time + ever-incrementing delta), not
+    // from COUNT(*) FROM trades. The trades table now only holds the
+    // last 2 days, so a raw count would massively understate lifetime
+    // activity. Liquidations table has full retention so its count is
+    // genuine. Traders table also unaffected by Phase 2 retention.
+    const [globalStatsResult, liqResult, tradersResult] = await Promise.all([
+      query<{ total: string }>(
+        `SELECT (total_trades_baseline + total_trades_since_baseline) AS total
+         FROM global_stats WHERE id = 1`
+      ).catch(() => [{ total: '0' }]),
       query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM liquidations`).catch(() => [{ count: 0, volume: 0 }]),
       query(`SELECT COUNT(*) as count FROM traders`).catch(() => [{ count: 0 }])
     ]);
     
     const result = {
       trades: {
-        count: parseInt(tradesResult[0]?.count || '0'),
+        count: parseInt(globalStatsResult[0]?.total || '0'),
         volume: totalVolume
       },
       liquidations: {
