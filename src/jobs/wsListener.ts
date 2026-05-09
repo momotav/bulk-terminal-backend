@@ -285,7 +285,29 @@ async function processTradeBatch(): Promise<void> {
       `INSERT INTO trades (wallet_address, symbol, side, size, price, value, timestamp) VALUES ${values}`,
       params
     );
-    
+
+    // Increment the persistent global trade counter by the batch size.
+    // This is the source of truth for the analytics page's "Total Trades"
+    // stat. The baseline (frozen at 35,160,034 from before the trades-table
+    // cleanup) plus this counter gives users the never-decreasing lifetime
+    // count, even though the trades table itself only retains 2 days.
+    //
+    // Done as a single bulk UPDATE rather than per-trade so a 1000-trade
+    // batch costs one DB round-trip instead of 1000. On WS-listener path
+    // performance, that matters.
+    //
+    // .catch() so a missing global_stats row never crashes the listener
+    // (defensive — the migration is supposed to seed the row, but we'd
+    // rather drop the increment than drop trades).
+    await query(
+      `UPDATE global_stats
+       SET total_trades_since_baseline = total_trades_since_baseline + $1
+       WHERE id = 1`,
+      [trades.length]
+    ).catch((err: unknown) => {
+      console.error('global_stats batch increment failed:', err);
+    });
+
     // Aggregate trader stats in memory (don't write to DB yet)
     for (const t of trades) {
       if (t.walletAddress) {
