@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { leaderboardService, TimeFrame } from '../services/leaderboard';
 import { getCache, setCache } from '../services/cache';
+import { isSystemWallet, filterOutSystemWallets } from '../services/systemWallets';
 
 const router = Router();
 
@@ -24,7 +25,10 @@ router.get('/pnl', async (req: Request, res: Response) => {
     const timeframe = validateTimeframe(req.query.timeframe as string);
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
     
-    const data = await withTimeout(leaderboardService.getTopTradersByPnL(timeframe, limit));
+    // Fetch a buffer so post-filtering BULK system wallets doesn't
+    // drop the visible row count below the requested limit.
+    const raw = await withTimeout(leaderboardService.getTopTradersByPnL(timeframe, limit + 5));
+    const data = filterOutSystemWallets(raw, r => r.wallet_address).slice(0, limit);
     res.json({ timeframe, data });
   } catch (error: any) {
     console.error('Leaderboard PnL error:', error.message);
@@ -38,7 +42,8 @@ router.get('/liquidated', async (req: Request, res: Response) => {
     const timeframe = validateTimeframe(req.query.timeframe as string);
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
     
-    const data = await withTimeout(leaderboardService.getMostLiquidated(timeframe, limit));
+    const raw = await withTimeout(leaderboardService.getMostLiquidated(timeframe, limit + 5));
+    const data = filterOutSystemWallets(raw, r => r.wallet_address).slice(0, limit);
     res.json({ timeframe, data });
   } catch (error: any) {
     console.error('Leaderboard liquidated error:', error.message);
@@ -51,7 +56,8 @@ router.get('/whales', async (req: Request, res: Response) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
     
-    const data = await withTimeout(leaderboardService.getBiggestPositions(limit));
+    const raw = await withTimeout(leaderboardService.getBiggestPositions(limit + 5));
+    const data = filterOutSystemWallets(raw, r => r.wallet_address).slice(0, limit);
     res.json({ data });
   } catch (error: any) {
     console.error('Leaderboard whales error:', error.message);
@@ -65,7 +71,8 @@ router.get('/active', async (req: Request, res: Response) => {
     const timeframe = validateTimeframe(req.query.timeframe as string);
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
     
-    const data = await withTimeout(leaderboardService.getMostActive(timeframe, limit));
+    const raw = await withTimeout(leaderboardService.getMostActive(timeframe, limit + 5));
+    const data = filterOutSystemWallets(raw, r => r.wallet_address).slice(0, limit);
     res.json({ timeframe, data });
   } catch (error: any) {
     console.error('Leaderboard active error:', error.message);
@@ -79,7 +86,8 @@ router.get('/volume', async (req: Request, res: Response) => {
     const timeframe = validateTimeframe(req.query.timeframe as string);
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
     
-    const data = await withTimeout(leaderboardService.getTopVolume(timeframe, limit));
+    const raw = await withTimeout(leaderboardService.getTopVolume(timeframe, limit + 5));
+    const data = filterOutSystemWallets(raw, r => r.wallet_address).slice(0, limit);
     res.json({ timeframe, data });
   } catch (error: any) {
     console.error('Leaderboard volume error:', error.message);
@@ -92,7 +100,10 @@ router.get('/liquidations/recent', async (req: Request, res: Response) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
     
-    const data = await leaderboardService.getRecentLiquidations(limit);
+    // Fetch a buffer extra so post-filtering system wallets doesn't
+    // drop the result count below what the caller asked for.
+    const rawData = await leaderboardService.getRecentLiquidations(limit + 10);
+    const data = filterOutSystemWallets(rawData, l => l.wallet_address).slice(0, limit);
     res.json({ data });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch liquidations' });
@@ -105,7 +116,8 @@ router.get('/trades/recent', async (req: Request, res: Response) => {
     const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
     const minValue = parseInt(req.query.minValue as string) || 10000;
     
-    const data = await leaderboardService.getRecentTrades(limit, minValue);
+    const rawData = await leaderboardService.getRecentTrades(limit + 10, minValue);
+    const data = filterOutSystemWallets(rawData, t => t.wallet_address).slice(0, limit);
     res.json({ data });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch trades' });
@@ -234,6 +246,14 @@ router.get('/bulk', async (req: Request, res: Response) => {
 
     const cached = await getCache<BulkLeaderboardResponse>(freshKey);
     if (cached) {
+      // Apply filter to cached responses too. Caches populated before
+      // this filter shipped may still contain system wallets, and old
+      // caches live for up to 60s (fresh) / 5min (stale). After those
+      // TTLs the filter-then-cache path above takes over and this
+      // becomes a no-op — but the safety belt is cheap.
+      if (cached?.rows) {
+        cached.rows = cached.rows.filter(row => !isSystemWallet(row.wallet));
+      }
       res.setHeader('X-Bulkstats-Source', 'bulk-indexer');
       res.setHeader('X-Bulkstats-Cache', 'fresh');
       return res.json(cached);
@@ -267,6 +287,12 @@ router.get('/bulk', async (req: Request, res: Response) => {
       // BULK API hiccup. Try stale cache so the page doesn't go blank.
       const stale = await getCache<BulkLeaderboardResponse>(staleKey);
       if (stale) {
+        // Apply system-wallet filter to stale cache too — entries
+        // cached before this filter shipped may include BULK system
+        // accounts that we now hide.
+        if (stale?.rows) {
+          stale.rows = stale.rows.filter(row => !isSystemWallet(row.wallet));
+        }
         res.setHeader('X-Bulkstats-Source', 'bulk-indexer');
         res.setHeader('X-Bulkstats-Cache', 'stale');
         return res.json(stale);
@@ -282,6 +308,21 @@ router.get('/bulk', async (req: Request, res: Response) => {
     }
 
     const data = (await bulkRes.json()) as BulkLeaderboardResponse;
+
+    // Strip out BULK's system/operational accounts (liquidation engine,
+    // insurance fund, market-maker bots etc.) — these show up in BULK's
+    // raw leaderboard with massive volume that would mislead users
+    // browsing "top traders." They remain inspectable by direct URL.
+    //
+    // Filter BEFORE caching so every consumer of the cached response
+    // sees the same filtered view. `total` reflects BULK's count (which
+    // includes system wallets); we don't try to recompute it because
+    // the ranking is BULK-side and adjusting `total` here would
+    // misrepresent it. The visible row count may be 1 less than
+    // `page_size` requested, which is acceptable.
+    if (data?.rows) {
+      data.rows = data.rows.filter(row => !isSystemWallet(row.wallet));
+    }
 
     // Cache both fresh and stale. Done in parallel since they're
     // independent writes.
