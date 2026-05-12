@@ -3,6 +3,7 @@ import { query } from '../db';
 import { getCache, setCache } from '../services/cache';
 import { getActiveSymbols } from '../services/markets';
 import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coinShape';
+import { filterOutSystemWallets } from '../services/systemWallets';
 
 const router = Router();
 
@@ -403,8 +404,14 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
   const limit = parseInt(req.query.limit as string) || 20;
   
   try {
+    // Fetch a few extra rows so that after stripping out BULK system
+    // wallets (liquidation engine etc.) we still have `limit` rows to
+    // return. System-wallet trades aren't real user activity and would
+    // dominate the feed.
+    const fetchExtra = 10;
+
     // Get recent trades - fetch more to ensure we have enough after combining
-    const trades = await query(`
+    const tradesRaw = await query(`
       SELECT 
         'trade' as type,
         wallet_address,
@@ -417,10 +424,11 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
       FROM trades
       ORDER BY timestamp DESC
       LIMIT $1
-    `, [limit]).catch(() => []);
+    `, [limit + fetchExtra]).catch(() => []);
+    const trades = filterOutSystemWallets(tradesRaw, t => t.wallet_address);
     
     // Get recent liquidations - always fetch at least 10 to ensure some show up
-    const liquidations = await query(`
+    const liquidationsRaw = await query(`
       SELECT 
         'liquidation' as type,
         wallet_address,
@@ -433,7 +441,8 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
       FROM liquidations
       ORDER BY timestamp DESC
       LIMIT $1
-    `, [Math.max(limit, 20)]).catch(() => []);
+    `, [Math.max(limit, 20) + fetchExtra]).catch(() => []);
+    const liquidations = filterOutSystemWallets(liquidationsRaw, l => l.wallet_address);
     
     // Strategy: Take all liquidations (up to half the limit) + fill rest with trades
     // This ensures liquidations are always visible even if trades are more frequent
