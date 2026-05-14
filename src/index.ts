@@ -16,6 +16,8 @@ import leaderboardRoutes from './routes/leaderboard';
 import analyticsRoutes from './routes/analytics';
 import walletRoutes from './routes/wallet';
 import userRoutes from './routes/users';
+import explorerRoutes from './routes/explorer';
+import { startExplorerListener } from './services/bulkExplorer';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -278,6 +280,7 @@ app.use('/api/leaderboard', leaderboardRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/wallet', walletRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/explorer', explorerRoutes);
 
 // Debug endpoint to check cache status
 app.get('/debug/cache', async (req, res) => {
@@ -323,6 +326,9 @@ async function start() {
   
   // Start WebSocket listener for live trades/liquidations
   startWebSocketListener();
+
+  // Start explorer WS listener for live block/throughput metrics
+  startExplorerListener();
   
   // Start HTTP server
   app.listen(PORT, () => {
