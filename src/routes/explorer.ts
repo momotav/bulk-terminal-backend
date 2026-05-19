@@ -15,6 +15,7 @@
 import { Router, Request, Response } from 'express';
 import { getThroughput, getRecentBlocks } from '../services/bulkExplorer';
 import { getCache, setCache } from '../services/cache';
+import { bulkFetch } from '../services/bulkAuth';
 
 const router = Router();
 
@@ -66,7 +67,7 @@ router.get('/block/:blockhash', async (req: Request, res: Response) => {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
-    const upstream = await fetch(`${BULK_EXPLORER_HTTP}/block/${blockhash}`, {
+    const upstream = await bulkFetch(`${BULK_EXPLORER_HTTP}/block/${blockhash}`, {
       signal: controller.signal,
     });
     clearTimeout(timer);
@@ -104,7 +105,7 @@ router.get('/tx/:txhash', async (req: Request, res: Response) => {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
-    const upstream = await fetch(`${BULK_EXPLORER_HTTP}/tx/${txhash}`, {
+    const upstream = await bulkFetch(`${BULK_EXPLORER_HTTP}/tx/${txhash}`, {
       signal: controller.signal,
     });
     clearTimeout(timer);
