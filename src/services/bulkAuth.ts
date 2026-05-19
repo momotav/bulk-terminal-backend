@@ -65,10 +65,19 @@ export async function bulkFetch(
 // fetch() accepts headers in three formats: plain object, Headers instance,
 // or array of [name, value] tuples. Convert all three to a plain object
 // for easy merging.
-function normalizeHeaders(
-  h: HeadersInit
-): Record<string, string> {
-  if (h instanceof Headers) {
+//
+// We use an inline union type rather than the DOM lib's `HeadersInit`
+// because some Node tsconfig setups don't include the DOM lib (we don't
+// run in a browser). The union covers the same shapes fetch() accepts.
+type HeadersLike =
+  | Headers
+  | Record<string, string>
+  | string[][]
+  | undefined;
+
+function normalizeHeaders(h: HeadersLike): Record<string, string> {
+  if (!h) return {};
+  if (typeof Headers !== 'undefined' && h instanceof Headers) {
     const obj: Record<string, string> = {};
     h.forEach((value, key) => {
       obj[key] = value;
