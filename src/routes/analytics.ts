@@ -4,6 +4,7 @@ import { getCache, setCache } from '../services/cache';
 import { getActiveSymbols } from '../services/markets';
 import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coinShape';
 import { filterOutSystemWallets } from '../services/systemWallets';
+import { bulkFetch } from '../services/bulkAuth';
 
 const router = Router();
 
@@ -92,7 +93,7 @@ async function fetchKlines(
       params.set('endTime', String(Math.floor(endTime)));
     }
     const url = `${BULK_API_BASE}/klines?${params.toString()}`;
-    const response = await fetch(url);
+    const response = await bulkFetch(url);
     if (!response.ok) return [];
     return await response.json() as BulkKline[];
   } catch (error) {
@@ -125,7 +126,7 @@ async function fetchTickersForStats(): Promise<{ volume24h: number; openInterest
 
   const symbols = await getActiveSymbols();
   const tickerPromises = symbols.map(symbol =>
-    fetch(`${BULK_API_BASE}/ticker/${symbol}`)
+    bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`)
       .then(r => r.ok ? r.json() as Promise<BulkTicker> : null)
       .catch(() => null)
   );
@@ -153,7 +154,7 @@ router.get('/ticker/:symbol', async (req: Request, res: Response) => {
   const { symbol } = req.params;
   
   try {
-    const response = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
+    const response = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
     if (!response.ok) {
       throw new Error(`BULK API returned ${response.status}`);
     }
@@ -204,7 +205,7 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), 5000);
           try {
-            const r = await fetch(
+            const r = await bulkFetch(
               `${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=24`,
               { signal: controller.signal }
             );
@@ -237,7 +238,7 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
-      const response = await fetch(`${BULK_API_BASE}/stats?period=1d`, {
+      const response = await bulkFetch(`${BULK_API_BASE}/stats?period=1d`, {
         signal: controller.signal,
       });
       clearTimeout(timer);
@@ -347,7 +348,7 @@ router.get('/exchange-health', async (req: Request, res: Response) => {
     
     // First try /stats endpoint
     try {
-      const statsRes = await fetch(`${BULK_API_BASE}/stats?period=1d`);
+      const statsRes = await bulkFetch(`${BULK_API_BASE}/stats?period=1d`);
       if (statsRes.ok) {
         const bulkStats = await statsRes.json() as BulkStatsResponse;
         
@@ -498,7 +499,7 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
     // an empty array so one bad coin doesn't take down the chart.
     const klinesResults = await Promise.all(
       symbols.map(symbol =>
-        fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
+        bulkFetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
           .then(r => r.ok ? r.json() : [])
           .catch(() => [])
       )
@@ -595,7 +596,7 @@ router.get('/trades-chart-api', async (req: Request, res: Response) => {
 
     const klinesResults = await Promise.all(
       symbols.map(symbol =>
-        fetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
+        bulkFetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
           .then(r => r.ok ? r.json() : [])
           .catch(() => [])
       )
@@ -1210,7 +1211,7 @@ router.get('/stats', async (req: Request, res: Response) => {
     // Get BULK API stats for volume
     let totalVolume = 0;
     try {
-      const statsRes = await fetch(`${BULK_API_BASE}/stats?period=all`);
+      const statsRes = await bulkFetch(`${BULK_API_BASE}/stats?period=all`);
       if (statsRes.ok) {
         const bulkStats = await statsRes.json() as BulkStatsResponse;
         if (bulkStats?.markets && bulkStats.markets.length > 0) {
@@ -1314,7 +1315,7 @@ router.get('/klines/:symbol', async (req: Request, res: Response) => {
     if (startTime) url += `&startTime=${startTime}`;
     if (endTime) url += `&endTime=${endTime}`;
     
-    const response = await fetch(url);
+    const response = await bulkFetch(url);
     if (!response.ok) {
       throw new Error(`BULK API returned ${response.status}`);
     }
@@ -1381,7 +1382,7 @@ router.get('/volume-chart-bulk', async (req: Request, res: Response) => {
 // OI & Funding from BULK API /stats (current snapshot only)
 router.get('/market-stats-bulk', async (req: Request, res: Response) => {
   try {
-    const response = await fetch(`${BULK_API_BASE}/stats?period=1d`);
+    const response = await bulkFetch(`${BULK_API_BASE}/stats?period=1d`);
     if (!response.ok) {
       throw new Error(`BULK API returned ${response.status}`);
     }
@@ -1419,7 +1420,7 @@ router.get('/tickers-bulk', async (req: Request, res: Response) => {
     const tickers = await Promise.all(
       symbols.map(async (symbol) => {
         try {
-          const response = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
+          const response = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
           if (!response.ok) return null;
           return await response.json() as BulkTicker;
         } catch {
@@ -1959,7 +1960,7 @@ router.get('/liquidations/market/:symbol', async (req: Request, res: Response) =
     let markPrice = 0;
     let priceChange24h = 0;
     try {
-      const tickerRes = await fetch(`${BULK_API_BASE}/ticker/${dbSymbol}`);
+      const tickerRes = await bulkFetch(`${BULK_API_BASE}/ticker/${dbSymbol}`);
       if (tickerRes.ok) {
         const ticker = await tickerRes.json() as BulkTicker;
         markPrice = ticker.markPrice || ticker.lastPrice || 0;
@@ -2078,7 +2079,7 @@ router.get('/regime', async (req: Request, res: Response) => {
 
     for (const symbol of symbols) {
       try {
-        const tickerRes = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
+        const tickerRes = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
         if (tickerRes.ok) {
           const ticker = await tickerRes.json() as any;
           regimeData.push({
@@ -2253,7 +2254,7 @@ router.get('/fee-tiers', async (req: Request, res: Response) => {
     const timer = setTimeout(() => controller.abort(), 3000);
     let feeRes: globalThis.Response;
     try {
-      feeRes = await fetch(`${BULK_API_BASE}/feeState`, { signal: controller.signal });
+      feeRes = await bulkFetch(`${BULK_API_BASE}/feeState`, { signal: controller.signal });
     } finally {
       clearTimeout(timer);
     }
@@ -2535,7 +2536,7 @@ router.get('/orderbook/:coin', async (req: Request, res: Response) => {
 
   try {
     const url = `${BULK_API_BASE}/l2book?type=l2book&coin=${encodeURIComponent(coin)}&nlevels=${nlevels}`;
-    const upstream = await fetch(url);
+    const upstream = await bulkFetch(url);
     if (!upstream.ok) {
       console.error(`BULK /l2book returned ${upstream.status} for ${coin}`);
       return res.status(502).json({ error: 'Upstream order book unavailable' });
@@ -2651,7 +2652,7 @@ router.get('/risk-surfaces/:coin', async (req: Request, res: Response) => {
 
   try {
     const url = `${BULK_API_BASE}/riskSurfaces?market=${encodeURIComponent(coin)}`;
-    const upstream = await fetch(url);
+    const upstream = await bulkFetch(url);
     if (!upstream.ok) {
       console.error(`BULK /riskSurfaces returned ${upstream.status} for ${coin}`);
       return res.status(502).json({ error: 'Upstream risk surfaces unavailable' });
@@ -2712,7 +2713,7 @@ router.get('/exchange-info', async (_req: Request, res: Response) => {
   }
 
   try {
-    const upstream = await fetch(`${BULK_API_BASE}/exchangeInfo`);
+    const upstream = await bulkFetch(`${BULK_API_BASE}/exchangeInfo`);
     if (!upstream.ok) {
       console.error(`BULK /exchangeInfo returned ${upstream.status}`);
       return res.status(502).json({ error: 'Upstream exchange info unavailable' });
