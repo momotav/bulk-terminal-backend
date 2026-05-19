@@ -127,7 +127,15 @@ function connect() {
   connectionState = 'connecting';
 
   try {
-    ws = new WebSocket(WS_URL);
+    // The `ws` library accepts options as second arg. We attach our auth
+    // header to the upgrade-request so it propagates onto the WebSocket
+    // handshake. If BULK's explorer WS enforces auth via the same
+    // `x-bulk-api-key` header used for HTTP, this is how to satisfy it.
+    // If it doesn't enforce, the extra header is harmless.
+    const headers = process.env.BULK_API_KEY
+      ? { 'x-bulk-api-key': process.env.BULK_API_KEY }
+      : undefined;
+    ws = new WebSocket(WS_URL, { headers });
   } catch (err) {
     console.error('Explorer WS construct failed:', err);
     connectionState = 'closed';
