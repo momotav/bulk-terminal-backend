@@ -1050,11 +1050,19 @@ function connect(): void {
   console.log(`🔌 Connecting to BULK WebSocket: ${WS_URL}`);
 
   try {
+    // BULK requires `x-bulk-api-key` on authenticated upstream
+    // connections (HTTP + WS handshake alike). We attach it on the
+    // WS handshake header set. If the env var isn't present, the
+    // header is omitted — useful for local dev.
+    const headers: Record<string, string> = {
+      'User-Agent': 'BULK-Terminal/1.0',
+    };
+    if (process.env.BULK_API_KEY) {
+      headers['x-bulk-api-key'] = process.env.BULK_API_KEY;
+    }
     ws = new WebSocket(WS_URL, {
       handshakeTimeout: 10000,
-      headers: {
-        'User-Agent': 'BULK-Terminal/1.0',
-      },
+      headers,
     });
 
     ws.on('open', async () => {
