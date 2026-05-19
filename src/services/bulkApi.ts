@@ -1,6 +1,7 @@
 // Service to interact with BULK Exchange API
 
 import { getActiveSymbols } from './markets';
+import { bulkFetch } from './bulkAuth';
 
 const BULK_API_URL = process.env.BULK_API_URL || 'https://exchange-api.bulk.trade/api/v1';
 
@@ -99,11 +100,11 @@ class BulkApiService {
   async getTicker(symbol: string): Promise<Ticker | null> {
     try {
       // Try the direct ticker endpoint first
-      let res = await fetch(`${this.baseUrl}/ticker/${symbol}`);
+      let res = await bulkFetch(`${this.baseUrl}/ticker/${symbol}`);
       
       // If that fails, try without the symbol in path (some APIs use query params)
       if (!res.ok) {
-        res = await fetch(`${this.baseUrl}/ticker?symbol=${symbol}`);
+        res = await bulkFetch(`${this.baseUrl}/ticker?symbol=${symbol}`);
       }
       
       if (!res.ok) {
@@ -139,7 +140,7 @@ class BulkApiService {
   async getAllTickers(): Promise<Ticker[]> {
     // First try bulk endpoint
     try {
-      const res = await fetch(`${this.baseUrl}/tickers`);
+      const res = await bulkFetch(`${this.baseUrl}/tickers`);
       if (res.ok) {
         const data: any = await res.json();
         const tickersArray: any[] = data.data || data || [];
@@ -175,7 +176,7 @@ class BulkApiService {
   // Fetch account data for a wallet
   async getFullAccount(walletAddress: string): Promise<FullAccount | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/account`, {
+      const res = await bulkFetch(`${this.baseUrl}/account`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'fullAccount', user: walletAddress }),
@@ -202,7 +203,7 @@ class BulkApiService {
   // back what came down the wire.
   async getActivityHistory(walletAddress: string): Promise<ActivityEvent[]> {
     try {
-      const res = await fetch(`${this.baseUrl}/account`, {
+      const res = await bulkFetch(`${this.baseUrl}/account`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'activityHistory', user: walletAddress }),
@@ -222,7 +223,7 @@ class BulkApiService {
   // Fetch exchange stats
   async getStats(): Promise<Record<string, unknown> | null> {
     try {
-      const res = await fetch(`${this.baseUrl}/stats?period=1d`);
+      const res = await bulkFetch(`${this.baseUrl}/stats?period=1d`);
       if (!res.ok) return null;
       const data = await res.json() as Record<string, unknown>;
       return data;
@@ -235,7 +236,7 @@ class BulkApiService {
   // Fetch order history for a wallet
   async getOrderHistory(walletAddress: string): Promise<unknown[]> {
     try {
-      const res = await fetch(`${this.baseUrl}/account`, {
+      const res = await bulkFetch(`${this.baseUrl}/account`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'orderHistory', user: walletAddress }),
@@ -269,7 +270,7 @@ class BulkApiService {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
     try {
-      const res = await fetch(`${this.baseUrl}/account`, {
+      const res = await bulkFetch(`${this.baseUrl}/account`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'fills', user: walletAddress }),
@@ -372,7 +373,7 @@ class BulkApiService {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
     try {
-      const res = await fetch(`${this.baseUrl}/account`, {
+      const res = await bulkFetch(`${this.baseUrl}/account`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'positions', user: walletAddress }),
