@@ -66,28 +66,32 @@ export async function bulkFetch(
 // or array of [name, value] tuples. Convert all three to a plain object
 // for easy merging.
 //
-// We use an inline union type rather than the DOM lib's `HeadersInit`
-// because some Node tsconfig setups don't include the DOM lib (we don't
-// run in a browser). The union covers the same shapes fetch() accepts.
-type HeadersLike =
-  | Headers
-  | Record<string, string>
-  | string[][]
-  | undefined;
-
-function normalizeHeaders(h: HeadersLike): Record<string, string> {
+// Param typed as `any` because TypeScript's `HeadersInit` type isn't
+// always available depending on tsconfig lib settings, and the Node /
+// DOM type definitions for fetch headers have shifted across versions.
+// Internal helper — we control all callers — so type safety here is
+// less important than build portability.
+function normalizeHeaders(h: any): Record<string, string> {
   if (!h) return {};
   if (typeof Headers !== 'undefined' && h instanceof Headers) {
     const obj: Record<string, string> = {};
-    h.forEach((value, key) => {
+    h.forEach((value: string, key: string) => {
       obj[key] = value;
     });
     return obj;
   }
   if (Array.isArray(h)) {
     const obj: Record<string, string> = {};
-    for (const [k, v] of h) obj[k] = v;
+    for (const [k, v] of h) obj[k] = String(v);
     return obj;
   }
-  return { ...(h as Record<string, string>) };
+  // Plain object — coerce all values to strings since fetch sometimes
+  // accepts arrays of strings (e.g. `Cookie: ['a=1', 'b=2']`) and we
+  // need to flatten down to a single header line.
+  const obj: Record<string, string> = {};
+  for (const k of Object.keys(h)) {
+    const v = h[k];
+    obj[k] = Array.isArray(v) ? v.join(', ') : String(v);
+  }
+  return obj;
 }
