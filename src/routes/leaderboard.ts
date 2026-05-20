@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { leaderboardService, TimeFrame } from '../services/leaderboard';
 import { getCache, setCache } from '../services/cache';
 import { isSystemWallet, filterOutSystemWallets } from '../services/systemWallets';
+import { bulkFetch } from '../services/bulkAuth';
 
 const router = Router();
 
@@ -273,7 +274,7 @@ router.get('/bulk', async (req: Request, res: Response) => {
       // 5s is a problem and we should fall back to stale.
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
-      bulkRes = await fetch(url.toString(), {
+      bulkRes = await bulkFetch(url.toString(), {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
       });
@@ -408,7 +409,7 @@ router.get('/bulk/rank/:address', async (req: Request, res: Response) => {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
-      bulkRes = await fetch(url.toString(), {
+      bulkRes = await bulkFetch(url.toString(), {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
       });
