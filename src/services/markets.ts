@@ -16,6 +16,8 @@
 
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
+import { bulkFetch } from './bulkAuth';
+
 // 5-minute cache. BULK adds/delists markets infrequently so this is plenty
 // fresh, and it keeps us from hammering /exchangeInfo on every reconnect.
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -44,7 +46,7 @@ interface ExchangeInfoMarket {
 }
 
 async function fetchFromBulk(): Promise<string[]> {
-  const res = await fetch(`${BULK_API_BASE}/exchangeInfo`);
+  const res = await bulkFetch(`${BULK_API_BASE}/exchangeInfo`);
   if (!res.ok) {
     throw new Error(`BULK /exchangeInfo returned ${res.status}`);
   }
