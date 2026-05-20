@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
+import { bulkFetch } from '../services/bulkAuth';
 
 // ============================================
 // OPTIMIZED DATA COLLECTOR
@@ -433,7 +434,7 @@ const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 // Collect fee state snapshot (for protocol revenue tracking)
 async function collectFeeSnapshot(): Promise<void> {
   try {
-    const res = await fetch(`${BULK_API_BASE}/feeState`);
+    const res = await bulkFetch(`${BULK_API_BASE}/feeState`);
     if (!res.ok) {
       console.error('Failed to fetch fee state from BULK API');
       return;
