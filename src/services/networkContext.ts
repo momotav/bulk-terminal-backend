@@ -18,7 +18,7 @@
 //
 //   3. If a function runs OUTSIDE of a request handler (e.g. a cron
 //      job calling bulkFetch), `getRequestNetwork()` returns
-//      'mainnet' — the safe default.
+//      'testnet' — the safe default.
 //
 // This is a standard Node pattern (similar to thread-local storage in
 // Java/C++ or `contextvars` in Python). No magic, no globals, no
@@ -48,7 +48,7 @@ export function requestNetworkMiddleware(
   networkContext.run(net, next);
 }
 
-// Returns the network chosen by the current request, or 'mainnet' if
+// Returns the network chosen by the current request, or 'testnet' if
 // called outside of any request context (e.g. from a cron job).
 // Safe to call from anywhere; never throws.
 export function getRequestNetwork(): NetworkId {
