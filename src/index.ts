@@ -18,6 +18,7 @@ import walletRoutes from './routes/wallet';
 import userRoutes from './routes/users';
 import explorerRoutes from './routes/explorer';
 import { startExplorerListener } from './services/bulkExplorer';
+import { requestNetworkMiddleware } from './services/networkContext';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -53,6 +54,13 @@ app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
   next();
 });
+
+// Network context middleware. Reads `?net=<mainnet|staging>` from the
+// query string and stashes the parsed value in async-local storage so
+// every BULK upstream call inside this request gets routed to the
+// chosen network's URLs. Without this middleware, all fetches go to
+// mainnet (the safe default).
+app.use(requestNetworkMiddleware);
 
 // Health check
 app.get('/health', (req, res) => {
