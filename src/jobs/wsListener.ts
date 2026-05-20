@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
 import { getActiveSymbols } from '../services/markets';
+import { bulkFetch } from '../services/bulkAuth';
 
 const WS_URL = process.env.BULK_WS_URL || 'wss://exchange-ws1.bulk.trade';
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
@@ -93,7 +94,7 @@ async function snapshotTickersFallback(): Promise<void> {
     }
     
     try {
-      const res = await fetch(`${BULK_API_BASE}/ticker/${symbol}`);
+      const res = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
       if (!res.ok) continue;
       
       const ticker = await res.json() as TickerData;
