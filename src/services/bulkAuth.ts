@@ -20,10 +20,10 @@
 // BULK) rather than silently sending an empty key.
 //
 // `bulkFetch` also accepts an optional `{ net }` parameter to route
-// the request at staging instead of mainnet. The URL passed in is
-// always a mainnet URL — `resolveBulkUrl` rewrites the host based on
+// the request at devnet instead of testnet. The URL passed in is
+// always a testnet URL — `resolveBulkUrl` rewrites the host based on
 // the target network. This means existing call sites don't need to
-// change at all to support staging; routes just need to thread the
+// change at all to support devnet; routes just need to thread the
 // `net` value down from the request to the call site.
 
 import { resolveBulkUrl, type NetworkId } from './networks';
@@ -50,10 +50,10 @@ export function bulkHeaders(): Record<string, string> {
 // All existing fetch options pass through unchanged.
 //
 // The optional `opts.net` argument controls which BULK network to
-// target. When unset (or 'mainnet'), the URL is used as-is. When
-// 'staging', the URL's host is rewritten to the staging equivalent
+// target. When unset (or 'testnet'), the URL is used as-is. When
+// 'devnet', the URL's host is rewritten to the devnet equivalent
 // via resolveBulkUrl. The same auth key is sent regardless — BULK
-// has confirmed staging accepts the mainnet key.
+// has confirmed devnet accepts the testnet key.
 export interface BulkFetchOpts {
   net?: NetworkId;
 }
@@ -72,7 +72,7 @@ export async function bulkFetch(
   // Pick network in priority order:
   //   1. Explicit opts.net (caller knows exactly what they want)
   //   2. Request-scoped context (set by requestNetworkMiddleware)
-  //   3. mainnet (default, for cron jobs and contexts without a request)
+  //   3. testnet (default, for cron jobs and contexts without a request)
   const net = opts?.net ?? getRequestNetwork();
   const targetUrl = resolveBulkUrl(typeof url === 'string' ? url : url.toString(), net);
 
