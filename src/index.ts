@@ -55,11 +55,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// Network context middleware. Reads `?net=<mainnet|staging>` from the
+// Network context middleware. Reads `?net=<testnet|devnet>` from the
 // query string and stashes the parsed value in async-local storage so
 // every BULK upstream call inside this request gets routed to the
 // chosen network's URLs. Without this middleware, all fetches go to
-// mainnet (the safe default).
+// testnet (the safe default).
 app.use(requestNetworkMiddleware);
 
 // Health check
