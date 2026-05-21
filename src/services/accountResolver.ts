@@ -66,6 +66,12 @@ const cacheKey = (address: string): string => `hierarchy:${address}`;
  * Returns Unknown kind if BULK doesn't recognize the address (e.g. a wallet
  * that has never deposited). Negative results are cached too, with a shorter
  * TTL so a wallet that just signed up doesn't stay invisible for 24h.
+ *
+ * BULK v1.0.15 NOTE: The master snapshot's `subAccounts[]` array now returns
+ * only `{pubkey}` — names were removed. To preserve the user-facing
+ * "gamble (alice's sub-account)" labels everywhere, we enrich masters with
+ * children by fetching each sub's own snapshot in parallel and merging the
+ * `name` field. 24h cache means this happens at most once per master per day.
  */
 export async function resolveHierarchy(address: string): Promise<AccountHierarchy> {
   const cached = await getCache<AccountHierarchy>(cacheKey(address));
@@ -73,12 +79,50 @@ export async function resolveHierarchy(address: string): Promise<AccountHierarch
 
   const fullAccount = await bulkApi.getFullAccount(address);
 
+  // Base hierarchy view from the queried account.
+  let subAccounts: SubAccountRef[] = fullAccount?.subAccounts ?? [];
+
+  // v1.0.15 enrichment: if this is a master with naked subAccounts (no name
+  // field), fan out and fetch each sub's own snapshot to harvest names.
+  // Sub-account snapshots carry `name` at the top level (verified live
+  // 2026-05-21). Failures here are tolerated — a missing name falls back
+  // to "Unnamed sub-account" in the frontend, which is no worse than the
+  // pre-fix state.
+  const needsNameEnrichment =
+    fullAccount?.kind === 'MasterEOA' &&
+    subAccounts.length > 0 &&
+    subAccounts.some((s) => !s.name);
+
+  if (needsNameEnrichment) {
+    const enriched = await Promise.all(
+      subAccounts.map(async (sub): Promise<SubAccountRef> => {
+        // If BULK already gave us a name (defensive — shouldn't happen on
+        // v1.0.15+, but cheap to handle in case they put it back), skip.
+        if (sub.name) return sub;
+        try {
+          const subAccount = await bulkApi.getFullAccount(sub.pubkey);
+          // The name is on the sub's own snapshot. Coerce null/undefined
+          // away so the type stays `string | undefined` (not `... | null`).
+          const name = subAccount?.name ?? undefined;
+          return name ? { pubkey: sub.pubkey, name } : sub;
+        } catch (err) {
+          console.warn(
+            `[accountResolver] name fetch failed for sub ${shortAddr(sub.pubkey)}:`,
+            err
+          );
+          return sub;
+        }
+      })
+    );
+    subAccounts = enriched;
+  }
+
   const result: AccountHierarchy = fullAccount
     ? {
         address,
         kind: fullAccount.kind ?? 'Unknown',
         parent: fullAccount.parent,
-        subAccounts: fullAccount.subAccounts ?? [],
+        subAccounts,
         multisigAccounts: fullAccount.multisigAccounts ?? [],
         resolvedAt: Date.now(),
       }
