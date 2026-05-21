@@ -54,7 +54,14 @@ export interface FullAccount {
   // `subAccounts` field at all rather than an empty array).
   kind?: 'MasterEOA' | 'SubAccount';
   parent?: string;                          // present on sub-accounts only
-  subAccounts?: { pubkey: string; name?: string }[]; // present on masters with children
+  /**
+   * Display name. Present on sub-account snapshots only — BULK v1.0.15
+   * removed `name` from the master's subAccounts[] array, so to render
+   * "gamble" instead of a pubkey you must fetch the sub's own snapshot
+   * and read this field. `null` for masters and unnamed subs.
+   */
+  name?: string | null;
+  subAccounts?: { pubkey: string; name?: string }[]; // v1.0.15: only {pubkey} now
   multisigAccounts?: string[];              // multisigs this account is a member of
   authorizedAgentWallets?: string[];
 
