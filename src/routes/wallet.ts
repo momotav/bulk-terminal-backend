@@ -307,15 +307,22 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
         // Prefer the string `reason` ("liquidation", "trade") over the
         // numeric `reasonCode` since the frontend marker logic compares
         // strings. Map to our standard tokens.
+        //
+        // v1.0.15 added reasonCode 3 = "liquidation_sweep" (partial-liq
+        // cascade). Check for "sweep" BEFORE the generic "liq" check so
+        // "liquidation_sweep" gets the more specific `liq_sweep` token
+        // rather than the generic `liq`.
         reasonCode: ((): string => {
           const reason = String(f.reason ?? '').toLowerCase();
+          if (reason.includes('sweep')) return 'liq_sweep';
           if (reason.includes('liq')) return 'liq';
           if (reason.includes('adl')) return 'adl';
           // Numeric fallback when string is missing — based on observed
-          // BULK behavior: 0 = trade, 1 = liq, 2 = adl.
+          // BULK behavior: 0 = trade, 1 = liq, 2 = adl, 3 = liq_sweep (v1.0.15).
           const code = Number(f.reasonCode ?? 0);
           if (code === 1) return 'liq';
           if (code === 2) return 'adl';
+          if (code === 3) return 'liq_sweep';
           return 'trade';
         })(),
         // Pass through identifiers in case the frontend needs them later.
@@ -456,13 +463,16 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
 
       // Liquidation detection. BULK uses `closeReason` (string) on closed
       // positions, not `reason` or numeric `reasonCode`. Common values
-      // observed: "liquidation", "trade", "adl". Match flexibly so we
-      // don't miss variants like "Liquidation" or "liquidated".
+      // observed: "liquidation", "trade", "adl". v1.0.15 added
+      // "liquidation_sweep". Match flexibly so we don't miss variants
+      // like "Liquidation" or "liquidated", and so sweep counts as a
+      // liquidation-flavored close (it economically IS one).
       const closeReason = String(p.closeReason ?? p.reason ?? '').toLowerCase();
       const liquidated =
         Boolean(p.liquidated ?? false) ||
-        closeReason.includes('liq') ||
-        Number(p.reasonCode ?? 0) === 1;
+        closeReason.includes('liq') || // matches "liquidation" AND "liquidation_sweep"
+        Number(p.reasonCode ?? 0) === 1 ||
+        Number(p.reasonCode ?? 0) === 3;
 
       return {
         symbol: String(p.symbol ?? p.sym ?? p.c ?? ''),
