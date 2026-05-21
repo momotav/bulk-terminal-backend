@@ -406,15 +406,15 @@ class BulkApiService {
   // Fetch closed-position history for a wallet.
   //
   // Per BULK docs, `positions` returns the last 5000 closed positions —
-  // each one is a full open→close lifecycle with realized PnL already
-  // computed (with fees and funding accounted for). This is what we
-  // surface as "Recent Trades" on the wallet page: real position-level
-  // events the user cares about, not individual fills.
+  // each one is a full open→close lifecycle with `realizedPnl`, `fees`,
+  // and `funding` as separate fields. realizedPnl is GROSS price-only
+  // PnL; downstream code nets `realizedPnl + fees + funding` to display
+  // true economic PnL. See `normalizeClosedPosition` in wallet.ts for
+  // the canonical netting site. Convention verified live 2026-05-21.
   //
   // Same shape-tolerance and logging strategy as getFills since BULK has
   // a habit of wrapping responses inconsistently (single-object .X vs
-  // array .X vs flat). The response shape isn't documented yet, so we
-  // dump raw on empty for fast diagnosis.
+  // array .X vs flat).
   async getClosedPositions(walletAddress: string): Promise<unknown[]> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
