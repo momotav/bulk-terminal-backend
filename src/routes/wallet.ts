@@ -538,23 +538,95 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
   }
 });
 
-// GET /wallet/:address/liquidations - Get liquidation history
+// GET /wallet/:address/liquidations - Risk event history (liquidations + ADL)
+//
+// Source: BULK POST /account type:"riskHistory" exclusively. The DB
+// `liquidations` and `adl_events` tables are no longer consulted here
+// — they remain populated by wsListener for analytics aggregations
+// elsewhere in the app, but the wallet detail page is now BULK-only
+// so users see the rich fields (marginPrior, marginAfter, reason) that
+// only this endpoint carries.
+//
+// Tradeoff: BULK runs a 5000-event protocol-wide ring buffer and has
+// been observed to reset across testnet redeploys, so a wallet that
+// was liquidated weeks ago may return empty. Acceptable per the
+// architectural decision in the v1.0.15 migration — single source of
+// truth, richer data, fewer code paths.
+//
+// Query params:
+//   ?limit=50           Max events to return (default 50, cap 500)
+//   ?type=liquidation   Filter by event type ('liquidation' | 'adl' | 'all', default 'all')
+//
+// Response:
+//   {
+//     events: RiskEvent[],
+//     source: 'bulk',
+//     truncated: boolean,    // true when BULK returned >= 5000 events
+//   }
 router.get('/:address/liquidations', async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
-    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
-    
-    const liquidations = await query(
-      `SELECT * FROM liquidations 
-       WHERE wallet_address = $1 
-       ORDER BY timestamp DESC 
-       LIMIT $2`,
-      [address, limit]
-    );
-    
-    res.json({ data: liquidations });
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 500);
+    const typeFilter = String(req.query.type ?? 'all').toLowerCase();
+
+    const raw = await bulkApi.getRiskHistory(address);
+
+    // Convert ns timestamp → ms, derive position side from fill direction,
+    // pre-compute margin delta + USD value so the frontend stays simple.
+    //
+    // Side derivation: `isBuy` is the side of the LIQUIDATING FILL, not the
+    // position. A long position is closed by a forced sell, so:
+    //   - isBuy: false (forced sell) → position was LONG
+    //   - isBuy: true  (forced buy)  → position was SHORT
+    const events = raw
+      .filter((e) => {
+        if (typeFilter === 'all') return true;
+        return e.eventType === typeFilter;
+      })
+      .map((e) => {
+        const tsMs = Math.floor(Number(e.timestamp) / 1e6); // ns → ms
+        const size = Number(e.amount) || 0;
+        const price = Number(e.price) || 0;
+        const marginPrior = Number(e.marginPrior) || 0;
+        const marginAfter = Number(e.marginAfter) || 0;
+        return {
+          eventType: e.eventType,
+          symbol: String(e.symbol ?? ''),
+          side: e.isBuy ? 'short' : 'long', // see comment above
+          size,
+          price,
+          value: size * price,
+          marginPrior,
+          marginAfter,
+          marginDelta: marginAfter - marginPrior, // negative = loss
+          reason: String(e.reason ?? ''),
+          iso: Boolean(e.iso),
+          timestamp: tsMs,
+          slot: Number(e.slot) || 0,
+          sequence: Number(e.sequence) || 0,
+        };
+      })
+      // Newest first. Tiebreak by sequence so events in the same slot keep
+      // a deterministic order (BULK's intra-block sequence number).
+      .sort((a, b) => {
+        if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp;
+        return b.sequence - a.sequence;
+      });
+
+    const trimmed = events.slice(0, limit);
+
+    res.json({
+      events: trimmed,
+      source: 'bulk' as const,
+      // BULK's ring buffer is 5000 events. If we got back 5000 from raw,
+      // the wallet's history almost certainly extends further back than
+      // BULK is keeping. UI can hint at this so users don't think they're
+      // seeing the complete record.
+      truncated: raw.length >= 5000,
+    });
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Failed to fetch liquidations' });
+    console.error('GET /wallet/:address/liquidations error:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch risk events' });
   }
 });
 
