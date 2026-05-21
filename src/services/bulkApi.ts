@@ -22,8 +22,21 @@ export interface Position {
   size: number;
   price: number;
   notional: number;
+  // PnL convention (BULK v1.0.x): realizedPnl + unrealizedPnl are GROSS —
+  // they're pure price math (close - open) × size, with no fees or funding
+  // netted. To compute the true economic PnL of a position you must add
+  // the `fees` (already negative-signed when paid) and `funding` fields:
+  //
+  //   netPnl = realizedPnl + unrealizedPnl + fees + funding
+  //
+  // Confirmed live 2026-05-21 against `Cpc7KD5C…`: closed-position rows
+  // had realizedPnl=-266.94 matching (close-open)*size exactly, fees=-192.19
+  // returned separately, and margin.realizedPnl summed gross across all
+  // closed positions. We net at every display surface.
   unrealizedPnl: number;
   realizedPnl: number;
+  fees: number;        // negative when paid by trader; zero before first fill
+  funding: number;     // signed (negative when paid, positive when received)
   leverage: number;
   liquidationPrice: number;
 }
@@ -69,8 +82,14 @@ export interface FullAccount {
     totalBalance: number;
     availableBalance: number;
     marginUsed: number;
+    // Aggregate wallet PnL across all positions. Same gross convention as
+    // per-position fields — must net `fees + funding` to display true PnL.
+    // See `Position` doc above for the full rationale.
     realizedPnl: number;
     unrealizedPnl: number;
+    fees: number;       // wallet-wide total, negative when net paid
+    funding: number;    // wallet-wide total, signed
+    notional?: number;  // wallet-wide gross notional; BULK includes this on margin too
   };
   positions: Position[];
   openOrders: unknown[];
