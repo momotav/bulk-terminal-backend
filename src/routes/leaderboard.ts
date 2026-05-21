@@ -193,14 +193,22 @@ type BulkMetric = typeof BULK_METRICS[number];
 interface BulkLeaderboardRow {
   rank: number;
   wallet: string;
+  // Gross realized PnL — closed-position price math only.
   realized_pnl: number;
+  // Net realized PnL — gross minus fees. UI headlines should use this.
   net_realized_pnl: number;
+  // Total fees paid (negative-signed). realized_pnl + fees_paid = net_realized_pnl.
+  fees_paid?: number;
   volume: number;
   closed_count: number;
   roi: number | null;
   net_realized_roi: number | null;
   cashflow_adjusted_roi: number | null;
   win_rate: number;
+  peak_notional?: number;
+  peak_balance?: number;
+  effective_capital?: number;
+  skill_score?: number;
   updated_at: string;
 }
 
