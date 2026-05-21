@@ -617,8 +617,13 @@ function processMessage(data: WebSocket.Data): void {
         const reason = trade.reason || null;
         
         // Check for liquidation
-        // Per BULK API docs: reason="liquidation" and/or liq=true
-        const isLiquidation = reason === 'liquidation' || 
+        // Per BULK API docs: reason="liquidation" and/or liq=true.
+        // v1.0.15 added reason="liquidation_sweep" (fill reasonCode 3) — a
+        // partial-liquidation cascade. Treat it as a liquidation for DB
+        // purposes since it IS one economically; the wallet detail page's
+        // chart marker distinguishes the two via the fills.reasonCode token.
+        const isLiquidation = reason === 'liquidation' ||
+                              reason === 'liquidation_sweep' ||
                               trade.liq === true ||
                               trade.liquidation || trade.isLiquidation || 
                               trade.orderType === 'liquidation' || 
@@ -820,8 +825,11 @@ function processMessage(data: WebSocket.Data): void {
         const taker = trade.taker;
         const time = trade.time || trade.T || Date.now();
         
-        // Route based on reason field
-        if (reason === 'liquidation' || trade.liq === true) {
+        // Route based on reason field.
+        // v1.0.15 added reason="liquidation_sweep" as a sibling of "liquidation"
+        // (a partial-liquidation cascade). Group with liquidation here so DB
+        // counters / liquidation tables include sweeps.
+        if (reason === 'liquidation' || reason === 'liquidation_sweep' || trade.liq === true) {
           // IMPORTANT: Only record the TAKER - they are the liquidated party
           if (taker) {
             console.log(`🔥 LIQUIDATION (from trades): ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
