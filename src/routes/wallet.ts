@@ -7,6 +7,52 @@ import { resolveHierarchy } from '../services/accountResolver';
 
 const router = Router();
 
+// Net a FullAccount's PnL fields in-place semantics — returns a new object
+// with `realizedPnl` and `unrealizedPnl` on both `margin` and each
+// `position` overwritten to include fees+funding. BULK reports these
+// values as GROSS (pure price math), with fees and funding as separate
+// signed fields; downstream UI surfaces want the true economic PnL, so
+// we collapse the breakdown here once at the API boundary rather than
+// scattering the math across every consumer.
+//
+// We preserve the original gross-component fields (`fees`, `funding`)
+// alongside so any consumer that wants to show a breakdown still can.
+//
+// Per-position semantics:
+//   net realizedPnl   = realizedPnl + fees + funding
+//   net unrealizedPnl = unrealizedPnl   (mark-to-market doesn't book fees)
+//
+// Wallet-aggregate (margin object) semantics:
+//   margin.realizedPnl   gets the fees+funding adjustment (wallet-level)
+//   margin.unrealizedPnl stays gross (mark-to-market)
+//
+// Logic mirrors wsListener.ts / dataCollector.ts so DB snapshots and
+// HTTP responses stay in sync semantically.
+function netFullAccount(account: FullAccount): FullAccount {
+  const netPositions = account.positions.map((p) => ({
+    ...p,
+    // Roll per-position fees+funding into realized side. Leave fees/funding
+    // fields intact so the frontend can show a breakdown if desired.
+    realizedPnl: (p.realizedPnl || 0) + (p.fees || 0) + (p.funding || 0),
+    // Unrealized stays gross — it's the mark-to-market component and
+    // BULK doesn't accrue fees against unrealized.
+    unrealizedPnl: p.unrealizedPnl || 0,
+  }));
+
+  const m = account.margin || ({} as FullAccount['margin']);
+  const netMargin = {
+    ...m,
+    realizedPnl: (m.realizedPnl || 0) + (m.fees || 0) + (m.funding || 0),
+    unrealizedPnl: m.unrealizedPnl || 0,
+  };
+
+  return {
+    ...account,
+    margin: netMargin,
+    positions: netPositions,
+  };
+}
+
 // Helper: store snapshot from an already-fetched FullAccount, avoiding
 // a duplicate BULK API round-trip. The previous version of this function
 // called bulkApi.getFullAccount() internally, which meant every wallet
@@ -14,25 +60,39 @@ const router = Router();
 // here. That added 200-500ms per visit on no actual benefit.
 async function storeWalletSnapshot(walletAddress: string, account: FullAccount): Promise<void> {
   try {
-    // Calculate totals from positions
+    // Calculate totals from positions. PnL convention: BULK reports
+    // realizedPnl / unrealizedPnl as GROSS (price math only), with fees
+    // and funding as separate signed siblings. We net them at every
+    // storage site so leaderboard / analytics rankings reflect true
+    // economic PnL. See wsListener.ts for the full breakdown.
     let totalNotional = 0;
     let totalRealizedPnl = 0;
     let totalUnrealizedPnl = 0;
+    let totalFees = 0;
+    let totalFunding = 0;
 
     for (const p of account.positions) {
       totalNotional += Math.abs(p.notional || 0);
       totalRealizedPnl += p.realizedPnl || 0;
       totalUnrealizedPnl += p.unrealizedPnl || 0;
+      totalFees += p.fees || 0;
+      totalFunding += p.funding || 0;
     }
 
     // Use margin totals if available (more authoritative than per-position
     // sums because margin includes cross-account effects).
     const marginRealizedPnl = account.margin?.realizedPnl || 0;
     const marginUnrealizedPnl = account.margin?.unrealizedPnl || 0;
+    const marginFees = account.margin?.fees || 0;
+    const marginFunding = account.margin?.funding || 0;
 
     const realizedPnl = marginRealizedPnl !== 0 ? marginRealizedPnl : totalRealizedPnl;
     const unrealizedPnl = marginUnrealizedPnl !== 0 ? marginUnrealizedPnl : totalUnrealizedPnl;
-    const totalPnl = realizedPnl + unrealizedPnl;
+    const fees = marginFees !== 0 ? marginFees : totalFees;
+    const funding = marginFunding !== 0 ? marginFunding : totalFunding;
+
+    // Net economic PnL — what the trader actually pocketed.
+    const totalPnl = realizedPnl + unrealizedPnl + fees + funding;
 
     // Update trader with current PnL. Don't await — fire and forget. The
     // user is waiting on this endpoint and the trader update is purely
@@ -48,12 +108,16 @@ async function storeWalletSnapshot(walletAddress: string, account: FullAccount):
 
     // Store snapshot for history. Same fire-and-forget pattern. Skip if
     // the wallet has nothing to snapshot — saves snapshot table bloat.
+    // Column semantics match wsListener/dataCollector: `pnl` carries
+    // realized+fees+funding (everything booked), `unrealized_pnl` is the
+    // gross mark-to-market component.
     if (account.positions.length > 0 || totalPnl !== 0) {
+      const snapshotRealizedNet = realizedPnl + fees + funding;
       void query(
         `INSERT INTO trader_snapshots
          (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
          VALUES ($1, $2, $3, $4, $5)`,
-        [walletAddress, realizedPnl, unrealizedPnl, account.positions.length, totalNotional]
+        [walletAddress, snapshotRealizedNet, unrealizedPnl, account.positions.length, totalNotional]
       ).catch((err) => console.error('snapshot insert failed:', err));
     }
   } catch (error) {
@@ -154,17 +218,23 @@ router.get('/:address', async (req: Request, res: Response) => {
       markPrices[ticker.symbol] = ticker.markPrice;
     }
 
+    // Net the PnL fields at the API boundary so all consumers (the
+    // wallet page KPIs, the positions list, the PnL chart fallback) see
+    // true economic PnL without each surface having to do the math.
+    // Frontend code can stay shape-stable; only the values change.
+    const netted = netFullAccount(account);
+
     const result = {
       address,
-      live: account,
+      live: netted,
       markPrices,
       tracked: trader,
       history: snapshots.reverse(),
     };
 
-    // Fire-and-forget snapshot write. We already have the FullAccount, so
-    // we pass it directly — no second BULK round-trip. Never blocks the
-    // response.
+    // Fire-and-forget snapshot write. Pass the ORIGINAL gross account —
+    // storeWalletSnapshot has its own netting logic that also needs to
+    // see the raw fees/funding fields to log the breakdown.
     void storeWalletSnapshot(address, account);
 
     // Cache for both fresh (30s) and stale (5min) keys. The stale key is
@@ -482,7 +552,19 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
         closePrice,
         openedAt: toMs(openTs),
         closedAt: toMs(closeTs),
-        realizedPnl: Number(p.realizedPnl ?? p.pnl ?? p.realized_pnl ?? p.realized ?? 0),
+        // NET realized PnL — BULK returns the gross price-PnL component
+        // separately from fees/funding (e.g. realizedPnl=-266.94 +
+        // fees=-192.19 + funding=0 = trueNet=-459.13). We expose ONE
+        // `realizedPnl` field that's already net so downstream code stays
+        // simple; the gross components are available separately below
+        // for hover/tooltip breakdowns.
+        realizedPnl:
+          Number(p.realizedPnl ?? p.pnl ?? p.realized_pnl ?? p.realized ?? 0) +
+          Number(p.fees ?? p.fee ?? 0) +
+          Number(p.funding ?? 0),
+        // Keep the original gross PnL so the UI can show "Gross $X · Fees $Y"
+        // breakdowns without re-deriving anything.
+        grossPnl: Number(p.realizedPnl ?? p.pnl ?? p.realized_pnl ?? p.realized ?? 0),
         fees: Number(p.fees ?? p.fee ?? 0),
         funding: Number(p.funding ?? 0),
         // Leverage isn't included on closed-position responses — BULK
@@ -681,21 +763,27 @@ router.get('/:address/hierarchy', async (req: Request, res: Response) => {
         }
         const acc = await bulkApi.getFullAccount(pk);
         if (!acc) return;
+        // Net at the API boundary — same semantics as the main GET handler.
+        // Hierarchy banner shows per-account "current PnL" and that's now
+        // the user-facing net value, including the fees/funding components.
+        const m = acc.margin;
+        const netRealized = (m?.realizedPnl ?? 0) + (m?.fees ?? 0) + (m?.funding ?? 0);
+        const netUnrealized =
+          m?.unrealizedPnl ??
+          acc.positions?.reduce((s, p) => s + (p.unrealizedPnl || 0), 0) ??
+          0;
         const summary = {
-          totalBalance: acc.margin?.totalBalance ?? 0,
-          availableBalance: acc.margin?.availableBalance ?? 0,
-          marginUsed: acc.margin?.marginUsed ?? 0,
+          totalBalance: m?.totalBalance ?? 0,
+          availableBalance: m?.availableBalance ?? 0,
+          marginUsed: m?.marginUsed ?? 0,
           // notional/unrealized/realized may not be on the margin object on all
           // BULK API versions — fall back to summing positions when missing.
           notional:
-            (acc.margin as any)?.notional ??
+            (m as any)?.notional ??
             acc.positions?.reduce((s, p) => s + (p.notional || 0), 0) ??
             0,
-          unrealizedPnl:
-            acc.margin.unrealizedPnl ??
-            acc.positions?.reduce((s, p) => s + (p.unrealizedPnl || 0), 0) ??
-            0,
-          realizedPnl: acc.margin.realizedPnl ?? 0,
+          unrealizedPnl: netUnrealized,
+          realizedPnl: netRealized,
           positionsCount: acc.positions?.length ?? 0,
         };
         await setCache(cacheKey, summary, SUMMARY_TTL);
