@@ -28,6 +28,26 @@ export interface Position {
   liquidationPrice: number;
 }
 
+// Raw risk-event row as returned by BULK's POST /account type:"riskHistory"
+// endpoint (v1.0.15). Wrapper shape on the wire is [{ riskHistory: {...} }, ...]
+// — we unwrap to RawRiskEvent in getRiskHistory(). Field names verified
+// against a live production sample on 2026-05-21.
+export interface RawRiskEvent {
+  owner: string;
+  symbol: string;
+  isBuy: boolean;       // direction of the forced fill, NOT the position side
+  amount: number;       // size in base units (unscaled)
+  price: number;        // fill price
+  eventType: 'liquidation' | 'adl';
+  marginPrior: number;  // margin balance snapshot before the event
+  marginAfter: number;  // margin balance snapshot after the event
+  reason: string;       // human-readable, e.g. "liquidation due to equity X < maintenance margin: Y"
+  iso: boolean;         // true for isolated-margin per-instrument events
+  slot: number;         // Solana slot number
+  timestamp: number;    // NANOSECONDS since epoch — divide by 1e6 for ms
+  sequence: number;     // per-block sequence; useful as tiebreaker on identical timestamps
+}
+
 export interface FullAccount {
   // v1.0.14 hierarchy fields. Optional on the type because BULK omits them
   // when not applicable (e.g. masters with no sub-accounts have no
@@ -459,6 +479,103 @@ class BulkApiService {
           : error?.message || 'unknown error';
       console.error(
         `[bulkApi.getClosedPositions] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
+      );
+      return [];
+    }
+  }
+
+  // Fetch the last 5000 protocol-wide risk events (liquidation + ADL) for a
+  // wallet via POST /account type:"riskHistory" (BULK v1.0.15).
+  //
+  // Response shape on the wire (verified live 2026-05-21):
+  //   [
+  //     { "riskHistory": { owner, symbol, isBuy, amount, price, eventType,
+  //                        marginPrior, marginAfter, reason, iso, slot,
+  //                        timestamp, sequence } },
+  //     ...
+  //   ]
+  //
+  // IMPORTANT: BULK's riskHistory is a 5000-event ring buffer at the
+  // protocol level, not a per-wallet log. Heavy traders eventually fall
+  // off as the ring rotates. BULK has also been observed to reset this
+  // state across testnet resets / redeploys (our DB has wallets with 500+
+  // historical liqs that come back empty from this endpoint).
+  //
+  // We accept this tradeoff in exchange for the rich fields BULK provides
+  // (marginPrior / marginAfter / reason) that our DB doesn't capture from
+  // the WS stream. The wallet detail page reads exclusively from this
+  // endpoint; DB liquidations remain for analytics aggregations only.
+  //
+  // Same defensive shape-detection as getFills / getClosedPositions so a
+  // future BULK rewrap doesn't silently break the panel.
+  async getRiskHistory(walletAddress: string): Promise<RawRiskEvent[]> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await bulkFetch(`${this.baseUrl}/account`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'riskHistory', user: walletAddress }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        console.warn(
+          `[bulkApi.getRiskHistory] BULK returned ${res.status} for ${walletAddress.slice(0, 8)}…`
+        );
+        return [];
+      }
+      const data = await res.json() as unknown[];
+      const results: RawRiskEvent[] = [];
+
+      // Production shape: [{ riskHistory: {...one event...} }, ...]
+      // Defensive: also handle flat [event, ...] and wrapped-array
+      // [{ riskHistory: [event, ...] }] in case BULK changes its mind.
+      if (Array.isArray(data)) {
+        for (const raw of data) {
+          if (!raw || typeof raw !== 'object') continue;
+          const obj = raw as Record<string, unknown>;
+          if ('riskHistory' in obj) {
+            const v = obj.riskHistory;
+            if (Array.isArray(v)) {
+              for (const ev of v) {
+                if (ev && typeof ev === 'object') results.push(ev as RawRiskEvent);
+              }
+            } else if (v && typeof v === 'object') {
+              results.push(v as RawRiskEvent);
+            }
+          } else if ('eventType' in obj) {
+            // Flat shape — the element itself is the event
+            results.push(obj as unknown as RawRiskEvent);
+          }
+        }
+      }
+
+      // Empty result is plausible (wallet has no liquidations, OR BULK reset)
+      // — both are valid states. Log raw preview only when we got something
+      // back but extracted nothing, which signals a shape mismatch.
+      if (results.length === 0 && Array.isArray(data) && data.length > 0) {
+        try {
+          const preview = JSON.stringify(data).slice(0, 500);
+          console.warn(
+            `[bulkApi.getRiskHistory] SHAPE MISMATCH for ${walletAddress.slice(0, 8)}… — ` +
+              `raw preview: ${preview}`
+          );
+        } catch { /* ignore */ }
+      }
+
+      console.log(
+        `[bulkApi.getRiskHistory] ${walletAddress.slice(0, 8)}… → ${results.length} events`
+      );
+      return results;
+    } catch (error: any) {
+      clearTimeout(timer);
+      const reason =
+        error?.name === 'AbortError'
+          ? 'timed out after 8s'
+          : error?.message || 'unknown error';
+      console.error(
+        `[bulkApi.getRiskHistory] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
       );
       return [];
     }
