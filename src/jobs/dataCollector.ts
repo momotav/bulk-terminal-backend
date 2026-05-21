@@ -81,9 +81,17 @@ async function updateTraderSnapshots(): Promise<void> {
           (sum, p) => sum + Math.abs(p.notional || 0), 0
         );
         
+        // PnL convention: BULK's realizedPnl / unrealizedPnl are GROSS;
+        // fees and funding are exposed as separate signed fields. We store
+        // net values so leaderboard / analytics rankings reflect what
+        // traders actually pocketed. See wsListener.ts for the full
+        // breakdown. Sourced from `margin.*` which carries wallet-wide
+        // totals (more authoritative than summing live positions).
         const realizedPnl = account.margin?.realizedPnl || 0;
         const unrealizedPnl = account.margin?.unrealizedPnl || 0;
-        const totalPnl = realizedPnl + unrealizedPnl;
+        const fees = account.margin?.fees || 0;
+        const funding = account.margin?.funding || 0;
+        const totalPnl = realizedPnl + unrealizedPnl + fees + funding;
         
         // Note: we no longer write `total_pnl` back to the `traders` table
         // here — the wallet page reads realized PnL from BULK's indexer
@@ -91,13 +99,16 @@ async function updateTraderSnapshots(): Promise<void> {
         // (powers the wallet page's PnL history chart, which BULK doesn't
         // expose).
         
-        // Create snapshot (even if no positions, to track PnL changes)
+        // Create snapshot (even if no positions, to track PnL changes).
+        // Matches wsListener column semantics: `pnl` = realized+fees+funding,
+        // `unrealized_pnl` = unrealized only. Their sum is the canonical net.
         if (account.positions.length > 0 || totalPnl !== 0) {
+          const snapshotRealizedNet = realizedPnl + fees + funding;
           await query(
             `INSERT INTO trader_snapshots 
              (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
              VALUES ($1, $2, $3, $4, $5)`,
-            [wallet, realizedPnl, unrealizedPnl, account.positions.length, totalNotional]
+            [wallet, snapshotRealizedNet, unrealizedPnl, account.positions.length, totalNotional]
           );
         }
         
