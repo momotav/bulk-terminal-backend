@@ -176,26 +176,48 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
       return;
     }
     
-    // Calculate totals from positions (the actual data source)
+    // Calculate totals from positions (the actual data source).
+    //
+    // PnL convention: BULK reports `realizedPnl`/`unrealizedPnl` as GROSS
+    // (pure price math), with `fees` and `funding` exposed as separate
+    // signed fields. To rank traders fairly on the leaderboard we must
+    // store NET PnL — gross totals systematically reward high-volume
+    // traders who paid lots of fees. We accumulate fees + funding alongside
+    // raw PnL and combine at the end. Verified against live BULK 2026-05-21.
     let totalNotional = 0;
     let totalRealizedPnl = 0;
     let totalUnrealizedPnl = 0;
-    
+    let totalFees = 0;
+    let totalFunding = 0;
+
     for (const p of account.positions) {
       // Notional is already provided, use absolute value
       totalNotional += Math.abs(p.notional || 0);
       totalRealizedPnl += p.realizedPnl || 0;
       totalUnrealizedPnl += p.unrealizedPnl || 0;
+      totalFees += p.fees || 0;
+      totalFunding += p.funding || 0;
     }
-    
-    // Also check margin object if it has better totals
+
+    // Also check margin object if it has better totals. Margin object
+    // carries wallet-wide aggregates that include closed positions too,
+    // so it's generally more authoritative than summing live positions.
     const marginRealizedPnl = account.margin?.realizedPnl || 0;
     const marginUnrealizedPnl = account.margin?.unrealizedPnl || 0;
-    
-    // Use whichever source has data (prefer margin totals if available)
+    const marginFees = account.margin?.fees || 0;
+    const marginFunding = account.margin?.funding || 0;
+
+    // Use whichever source has data (prefer margin totals if available).
+    // Tied-zero falls through to position sums.
     const realizedPnl = marginRealizedPnl !== 0 ? marginRealizedPnl : totalRealizedPnl;
     const unrealizedPnl = marginUnrealizedPnl !== 0 ? marginUnrealizedPnl : totalUnrealizedPnl;
-    const totalPnl = realizedPnl + unrealizedPnl;
+    const fees = marginFees !== 0 ? marginFees : totalFees;
+    const funding = marginFunding !== 0 ? marginFunding : totalFunding;
+
+    // NET PnL — what the user actually pocketed. Stored in DB as the
+    // canonical PnL so all downstream consumers (leaderboard, analytics,
+    // featured wallets) rank by true economic performance.
+    const totalPnl = realizedPnl + unrealizedPnl + fees + funding;
     
     // Upsert trader with PnL data
     await query(
@@ -207,15 +229,24 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
       [walletAddress, totalPnl]
     );
     
-    // Store snapshot for history
+    // Store snapshot for history. We split the PnL into two columns so
+    // time-windowed leaderboard queries can sum the parts correctly:
+    //   - `pnl`            = realized + fees + funding (everything booked)
+    //   - `unrealized_pnl` = unrealized mark-to-market (gross — open positions
+    //                        haven't booked their fees+funding to "realized"
+    //                        side yet, but BULK's `fees`/`funding` fields
+    //                        already include in-flight expenses on open
+    //                        positions, so they're already inside `pnl`)
+    // Sum of the two columns = the same totalPnl written to traders above.
+    const snapshotRealizedNet = realizedPnl + fees + funding;
     await query(
       `INSERT INTO trader_snapshots 
        (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
        VALUES ($1, $2, $3, $4, $5)`,
-      [walletAddress, realizedPnl, unrealizedPnl, account.positions.length, totalNotional]
+      [walletAddress, snapshotRealizedNet, unrealizedPnl, account.positions.length, totalNotional]
     );
     
-    console.log(`💰 ${walletAddress.slice(0, 8)}...: PnL=$${totalPnl.toFixed(2)} | Notional=$${totalNotional.toFixed(2)} | Positions=${account.positions.length}`);
+    console.log(`💰 ${walletAddress.slice(0, 8)}...: NetPnL=$${totalPnl.toFixed(2)} (gross R=$${realizedPnl.toFixed(2)}, U=$${unrealizedPnl.toFixed(2)}, fees=$${fees.toFixed(2)}, funding=$${funding.toFixed(2)}) | Notional=$${totalNotional.toFixed(2)} | Positions=${account.positions.length}`);
   } catch (error) {
     console.error(`❌ Error fetching ${walletAddress.slice(0, 8)}...:`, error);
   }
