@@ -52,80 +52,6 @@ async function collectMarketStats(): Promise<void> {
 }
 
 // Update trader snapshots - wallets viewed in last 24 hours
-async function updateTraderSnapshots(): Promise<void> {
-  try {
-    // Track wallets that have been viewed/active in last 24 hours
-    // This ensures anyone who checked their wallet gets hourly snapshots
-    const activeWallets = await query<{ wallet_address: string }>(
-      `SELECT wallet_address FROM traders 
-       WHERE last_seen > NOW() - INTERVAL '24 hours'
-       ORDER BY last_seen DESC 
-       LIMIT 100`
-    );
-    
-    if (activeWallets.length === 0) {
-      console.log('👤 No recently active wallets to update');
-      return;
-    }
-    
-    let updated = 0;
-    
-    for (const row of activeWallets) {
-      const wallet = row.wallet_address;
-      
-      try {
-        const account = await bulkApi.getFullAccount(wallet);
-        if (!account) continue;
-        
-        const totalNotional = account.positions.reduce(
-          (sum, p) => sum + Math.abs(p.notional || 0), 0
-        );
-        
-        // PnL convention: BULK's realizedPnl / unrealizedPnl are GROSS;
-        // fees and funding are exposed as separate signed fields. We store
-        // net values so leaderboard / analytics rankings reflect what
-        // traders actually pocketed. See wsListener.ts for the full
-        // breakdown. Sourced from `margin.*` which carries wallet-wide
-        // totals (more authoritative than summing live positions).
-        const realizedPnl = account.margin?.realizedPnl || 0;
-        const unrealizedPnl = account.margin?.unrealizedPnl || 0;
-        const fees = account.margin?.fees || 0;
-        const funding = account.margin?.funding || 0;
-        const totalPnl = realizedPnl + unrealizedPnl + fees + funding;
-        
-        // Note: we no longer write `total_pnl` back to the `traders` table
-        // here — the wallet page reads realized PnL from BULK's indexer
-        // directly. We only keep the trader_snapshots history below
-        // (powers the wallet page's PnL history chart, which BULK doesn't
-        // expose).
-        
-        // Create snapshot (even if no positions, to track PnL changes).
-        // Matches wsListener column semantics: `pnl` = realized+fees+funding,
-        // `unrealized_pnl` = unrealized only. Their sum is the canonical net.
-        if (account.positions.length > 0 || totalPnl !== 0) {
-          const snapshotRealizedNet = realizedPnl + fees + funding;
-          await query(
-            `INSERT INTO trader_snapshots 
-             (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [wallet, snapshotRealizedNet, unrealizedPnl, account.positions.length, totalNotional]
-          );
-        }
-        
-        updated++;
-        
-        // Rate limit: 500ms between requests
-        await new Promise(resolve => setTimeout(resolve, 500));
-      } catch (err) {
-        // Skip wallets that fail
-      }
-    }
-    
-    console.log(`👤 Hourly snapshot: Updated ${updated}/${activeWallets.length} wallets`);
-  } catch (error) {
-    console.error('❌ Failed to update trader snapshots:', error);
-  }
-}
 
 // Record a liquidation event
 export async function recordLiquidation(
@@ -484,13 +410,15 @@ export function startDataCollector(): void {
   cron.schedule('* * * * *', () => {
     collectMarketStats();
   });
-  
-  // Update trader snapshots every hour (wallets viewed in last 24h)
-  cron.schedule('0 * * * *', () => {
-    updateTraderSnapshots();
-  });
-  
-  // Aggregate daily stats every hour at :05 (after trader snapshots)
+
+  // [Removed] updateTraderSnapshots hourly cron — the PnL history chart
+  // is now derived from BULK closed-positions at query time, so we no
+  // longer write to the `trader_snapshots` table. See deriveHistory-
+  // FromClosedPositions in routes/wallet.ts. The DELETE cleanup below
+  // still ages out rows that the OLD path wrote so the table doesn't
+  // bloat indefinitely.
+
+  // Aggregate daily stats every hour at :05
   cron.schedule('5 * * * *', () => {
     aggregateDailyStats();
   });
@@ -512,5 +440,5 @@ export function startDataCollector(): void {
   // Backfill daily stats on startup (only if empty)
   setTimeout(() => backfillDailyStats(), 5000);
   
-  console.log('✅ Data collector started (hourly snapshots + daily stats aggregation + fee tracking)');
+  console.log('✅ Data collector started (market stats + daily aggregation + fee tracking)');
 }
