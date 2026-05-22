@@ -53,50 +53,28 @@ function netFullAccount(account: FullAccount): FullAccount {
   };
 }
 
-// Helper: store snapshot from an already-fetched FullAccount, avoiding
-// a duplicate BULK API round-trip. The previous version of this function
-// called bulkApi.getFullAccount() internally, which meant every wallet
-// page view fetched the account twice — once in the GET handler, once
-// here. That added 200-500ms per visit on no actual benefit.
-async function storeWalletSnapshot(walletAddress: string, account: FullAccount): Promise<void> {
+// Helper: maintain the `traders` table row for this wallet. Writes net
+// PnL to `traders.total_pnl` and bumps `last_seen`. Fire-and-forget —
+// nobody reads `total_pnl` back synchronously from the wallet response;
+// it powers leaderboard fallback queries when BULK indexer data is
+// unavailable. Sourced from BULK's `margin.*` aggregate fields.
+//
+// Replaces the older `storeWalletSnapshot` function which ALSO wrote to
+// the `trader_snapshots` table on every page view + hourly cron. The
+// snapshots table was sampled inconsistently (whoever happened to view
+// the wallet, plus a 100-wallet hourly cron) so the resulting PnL
+// history chart was a record of viewing patterns, not trading activity.
+// We now derive the PnL chart from closed positions at query time
+// (see deriveHistoryFromClosedPositions below) which is deterministic,
+// dense, and accurate for any wallet — no DB writes required.
+async function upsertTraderRow(walletAddress: string, account: FullAccount): Promise<void> {
   try {
-    // Calculate totals from positions. PnL convention: BULK reports
-    // realizedPnl / unrealizedPnl as GROSS (price math only), with fees
-    // and funding as separate signed siblings. We net them at every
-    // storage site so leaderboard / analytics rankings reflect true
-    // economic PnL. See wsListener.ts for the full breakdown.
-    let totalNotional = 0;
-    let totalRealizedPnl = 0;
-    let totalUnrealizedPnl = 0;
-    let totalFees = 0;
-    let totalFunding = 0;
-
-    for (const p of account.positions) {
-      totalNotional += Math.abs(p.notional || 0);
-      totalRealizedPnl += p.realizedPnl || 0;
-      totalUnrealizedPnl += p.unrealizedPnl || 0;
-      totalFees += p.fees || 0;
-      totalFunding += p.funding || 0;
-    }
-
-    // Use margin totals if available (more authoritative than per-position
-    // sums because margin includes cross-account effects).
-    const marginRealizedPnl = account.margin?.realizedPnl || 0;
-    const marginUnrealizedPnl = account.margin?.unrealizedPnl || 0;
-    const marginFees = account.margin?.fees || 0;
-    const marginFunding = account.margin?.funding || 0;
-
-    const realizedPnl = marginRealizedPnl !== 0 ? marginRealizedPnl : totalRealizedPnl;
-    const unrealizedPnl = marginUnrealizedPnl !== 0 ? marginUnrealizedPnl : totalUnrealizedPnl;
-    const fees = marginFees !== 0 ? marginFees : totalFees;
-    const funding = marginFunding !== 0 ? marginFunding : totalFunding;
-
-    // Net economic PnL — what the trader actually pocketed.
+    const realizedPnl = account.margin?.realizedPnl || 0;
+    const unrealizedPnl = account.margin?.unrealizedPnl || 0;
+    const fees = account.margin?.fees || 0;
+    const funding = account.margin?.funding || 0;
     const totalPnl = realizedPnl + unrealizedPnl + fees + funding;
 
-    // Update trader with current PnL. Don't await — fire and forget. The
-    // user is waiting on this endpoint and the trader update is purely
-    // for our DB analytics; nobody is reading total_pnl back synchronously.
     void query(
       `INSERT INTO traders (wallet_address, total_pnl, last_seen)
        VALUES ($1, $2, NOW())
@@ -104,34 +82,100 @@ async function storeWalletSnapshot(walletAddress: string, account: FullAccount):
          total_pnl = $2,
          last_seen = NOW()`,
       [walletAddress, totalPnl]
-    ).catch((err) => console.error('snapshot trader update failed:', err));
-
-    // Store snapshot for history. Same fire-and-forget pattern. Skip if
-    // the wallet has nothing to snapshot — saves snapshot table bloat.
-    // Column semantics match wsListener/dataCollector: `pnl` carries
-    // realized+fees+funding (everything booked), `unrealized_pnl` is the
-    // gross mark-to-market component.
-    if (account.positions.length > 0 || totalPnl !== 0) {
-      const snapshotRealizedNet = realizedPnl + fees + funding;
-      void query(
-        `INSERT INTO trader_snapshots
-         (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [walletAddress, snapshotRealizedNet, unrealizedPnl, account.positions.length, totalNotional]
-      ).catch((err) => console.error('snapshot insert failed:', err));
-    }
+    ).catch((err) => console.error('traders upsert failed:', err));
   } catch (error) {
-    console.error(`Failed to store wallet snapshot for ${walletAddress.slice(0, 8)}:`, error);
+    console.error(`Failed to upsert trader row for ${walletAddress.slice(0, 8)}:`, error);
   }
 }
 
-// Legacy function kept for the /track endpoint and the bulk hierarchy refresh.
-// New callers should prefer storeWalletSnapshot (above) when they already have
-// a FullAccount in hand.
-async function fetchAndStoreWalletSnapshot(walletAddress: string): Promise<void> {
-  const account = await bulkApi.getFullAccount(walletAddress);
-  if (!account) return;
-  await storeWalletSnapshot(walletAddress, account);
+// Derive PnL history from BULK's closed-position log. Walks closed
+// positions in chronological order, accumulating net realized PnL, then
+// appends a synthetic "now" point with current unrealized added so the
+// chart's right edge reflects live state.
+//
+// The shape of the returned array matches what the old snapshot-based
+// path produced, so frontend rendering is shape-stable: each row has
+// `{timestamp, pnl, unrealized_pnl, positions_count, total_notional}`.
+// For closed-position rows we put cumulative-realized in `pnl` and 0
+// in `unrealized_pnl`; for the "now" row we put current realized in
+// `pnl` and current unrealized in `unrealized_pnl`. The chart plots
+// the sum, so it shows realized-only across history with the live
+// unrealized as a final-step extension.
+//
+// Caveats:
+//  - BULK only exposes the last 5000 closed positions per wallet. For
+//    heavy traders the earliest cumulative value won't be at zero (it
+//    misses older closes). The chart shape is still right (deltas are
+//    accurate) but the absolute baseline can be off. Most wallets have
+//    fewer than 5000 lifetime trades so this is a long-tail edge case.
+//  - Funding payments DON'T get their own time points — they're already
+//    netted into each closed position's `realizedPnl` via netFullAccount.
+//    Open-position funding accruals are folded into the "now" point's
+//    unrealized via account.margin.funding. Good enough for visualizing
+//    a trading curve.
+function deriveHistoryFromClosedPositions(
+  closedPositions: unknown[],
+  account: FullAccount | null,
+): Array<{ timestamp: string; pnl: number; unrealized_pnl: number; positions_count: number; total_notional: number }> {
+  // BULK returns closed positions with ns-precision timestamps in
+  // `closeTime`. We normalize at the boundary because bulkApi returns
+  // `unknown[]` — the raw shape isn't guaranteed by TS — and we want
+  // strong runtime guards in case BULK ever changes the field layout.
+  const normalized: Array<{ closedAt: number; realizedPnl: number; fees: number; funding: number }> = [];
+  for (const raw of closedPositions) {
+    if (!raw || typeof raw !== 'object') continue;
+    const p = raw as Record<string, unknown>;
+    // Timestamps from BULK are ns; convert to ms. Some endpoints have
+    // shipped responses with already-ms values during testing, so we
+    // detect by magnitude: anything past year 3000 in ms is almost
+    // certainly nanoseconds and needs to be divided down.
+    const rawCloseTime = Number(p.closeTime) || 0;
+    if (rawCloseTime === 0) continue;
+    const closedAt = rawCloseTime > 1e15 ? rawCloseTime / 1_000_000 : rawCloseTime;
+    normalized.push({
+      closedAt,
+      realizedPnl: Number(p.realizedPnl) || 0,
+      fees: Number(p.fees) || 0,
+      funding: Number(p.funding) || 0,
+    });
+  }
+  const sorted = normalized.sort((a, b) => a.closedAt - b.closedAt);
+  const history: Array<{ timestamp: string; pnl: number; unrealized_pnl: number; positions_count: number; total_notional: number }> = [];
+  let cumulative = 0;
+  for (const p of sorted) {
+    // realizedPnl from the BULK endpoint is GROSS (per our earlier
+    // diagnosis); the netting we do at the API boundary happens in
+    // normalizeClosedPosition (which the wallet route uses for the
+    // closed-positions endpoint). Here we're working with the raw
+    // BULK response so we need to net manually: realized + fees + funding.
+    const net = (p.realizedPnl || 0) + (p.fees || 0) + (p.funding || 0);
+    cumulative += net;
+    history.push({
+      timestamp: new Date(p.closedAt).toISOString(),
+      pnl: cumulative,
+      unrealized_pnl: 0,
+      positions_count: 0,
+      total_notional: 0,
+    });
+  }
+  // Append synthetic "now" row with current unrealized so chart's right
+  // edge shows live state. Only emit when we have a live account — for
+  // wallets without live data, the chart simply ends at the last close.
+  if (account) {
+    const realized = account.margin?.realizedPnl || 0;
+    const fees = account.margin?.fees || 0;
+    const funding = account.margin?.funding || 0;
+    const unrealized = account.margin?.unrealizedPnl || 0;
+    const totalNotional = account.positions.reduce((sum, p) => sum + Math.abs(p.notional || 0), 0);
+    history.push({
+      timestamp: new Date().toISOString(),
+      pnl: realized + fees + funding,
+      unrealized_pnl: unrealized,
+      positions_count: account.positions.length,
+      total_notional: totalNotional,
+    });
+  }
+  return history;
 }
 
 // GET /wallet/:address - Get wallet info (live from BULK API + our data)
@@ -164,21 +208,31 @@ router.get('/:address', async (req: Request, res: Response) => {
 
     // Parallel fan-out: all four data sources kick off at the same time.
     // Previously these were sequential, costing 4× round-trip latency.
-    const [account, tickers, trader, snapshots] = await Promise.all([
+    //
+    // We fetch CLOSED POSITIONS (not the trader_snapshots DB table) for
+    // the PnL history chart. The chart is now DERIVED — sort closes by
+    // time, accumulate net realized PnL, plus a synthetic "now" point
+    // with current unrealized added on. See deriveHistoryFromClosedPositions
+    // below for the math.
+    //
+    // Why this is better than the old snapshot approach:
+    //  - Snapshots only existed for the 100 most-viewed wallets via the
+    //    hourly cron + on-page-view writes. New / quiet wallets had
+    //    one data point (the visit), so their chart was empty.
+    //  - The chart "history" was actually a record of WHO LOOKED AT THE
+    //    WALLET WHEN, not when trading happened. Bumpy and irregular.
+    //  - Sampling cadence was wildly inconsistent (every page view or
+    //    every hour, sometimes both).
+    // Deriving from closed positions gives every wallet a real, dense,
+    // deterministic PnL curve from their first closed trade onward.
+    const [account, tickers, trader, closedPositions] = await Promise.all([
       bulkApi.getFullAccount(address),
       bulkApi.getAllTickers(),
       queryOne(
         'SELECT * FROM traders WHERE wallet_address = $1',
         [address]
       ),
-      query(
-        `SELECT timestamp, pnl, unrealized_pnl, positions_count, total_notional
-         FROM trader_snapshots
-         WHERE wallet_address = $1
-         ORDER BY timestamp DESC
-         LIMIT 168`,
-        [address]
-      ),
+      bulkApi.getClosedPositions(address),
     ]);
 
     // BULK API call returned null. Two cases:
@@ -208,7 +262,7 @@ router.get('/:address', async (req: Request, res: Response) => {
         live: null,
         markPrices,
         tracked: trader,
-        history: snapshots.reverse(),
+        history: deriveHistoryFromClosedPositions(closedPositions || [], null),
       });
     }
 
@@ -229,13 +283,16 @@ router.get('/:address', async (req: Request, res: Response) => {
       live: netted,
       markPrices,
       tracked: trader,
-      history: snapshots.reverse(),
+      history: deriveHistoryFromClosedPositions(closedPositions || [], account),
     };
 
-    // Fire-and-forget snapshot write. Pass the ORIGINAL gross account —
-    // storeWalletSnapshot has its own netting logic that also needs to
-    // see the raw fees/funding fields to log the breakdown.
-    void storeWalletSnapshot(address, account);
+    // Fire-and-forget: maintain the traders DB row (last_seen + total_pnl
+    // fallback). We pass the ORIGINAL gross account because the helper
+    // does its own netting from margin.* before writing. Previously this
+    // also wrote a row to trader_snapshots on every page view; that path
+    // is now obsolete (chart is derived from closed positions, not the
+    // snapshots table).
+    void upsertTraderRow(address, account);
 
     // Cache for both fresh (30s) and stale (5min) keys. The stale key is
     // only consulted when BULK fails on a future request.
@@ -252,13 +309,24 @@ router.get('/:address', async (req: Request, res: Response) => {
 });
 
 // POST /wallet/:address/track - Start tracking a wallet
+//
+// Bumps `last_seen` and records current PnL on the `traders` row. The
+// old version of this endpoint also wrote to `trader_snapshots` (which
+// is now obsolete — the PnL chart derives from BULK closed-positions
+// at query time). We still need the traders upsert because that row
+// is read by leaderboard fallback queries and the analytics views.
 router.post('/:address/track', async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
-    
-    // Actually fetch and store data
-    await fetchAndStoreWalletSnapshot(address);
-    
+
+    const account = await bulkApi.getFullAccount(address);
+    if (account) {
+      // Fire-and-forget — the request can return without waiting for the
+      // DB write, same pattern as the main wallet route. If the wallet
+      // doesn't exist on BULK we just skip the upsert silently.
+      void upsertTraderRow(address, account);
+    }
+
     res.json({ success: true, message: 'Wallet is now being tracked' });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to track wallet' });
@@ -911,17 +979,21 @@ router.post('/watchlist/:address', requireAuth, async (req: Request, res: Respon
   try {
     const { address } = req.params;
     const { nickname } = req.body;
-    
-    // Start tracking if not already
-    await fetchAndStoreWalletSnapshot(address);
-    
+
+    // Ensure the traders row exists so leaderboard fallback queries can
+    // resolve this wallet later. Fire-and-forget — adding to watchlist
+    // doesn't depend on this completing, and the BULK fetch can be slow.
+    bulkApi.getFullAccount(address).then((account) => {
+      if (account) void upsertTraderRow(address, account);
+    }).catch(() => { /* swallow — non-blocking */ });
+
     await query(
       `INSERT INTO watchlist (user_id, wallet_address, nickname)
        VALUES ($1, $2, $3)
        ON CONFLICT (user_id, wallet_address) DO UPDATE SET nickname = $3`,
       [req.userId, address, nickname || null]
     );
-    
+
     res.json({ success: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to add to watchlist' });
