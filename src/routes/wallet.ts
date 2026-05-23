@@ -89,30 +89,37 @@ async function upsertTraderRow(walletAddress: string, account: FullAccount): Pro
 }
 
 // Derive PnL history from BULK's closed-position log. Walks closed
-// positions in chronological order, accumulating net realized PnL, then
-// appends a synthetic "now" point with current unrealized added so the
-// chart's right edge reflects live state.
+// positions in chronological order accumulating GROSS realizedPnl, then
+// appends a synthetic "now" point with current unrealized for the live
+// edge of the chart.
 //
-// The shape of the returned array matches what the old snapshot-based
-// path produced, so frontend rendering is shape-stable: each row has
-// `{timestamp, pnl, unrealized_pnl, positions_count, total_notional}`.
-// For closed-position rows we put cumulative-realized in `pnl` and 0
-// in `unrealized_pnl`; for the "now" row we put current realized in
-// `pnl` and current unrealized in `unrealized_pnl`. The chart plots
-// the sum, so it shows realized-only across history with the live
-// unrealized as a final-step extension.
+// IMPORTANT — per-position `fees` and `funding` are unreliable.
+// Confirmed live 2026-05-23 against wallet AWKS5eEs…zdQN: BULK's
+// closed-position response stamps each row with the wallet's
+// CUMULATIVE lifetime fees+funding as of that close moment, not the
+// fees+funding contributed by THAT individual position. Adding them
+// per row would multiply lifetime totals 689× and bury the chart at
+// -$1.3M instead of the true ~+$28K. So we use gross realizedPnl only
+// for the per-position rows, then apply the lifetime fees+funding
+// adjustment ONCE at the synthetic "now" row via account.margin.
+// This produces an accurate-shape curve whose final value lines up
+// with the wallet's true net PnL.
+//
+// Shape: `{timestamp, pnl, unrealized_pnl, positions_count, total_notional}`.
+// For closed-position rows we put cumulative-gross-realized in `pnl`
+// and 0 in `unrealized_pnl`. For the "now" row we put net realized
+// (gross + fees + funding from margin) in `pnl` and current unrealized
+// in `unrealized_pnl`. The chart's last visible value = realized net +
+// unrealized = the wallet's true current PnL.
 //
 // Caveats:
 //  - BULK only exposes the last 5000 closed positions per wallet. For
-//    heavy traders the earliest cumulative value won't be at zero (it
-//    misses older closes). The chart shape is still right (deltas are
-//    accurate) but the absolute baseline can be off. Most wallets have
-//    fewer than 5000 lifetime trades so this is a long-tail edge case.
-//  - Funding payments DON'T get their own time points — they're already
-//    netted into each closed position's `realizedPnl` via netFullAccount.
-//    Open-position funding accruals are folded into the "now" point's
-//    unrealized via account.margin.funding. Good enough for visualizing
-//    a trading curve.
+//    very heavy traders the earliest cumulative value won't start at
+//    zero. Deltas remain accurate; absolute baseline may be off.
+//  - The transition from the last closed-position row to "now" includes
+//    the full lifetime fees+funding adjustment (could be a big drop).
+//    Acceptable visualization compromise given BULK's per-position
+//    breakdown isn't available.
 function deriveHistoryFromClosedPositions(
   closedPositions: unknown[],
   account: FullAccount | null,
@@ -121,35 +128,24 @@ function deriveHistoryFromClosedPositions(
   // `closeTime`. We normalize at the boundary because bulkApi returns
   // `unknown[]` — the raw shape isn't guaranteed by TS — and we want
   // strong runtime guards in case BULK ever changes the field layout.
-  const normalized: Array<{ closedAt: number; realizedPnl: number; fees: number; funding: number }> = [];
+  const normalized: Array<{ closedAt: number; realizedPnl: number }> = [];
   for (const raw of closedPositions) {
     if (!raw || typeof raw !== 'object') continue;
     const p = raw as Record<string, unknown>;
-    // Timestamps from BULK are ns; convert to ms. Some endpoints have
-    // shipped responses with already-ms values during testing, so we
-    // detect by magnitude: anything past year 3000 in ms is almost
-    // certainly nanoseconds and needs to be divided down.
     const rawCloseTime = Number(p.closeTime) || 0;
     if (rawCloseTime === 0) continue;
     const closedAt = rawCloseTime > 1e15 ? rawCloseTime / 1_000_000 : rawCloseTime;
     normalized.push({
       closedAt,
       realizedPnl: Number(p.realizedPnl) || 0,
-      fees: Number(p.fees) || 0,
-      funding: Number(p.funding) || 0,
     });
   }
   const sorted = normalized.sort((a, b) => a.closedAt - b.closedAt);
   const history: Array<{ timestamp: string; pnl: number; unrealized_pnl: number; positions_count: number; total_notional: number }> = [];
   let cumulative = 0;
   for (const p of sorted) {
-    // realizedPnl from the BULK endpoint is GROSS (per our earlier
-    // diagnosis); the netting we do at the API boundary happens in
-    // normalizeClosedPosition (which the wallet route uses for the
-    // closed-positions endpoint). Here we're working with the raw
-    // BULK response so we need to net manually: realized + fees + funding.
-    const net = (p.realizedPnl || 0) + (p.fees || 0) + (p.funding || 0);
-    cumulative += net;
+    // Gross only. Lifetime fees+funding netted at "now" instead.
+    cumulative += p.realizedPnl;
     history.push({
       timestamp: new Date(p.closedAt).toISOString(),
       pnl: cumulative,
@@ -158,9 +154,13 @@ function deriveHistoryFromClosedPositions(
       total_notional: 0,
     });
   }
-  // Append synthetic "now" row with current unrealized so chart's right
-  // edge shows live state. Only emit when we have a live account — for
-  // wallets without live data, the chart simply ends at the last close.
+  // Synthetic "now" row with lifetime net realized + current unrealized.
+  // The margin object's fees+funding ARE reliable wallet totals (separate
+  // path from the per-position breakdown). Using them here gives the
+  // chart a correct final value at the cost of a one-time drop between
+  // the last closed-position row (gross-cumulative) and the "now" row
+  // (net-cumulative). That drop equals the wallet's lifetime fees+funding,
+  // which is honest information for the chart to convey.
   if (account) {
     const realized = account.margin?.realizedPnl || 0;
     const fees = account.margin?.fees || 0;
@@ -620,32 +620,37 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
         closePrice,
         openedAt: toMs(openTs),
         closedAt: toMs(closeTs),
-        // NET realized PnL — BULK returns the gross price-PnL component
-        // separately from fees/funding (e.g. realizedPnl=-266.94 +
-        // fees=-192.19 + funding=0 = trueNet=-459.13). We expose ONE
-        // `realizedPnl` field that's already net so downstream code stays
-        // simple; the gross components are available separately below
-        // for hover/tooltip breakdowns.
-        realizedPnl:
-          Number(p.realizedPnl ?? p.pnl ?? p.realized_pnl ?? p.realized ?? 0) +
-          Number(p.fees ?? p.fee ?? 0) +
-          Number(p.funding ?? 0),
-        // Keep the original gross PnL so the UI can show "Gross $X · Fees $Y"
-        // breakdowns without re-deriving anything.
+        // GROSS realized PnL — closed positions only.
+        //
+        // We previously netted `realizedPnl + fees + funding` per row,
+        // but live diagnosis (2026-05-23, wallet AWKS5eEs…zdQN with 689
+        // closed positions) showed BULK's per-position `fees` and
+        // `funding` fields are actually the WALLET'S CUMULATIVE
+        // lifetime totals as of the close moment, not the per-position
+        // contribution. Adding them per row inflated a +$25 trade into
+        // a -$9,500 "trade." So we now expose only gross realized PnL
+        // for closed-position display.
+        //
+        // The wallet's lifetime net PnL is correctly reflected at the
+        // live-margin level (account.margin.fees + funding) and on the
+        // indexer's `net_realized_pnl` field — both used elsewhere.
+        realizedPnl: Number(p.realizedPnl ?? p.pnl ?? p.realized_pnl ?? p.realized ?? 0),
+        // grossPnl alias kept for backward compat with frontend code
+        // that reads it for the breakdown popover. Same value as
+        // realizedPnl now.
         grossPnl: Number(p.realizedPnl ?? p.pnl ?? p.realized_pnl ?? p.realized ?? 0),
-        fees: Number(p.fees ?? p.fee ?? 0),
-        funding: Number(p.funding ?? 0),
+        // Per-position fees/funding from BULK are NOT reliable
+        // (wallet-cumulative; see comment above). Set to 0 so the
+        // frontend breakdown popover shows a clean "Gross +$X · Net +$X"
+        // without misleading fee numbers. The real lifetime fees live
+        // on margin.fees and are surfaced on the wallet's Overview rail.
+        fees: 0,
+        funding: 0,
         // Leverage isn't included on closed-position responses — BULK
-        // only exposes it on the live position object. We'd have to
-        // compute it from totalVolume / margin, which we don't have.
-        // Pass through if BULK does include it; otherwise 0 (frontend
-        // hides the badge when leverage=0).
+        // only exposes it on the live position object.
         leverage: Number(p.leverage ?? p.lev ?? 0),
         notional: p.notional !== undefined ? Number(p.notional) : undefined,
         liquidated,
-        // Pass through the close reason as a debug aid + so the frontend
-        // can show "ADL" vs "LIQ" vs other distinctly if we want to
-        // expand later. Empty string when missing.
         closeReason,
       };
     }
