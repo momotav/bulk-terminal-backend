@@ -118,6 +118,91 @@ export async function deleteCache(key: string): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Stale-while-revalidate cache
+//
+// Problem this solves: endpoints with long TTLs (e.g. the all-time
+// analytics charts, TTL 3600) rebuild synchronously on the first request
+// after expiry. The rebuild fans out to BULK (klines × every symbol) and
+// can take 10-20s — so once per hour, one unlucky visitor eats a 20s page
+// load. Classic thundering-herd-of-one.
+//
+// With SWR the data is stored in an envelope { v, freshUntil } whose
+// Redis TTL is much LONGER than the freshness window. On read:
+//   - fresh hit  → serve
+//   - stale hit  → serve the stale copy IMMEDIATELY, kick off a
+//                  background rebuild (deduped across concurrent
+//                  requests) that refreshes the envelope
+//   - cold miss  → compute synchronously (first request after deploy
+//                  or Redis flush), deduped so concurrent cold requests
+//                  share one rebuild instead of stampeding BULK
+//
+// The result: steady-state latency is always a cache read. Slightly
+// stale data for at most one rebuild duration is a fine trade for
+// analytics charts.
+// ---------------------------------------------------------------------------
+type SwrEnvelope<T> = { v: T; freshUntil: number };
+
+const inflightRebuilds = new Map<string, Promise<unknown>>();
+
+export async function swrCache<T>(
+  key: string,
+  freshSeconds: number,
+  rebuild: () => Promise<T>,
+  // Keep the stale copy around well past freshness so there's always
+  // something to serve while rebuilding. 24× covers a full day of
+  // serving stale all-time data even if BULK is down for hours.
+  hardTtlSeconds: number = freshSeconds * 24,
+): Promise<T> {
+  const raw = await getCache<SwrEnvelope<T>>(key);
+  const now = Date.now();
+  // Shape guard: entries written by the old direct setCache path (or any
+  // other writer) aren't envelopes. Treat them as a cold miss so they get
+  // rebuilt and rewritten in envelope form, rather than serving
+  // `envelope.v === undefined` as a response body.
+  const envelope =
+    raw && typeof raw === 'object' && 'v' in raw && typeof (raw as SwrEnvelope<T>).freshUntil === 'number'
+      ? raw
+      : null;
+
+  // Fresh hit — the fast path that should serve ~all requests.
+  if (envelope && envelope.freshUntil > now) {
+    return envelope.v;
+  }
+
+  const startRebuild = (): Promise<T> => {
+    const existing = inflightRebuilds.get(key);
+    if (existing) return existing as Promise<T>;
+    const p = rebuild()
+      .then(async (v) => {
+        await setCache(
+          key,
+          { v, freshUntil: Date.now() + freshSeconds * 1000 } satisfies SwrEnvelope<T>,
+          hardTtlSeconds,
+        );
+        return v;
+      })
+      .finally(() => {
+        inflightRebuilds.delete(key);
+      });
+    inflightRebuilds.set(key, p);
+    return p;
+  };
+
+  // Stale hit — serve immediately, refresh in background. Swallow
+  // background failures: the stale copy stays valid in Redis and the
+  // next request will retry the rebuild.
+  if (envelope) {
+    startRebuild().catch((e) =>
+      console.error(`SWR background rebuild failed for ${key}:`, e),
+    );
+    return envelope.v;
+  }
+
+  // Cold miss — must wait, but concurrent cold requests share one rebuild.
+  return startRebuild();
+}
+
 export async function deleteCachePattern(pattern: string): Promise<void> {
   try {
     if (isConnected && redisClient) {
