@@ -676,21 +676,34 @@ router.get('/trades-chart-api', async (req: Request, res: Response) => {
 router.get('/open-interest-history/:symbol', async (req: Request, res: Response) => {
   const { symbol } = req.params;
   const hours = parseInt(req.query.hours as string) || 24;
-  
+
+  const cacheKey = `analytics:oi_history:${symbol}:${hours}`;
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
   try {
+    // Bucket by range — raw rows over 30d were ~hundreds of thousands
+    // (snapshots every few seconds), which made range switching crawl.
+    // Tiers match oi-chart: 1d→minute, ≤7d→hour, beyond→day.
+    const bucket: 'minute' | 'hour' | 'day' =
+      hours <= 24 ? 'minute' : hours <= 168 ? 'hour' : 'day';
     const result = await query(`
-      SELECT timestamp, open_interest_usd as value
+      SELECT date_trunc('${bucket}', timestamp) as timestamp,
+             AVG(open_interest_usd) as value
       FROM ticker_snapshots
       WHERE symbol = $1 AND timestamp >= NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('${bucket}', timestamp)
       ORDER BY timestamp ASC
     `, [symbol]);
-    
+
     const data = result.map((row: any) => ({
       timestamp: row.timestamp,
       value: parseFloat(row.value || 0)
     }));
-    
-    res.json({ symbol, hours, dataPoints: data.length, data });
+
+    const response = { symbol, hours, dataPoints: data.length, data };
+    await setCache(cacheKey, response, 60);
+    res.json(response);
   } catch (error) {
     console.error('Error fetching OI history:', error);
     res.status(500).json({ error: 'Failed to fetch OI history' });
@@ -701,21 +714,32 @@ router.get('/open-interest-history/:symbol', async (req: Request, res: Response)
 router.get('/funding-rate-history/:symbol', async (req: Request, res: Response) => {
   const { symbol } = req.params;
   const hours = parseInt(req.query.hours as string) || 24;
-  
+
+  const cacheKey = `analytics:funding_history:${symbol}:${hours}`;
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
   try {
+    // Same tiered bucketing as open-interest-history above.
+    const bucket: 'minute' | 'hour' | 'day' =
+      hours <= 24 ? 'minute' : hours <= 168 ? 'hour' : 'day';
     const result = await query(`
-      SELECT timestamp, funding_rate as value
+      SELECT date_trunc('${bucket}', timestamp) as timestamp,
+             AVG(funding_rate) as value
       FROM ticker_snapshots
       WHERE symbol = $1 AND timestamp >= NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('${bucket}', timestamp)
       ORDER BY timestamp ASC
     `, [symbol]);
-    
+
     const data = result.map((row: any) => ({
       timestamp: row.timestamp,
       value: parseFloat(row.value || 0)
     }));
-    
-    res.json({ symbol, hours, dataPoints: data.length, data });
+
+    const response = { symbol, hours, dataPoints: data.length, data };
+    await setCache(cacheKey, response, 60);
+    res.json(response);
   } catch (error) {
     console.error('Error fetching funding rate history:', error);
     res.status(500).json({ error: 'Failed to fetch funding rate history' });
@@ -734,15 +758,21 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
   }
 
   try {
+    // Bucket granularity scales with the window so the row count stays
+    // bounded (~hundreds, not tens of thousands). Minute-resolution over
+    // 30d was ~43K buckets × symbols — slow query, fat payload, sluggish
+    // chart switching. Tiers: 1d→minute, ≤7d→hour, beyond→day.
+    const bucket: 'minute' | 'hour' | 'day' =
+      hours <= 24 ? 'minute' : hours <= 168 ? 'hour' : 'day';
     const result = await Promise.race([
       query(`
         SELECT 
-          date_trunc('minute', timestamp) as timestamp,
+          date_trunc('${bucket}', timestamp) as timestamp,
           symbol,
           AVG(open_interest_usd) as value
         FROM ticker_snapshots
         WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
-        GROUP BY date_trunc('minute', timestamp), symbol
+        GROUP BY date_trunc('${bucket}', timestamp), symbol
         ORDER BY timestamp ASC
       `),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
@@ -852,15 +882,18 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
   }
   
   try {
+    // Same tiered bucketing as oi-chart above — see comment there.
+    const bucket: 'minute' | 'hour' | 'day' =
+      hours <= 24 ? 'minute' : hours <= 168 ? 'hour' : 'day';
     const result = await Promise.race([
       query(`
         SELECT 
-          date_trunc('minute', timestamp) as timestamp,
+          date_trunc('${bucket}', timestamp) as timestamp,
           symbol,
           AVG(funding_rate) as value
         FROM ticker_snapshots
         WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
-        GROUP BY date_trunc('minute', timestamp), symbol
+        GROUP BY date_trunc('${bucket}', timestamp), symbol
         ORDER BY timestamp ASC
       `),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
