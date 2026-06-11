@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { query } from '../db';
-import { getCache, setCache } from '../services/cache';
+import { getCache, setCache, swrCache } from '../services/cache';
 import { getActiveSymbols } from '../services/markets';
 import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coinShape';
 import { filterOutSystemWallets } from '../services/systemWallets';
@@ -483,10 +483,14 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
   // 24h window AND the all-time window. With ~5 symbols × 1000 klines per
   // call, the network and parse overhead was dominating page load.
   const cacheKey = `analytics:volume_chart_api:${hours}`;
-  const cached = await getCache<unknown>(cacheKey);
-  if (cached) return res.json(cached);
 
   try {
+    // SWR: serve stale data instantly and rebuild in the background.
+    // The rebuild fans out to BULK klines for every active symbol
+    // (~10 fetches × 1000 bars) and used to block one unlucky request
+    // for 10-20s every time the 1h all-time TTL expired. With SWR the
+    // only synchronous rebuild is the very first request after deploy.
+    const result = await swrCache(cacheKey, isAllTime ? 3600 : 60, async () => {
     const now = Date.now();
     const startTime = isAllTime ? 0 : now - (hours * 60 * 60 * 1000);
 
@@ -570,11 +574,8 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
       });
 
     console.log(`📊 Volume chart (${isAllTime ? 'ALL' : hours + 'h'}): ${data.length} bars, ${symbols.length} coins, cumulative: $${(cumulative/1e9).toFixed(2)}B`);
-    const result = { data };
-    // 1h TTL for all-time (klines from years ago don't change), 60s for
-    // recent windows (last hour's bar is still in flight).
-    const ttl = isAllTime ? 3600 : 60;
-    await setCache(cacheKey, result, ttl);
+    return { data };
+    });
     res.json(result);
   } catch (error) {
     console.error('Error fetching volume chart from API:', error);
@@ -1031,14 +1032,11 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
   const isAllTime = hours >= 8760;
   const cacheKey = `analytics:trades_chart:${hours}`;
-  
-  // Check cache first
-  const cached = await getCache<any>(cacheKey);
-  if (cached) {
-    return res.json(cached);
-  }
-  
+
   try {
+    // SWR — see volume-chart-api above. All-time rebuild is a multi-
+    // second DB scan; stale-serve means no request ever waits for it.
+    const result = await swrCache(cacheKey, isAllTime ? 3600 : 60, async () => {
     // Get total trades count ONLY from BULK API start date onwards (for chart alignment)
     const totalResult = await query<{ total: string }>(`
       SELECT COUNT(*) as total FROM trades WHERE timestamp >= '${BULK_API_START}'
@@ -1074,17 +1072,9 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
     const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
-    const result = { data };
-    
-    // Cache TTL: short for windowed queries (data evolves), long for
-    // all-time queries (the answer barely changes from one minute to the
-    // next — daily-aggregated counts of years of data move slowly). The
-    // analytics page polls all-time every 5 minutes which used to blow
-    // the cache and force a fresh ~5-second DB scan every time. With a
-    // 1-hour TTL on all-time, the same scan only happens once per hour.
-    const ttl = isAllTime ? 3600 : 60;
-    await setCache(cacheKey, result, ttl);
-    
+    return { data };
+    });
+
     res.json(result);
   } catch (error) {
     console.error('Error fetching trades chart:', error);
@@ -1099,14 +1089,10 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
   const isAllTime = hours >= 8760;
   const cacheKey = `analytics:liquidations_chart:${hours}`;
-  
-  // Check cache first
-  const cached = await getCache<any>(cacheKey);
-  if (cached) {
-    return res.json(cached);
-  }
-  
+
   try {
+    // SWR — same rationale as trades-chart above.
+    const result = await swrCache(cacheKey, isAllTime ? 3600 : 60, async () => {
     // Get total liquidation value ONLY from BULK API start date onwards
     const totalResult = await query<{ total: string }>(`
       SELECT COALESCE(SUM(value), 0) as total FROM liquidations WHERE timestamp >= '${BULK_API_START}'
@@ -1139,12 +1125,9 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
     const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
-    const result = { data };
-    
-    // See trades-chart endpoint above for cache-TTL rationale.
-    const ttl = isAllTime ? 3600 : 60;
-    await setCache(cacheKey, result, ttl);
-    
+    return { data };
+    });
+
     res.json(result);
   } catch (error) {
     console.error('Error fetching liquidations chart:', error);
