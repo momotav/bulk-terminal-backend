@@ -136,10 +136,6 @@ export async function deleteCache(key: string): Promise<void> {
 //   - cold miss  → compute synchronously (first request after deploy
 //                  or Redis flush), deduped so concurrent cold requests
 //                  share one rebuild instead of stampeding BULK
-//
-// The result: steady-state latency is always a cache read. Slightly
-// stale data for at most one rebuild duration is a fine trade for
-// analytics charts.
 // ---------------------------------------------------------------------------
 type SwrEnvelope<T> = { v: T; freshUntil: number };
 
