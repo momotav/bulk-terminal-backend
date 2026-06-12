@@ -684,16 +684,20 @@ router.get('/open-interest-history/:symbol', async (req: Request, res: Response)
   try {
     // Bucket by range — raw rows over 30d were ~hundreds of thousands
     // (snapshots every few seconds), which made range switching crawl.
-    // Tiers match oi-chart: 1d→minute, ≤7d→hour, beyond→day.
-    const bucket: 'minute' | 'hour' | 'day' =
-      hours <= 24 ? 'minute' : hours <= 168 ? 'hour' : 'day';
+    // Tiers match oi-chart: 1d→5-min bins, ≤7d→hour, beyond→day.
+    const bucketExpr =
+      hours <= 24
+        ? `to_timestamp(floor(extract(epoch FROM timestamp) / 300) * 300)`
+        : hours <= 168
+          ? `date_trunc('hour', timestamp)`
+          : `date_trunc('day', timestamp)`;
     const result = await query(`
-      SELECT date_trunc('${bucket}', timestamp) as timestamp,
+      SELECT ${bucketExpr} as timestamp,
              AVG(open_interest_usd) as value
       FROM ticker_snapshots
       WHERE symbol = $1 AND timestamp >= NOW() - INTERVAL '${hours} hours'
-      GROUP BY date_trunc('${bucket}', timestamp)
-      ORDER BY timestamp ASC
+      GROUP BY 1
+      ORDER BY 1 ASC
     `, [symbol]);
 
     const data = result.map((row: any) => ({
@@ -721,15 +725,19 @@ router.get('/funding-rate-history/:symbol', async (req: Request, res: Response) 
 
   try {
     // Same tiered bucketing as open-interest-history above.
-    const bucket: 'minute' | 'hour' | 'day' =
-      hours <= 24 ? 'minute' : hours <= 168 ? 'hour' : 'day';
+    const bucketExpr =
+      hours <= 24
+        ? `to_timestamp(floor(extract(epoch FROM timestamp) / 300) * 300)`
+        : hours <= 168
+          ? `date_trunc('hour', timestamp)`
+          : `date_trunc('day', timestamp)`;
     const result = await query(`
-      SELECT date_trunc('${bucket}', timestamp) as timestamp,
+      SELECT ${bucketExpr} as timestamp,
              AVG(funding_rate) as value
       FROM ticker_snapshots
       WHERE symbol = $1 AND timestamp >= NOW() - INTERVAL '${hours} hours'
-      GROUP BY date_trunc('${bucket}', timestamp)
-      ORDER BY timestamp ASC
+      GROUP BY 1
+      ORDER BY 1 ASC
     `, [symbol]);
 
     const data = result.map((row: any) => ({
@@ -759,21 +767,26 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
 
   try {
     // Bucket granularity scales with the window so the row count stays
-    // bounded (~hundreds, not tens of thousands). Minute-resolution over
-    // 30d was ~43K buckets × symbols — slow query, fat payload, sluggish
-    // chart switching. Tiers: 1d→minute, ≤7d→hour, beyond→day.
-    const bucket: 'minute' | 'hour' | 'day' =
-      hours <= 24 ? 'minute' : hours <= 168 ? 'hour' : 'day';
+    // bounded (~hundreds, not tens of thousands). Tiers: 1d→5-minute
+    // bins (288 points; minute bins were 1440 points / ~97 kB payloads),
+    // ≤7d→hour, beyond→day. 5-min bins use epoch math since date_trunc
+    // has no sub-hour multiple units.
+    const bucketExpr =
+      hours <= 24
+        ? `to_timestamp(floor(extract(epoch FROM timestamp) / 300) * 300)`
+        : hours <= 168
+          ? `date_trunc('hour', timestamp)`
+          : `date_trunc('day', timestamp)`;
     const result = await Promise.race([
       query(`
         SELECT 
-          date_trunc('${bucket}', timestamp) as timestamp,
+          ${bucketExpr} as timestamp,
           symbol,
           AVG(open_interest_usd) as value
         FROM ticker_snapshots
         WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
-        GROUP BY date_trunc('${bucket}', timestamp), symbol
-        ORDER BY timestamp ASC
+        GROUP BY 1, symbol
+        ORDER BY 1 ASC
       `),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
     ]) as any[];
@@ -883,18 +896,22 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
   
   try {
     // Same tiered bucketing as oi-chart above — see comment there.
-    const bucket: 'minute' | 'hour' | 'day' =
-      hours <= 24 ? 'minute' : hours <= 168 ? 'hour' : 'day';
+    const bucketExpr =
+      hours <= 24
+        ? `to_timestamp(floor(extract(epoch FROM timestamp) / 300) * 300)`
+        : hours <= 168
+          ? `date_trunc('hour', timestamp)`
+          : `date_trunc('day', timestamp)`;
     const result = await Promise.race([
       query(`
         SELECT 
-          date_trunc('${bucket}', timestamp) as timestamp,
+          ${bucketExpr} as timestamp,
           symbol,
           AVG(funding_rate) as value
         FROM ticker_snapshots
         WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
-        GROUP BY date_trunc('${bucket}', timestamp), symbol
-        ORDER BY timestamp ASC
+        GROUP BY 1, symbol
+        ORDER BY 1 ASC
       `),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Query timeout')), 5000))
     ]) as any[];
@@ -1173,8 +1190,13 @@ router.get('/liquidations-chart', async (req: Request, res: Response) => {
 router.get('/adl-chart', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 720;
   const isAllTime = hours >= 8760;
-  
+  const cacheKey = `analytics:adl_chart:${hours}`;
+
   try {
+    // SWR — this endpoint previously had NO cache, so every analytics
+    // page load paid two adl_events scans (~1s). Same treatment as the
+    // other chart endpoints.
+    const result = await swrCache(cacheKey, isAllTime ? 3600 : 60, async () => {
     // Get total ADL value ONLY from BULK API start date onwards
     const totalResult = await query<{ total: string }>(`
       SELECT COALESCE(SUM(value), 0) as total FROM adl_events WHERE timestamp >= '${BULK_API_START}'
@@ -1204,7 +1226,10 @@ router.get('/adl-chart', async (req: Request, res: Response) => {
     const historicalCumulative = totalAllTime - visibleSum;
     
     const data = transformToChartData(visibleRows, historicalCumulative);
-    res.json({ data });
+    return { data };
+    });
+
+    res.json(result);
   } catch (error) {
     console.error('Error fetching ADL chart:', error);
     res.json({ data: [] }); // Return empty on error
@@ -2390,76 +2415,11 @@ router.get('/protocol-revenue-chart', async (req: Request, res: Response) => {
   }
 });
 
-// ============ ADL EVENTS CHART ============
+// [Removed] A second, unreachable /adl-chart route used to live here.
+// Express serves the first registration (above, with SWR caching); this
+// duplicate was dead code and additionally had an invalid date_trunc
+// unit ('1_hour') that would have thrown had it ever been reached.
 
-// ADL events chart (already in DB)
-router.get('/adl-chart', async (req: Request, res: Response) => {
-  const hours = parseInt(req.query.hours as string) || 168;
-  const cacheKey = `analytics:adl_chart:${hours}`;
-
-  const cached = await getCache<any>(cacheKey);
-  if (cached) {
-    return res.json(cached);
-  }
-
-  try {
-    // Determine bucket interval
-    let bucketInterval = '1 hour';
-    if (hours <= 24) bucketInterval = '1 hour';
-    else if (hours <= 168) bucketInterval = '4 hours';
-    else bucketInterval = '1 day';
-
-    // Start date for BULK API data
-    const BULK_API_START = '2026-04-13T19:00:00.000Z';
-
-    // Group dynamically per symbol — no more hardcoded btc_value/eth_value
-    // columns. Any new market BULK lists appears automatically once ADL
-    // events for it land in the DB.
-    const rows = await query<{
-      time_bucket: string;
-      symbol: string;
-      bucket_value: string;
-      bucket_count: string;
-    }>(`
-      SELECT 
-        date_trunc('${bucketInterval.replace(' ', '_')}', timestamp) as time_bucket,
-        symbol,
-        COALESCE(SUM(value), 0) as bucket_value,
-        COUNT(*) as bucket_count
-      FROM adl_events
-      WHERE timestamp >= GREATEST('${BULK_API_START}'::timestamp, NOW() - INTERVAL '${hours} hours')
-      GROUP BY time_bucket, symbol
-      ORDER BY time_bucket ASC
-    `);
-
-    const symbols = await getActiveSymbols();
-    const bucketMap = new Map<string, { coinValues: Record<string, number>; count: number }>();
-    for (const row of rows) {
-      const ts = new Date(row.time_bucket).toISOString();
-      if (!bucketMap.has(ts)) bucketMap.set(ts, { coinValues: zeroCoinDict(symbols), count: 0 });
-      const entry = bucketMap.get(ts)!;
-      const coin = coinFromSymbol(row.symbol);
-      if (coin) entry.coinValues[coin] = parseFloat(row.bucket_value || '0');
-      entry.count += parseInt(row.bucket_count || '0');
-    }
-
-    let cumulative = 0;
-    const data = Array.from(bucketMap.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([ts, { coinValues, count }]) => {
-        const total = Object.values(coinValues).reduce((s, v) => s + v, 0);
-        cumulative += total;
-        return buildAdditiveRow(ts, coinValues, { total, count, Cumulative: cumulative });
-      });
-
-    const result = { period: hours, data };
-    await setCache(cacheKey, result, 60);
-    res.json(result);
-  } catch (error) {
-    console.error('Error fetching ADL chart:', error);
-    res.status(500).json({ error: 'Failed to fetch ADL chart' });
-  }
-});
 
 // ADL summary stats
 router.get('/adl-summary', async (req: Request, res: Response) => {
