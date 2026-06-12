@@ -684,7 +684,8 @@ router.get('/open-interest-history/:symbol', async (req: Request, res: Response)
   try {
     // Bucket by range — raw rows over 30d were ~hundreds of thousands
     // (snapshots every few seconds), which made range switching crawl.
-    // Tiers match oi-chart: 1d→5-min bins, ≤7d→hour, beyond→day.
+    // Tiers: 1d→5-min bins (epoch math; date_trunc has no sub-hour
+    // multiple units), ≤7d→hour, beyond→day.
     const bucketExpr =
       hours <= 24
         ? `to_timestamp(floor(extract(epoch FROM timestamp) / 300) * 300)`
