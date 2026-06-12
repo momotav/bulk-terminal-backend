@@ -7,6 +7,7 @@ dotenv.config();
 
 import { testConnection, initializeDatabase, query } from './db';
 import { startDataCollector } from './jobs/dataCollector';
+import { startCacheWarmer } from './jobs/cacheWarmer';
 import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
 import { initRedis, getCacheStats } from './services/cache';
 
@@ -343,6 +344,10 @@ async function start() {
     console.log(`✅ Server running on port ${PORT}`);
     console.log(`   Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
     console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+    // Pre-populate hot analytics caches so the first real visitor after
+    // a deploy never pays the cold rebuild. Must start after listen()
+    // because it warms by fetching our own endpoints over localhost.
+    startCacheWarmer(PORT);
   });
 }
 
