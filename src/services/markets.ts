@@ -24,11 +24,15 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 
 // Known-good fallback used when /exchangeInfo is unreachable OR returns an
 // empty array (which it currently does on testnet after the network upgrade
-// — HTTP 200 with `[]`). Keep this list in sync with the markets actually
-// trading on BULK so the coin selectors stay complete. These are every coin
-// observed live on testnet (price/trade/liquidation activity) as of the
-// post-upgrade state; when BULK repopulates /exchangeInfo this list stops
-// mattering and the live data takes over automatically.
+// — HTTP 200 with `[]`). These are the markets CONFIRMED live on the Paper
+// Trading Testnet, verified via per-symbol probes:
+//   GET /ticker/{symbol}  → HTTP 200 with price data
+//   GET /klines?symbol=…  → 90 bars of history
+// Coins seen in BULK's mainnet UI (XMR, GOLD, SILVER, MU, STBL, GRIFFAIN,
+// ANTHROPIC, CHIP) return 404 / 0 klines on testnet, so they're deliberately
+// excluded — listing them would put un-chartable coins in the selector.
+// When BULK repopulates /exchangeInfo this list stops mattering and live
+// data takes over automatically; re-probe if pointing at a different network.
 const FALLBACK_SYMBOLS: readonly string[] = [
   'BTC-USD',
   'ETH-USD',
@@ -38,15 +42,7 @@ const FALLBACK_SYMBOLS: readonly string[] = [
   'DOGE-USD',
   'SUI-USD',
   'ZEC-USD',
-  'XMR-USD',
-  'GOLD-USD',
-  'SILVER-USD',
-  'MU-USD',
-  'STBL-USD',
-  'GRIFFAIN-USD',
   'FARTCOIN-USD',
-  'ANTHROPIC-USD',
-  'CHIP-USD',
 ];
 
 let cache: { symbols: string[]; expiresAt: number } | null = null;
