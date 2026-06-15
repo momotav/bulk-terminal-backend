@@ -2699,7 +2699,7 @@ router.get('/exchange-info', async (_req: Request, res: Response) => {
 
     // BULK returns an array of market objects. Normalize each to the minimal
     // shape the frontend needs — we can add more fields later as needed.
-    const markets = Array.isArray(raw)
+    let markets = Array.isArray(raw)
       ? raw
           .filter((m: any) => m && typeof m.symbol === 'string')
           .map((m: any) => ({
@@ -2714,8 +2714,38 @@ router.get('/exchange-info', async (_req: Request, res: Response) => {
           }))
       : [];
 
+    // BULK's /exchangeInfo currently returns an empty array on testnet (HTTP
+    // 200 with literally `[]`) even though markets exist and trade — the
+    // network upgrade left it unpopulated. When that happens, fall back to
+    // the shared market list from getActiveSymbols(), which itself falls back
+    // to a known-good hardcoded set (BTC/ETH/SOL/GOLD/XRP/BNB/DOGE/FARTCOIN/
+    // SUI/ZEC). Without this the frontend coin selector collapsed to just its
+    // 3 built-in defaults and users couldn't pick any other coin. Build the
+    // same normalized shape from the symbol strings so the frontend hook is
+    // none the wiser.
+    if (markets.length === 0) {
+      const symbols = await getActiveSymbols();
+      markets = symbols.map((symbol) => ({
+        symbol,
+        coin: symbol.replace('-USD', ''),
+        quoteAsset: 'USDC',
+        status: 'TRADING',
+        maxLeverage: 0,
+        tickSize: 0,
+        lotSize: 0,
+        minNotional: 0,
+      }));
+      console.log(
+        `📋 /exchangeInfo empty — served ${markets.length} coins from getActiveSymbols fallback`,
+      );
+    }
+
     const result = { markets, count: markets.length, timestamp: Date.now() };
-    await setCache(cacheKey, result, 300); // 5-minute TTL
+    // Only cache a non-empty result. If even the fallback somehow yields
+    // nothing, don't poison the 5-minute cache with an empty list.
+    if (markets.length > 0) {
+      await setCache(cacheKey, result, 300); // 5-minute TTL
+    }
     res.json(result);
   } catch (error) {
     console.error('Error fetching exchange info:', error);
