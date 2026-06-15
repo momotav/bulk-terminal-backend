@@ -22,19 +22,31 @@ import { bulkFetch } from './bulkAuth';
 // fresh, and it keeps us from hammering /exchangeInfo on every reconnect.
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
-// Known-good fallback used when /exchangeInfo is unreachable. Keep at least
-// the coins we've always supported here so the site never fully breaks.
+// Known-good fallback used when /exchangeInfo is unreachable OR returns an
+// empty array (which it currently does on testnet after the network upgrade
+// — HTTP 200 with `[]`). Keep this list in sync with the markets actually
+// trading on BULK so the coin selectors stay complete. These are every coin
+// observed live on testnet (price/trade/liquidation activity) as of the
+// post-upgrade state; when BULK repopulates /exchangeInfo this list stops
+// mattering and the live data takes over automatically.
 const FALLBACK_SYMBOLS: readonly string[] = [
   'BTC-USD',
   'ETH-USD',
   'SOL-USD',
-  'GOLD-USD',
   'XRP-USD',
   'BNB-USD',
   'DOGE-USD',
-  'FARTCOIN-USD',
   'SUI-USD',
   'ZEC-USD',
+  'XMR-USD',
+  'GOLD-USD',
+  'SILVER-USD',
+  'MU-USD',
+  'STBL-USD',
+  'GRIFFAIN-USD',
+  'FARTCOIN-USD',
+  'ANTHROPIC-USD',
+  'CHIP-USD',
 ];
 
 let cache: { symbols: string[]; expiresAt: number } | null = null;
