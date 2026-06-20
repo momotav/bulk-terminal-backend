@@ -308,8 +308,9 @@ router.get('/status', async (_req: Request, res: Response) => {
       backfill_complete: boolean;
       last_run: string | null;
       total_indexed: string;
-    }>(`SELECT backfill_complete, last_run::text, total_indexed::text
-        FROM predeposit_index_state WHERE id = 1`);
+    }>(`SELECT s.backfill_complete, s.last_run::text,
+               (SELECT COUNT(*) FROM predeposit_transfers)::text AS total_indexed
+        FROM predeposit_index_state s WHERE s.id = 1`);
     const r = rows[0];
     res.json({
       backfillComplete: r?.backfill_complete ?? false,
