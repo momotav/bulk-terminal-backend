@@ -8,6 +8,7 @@ dotenv.config();
 import { testConnection, initializeDatabase, query } from './db';
 import { startDataCollector } from './jobs/dataCollector';
 import { startCacheWarmer } from './jobs/cacheWarmer';
+import { startPredepositIndexer } from './services/solanaIndexer';
 import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
 import { initRedis, getCacheStats } from './services/cache';
 
@@ -18,6 +19,7 @@ import analyticsRoutes from './routes/analytics';
 import walletRoutes from './routes/wallet';
 import userRoutes from './routes/users';
 import explorerRoutes from './routes/explorer';
+import predepositRoutes from './routes/predeposit';
 import { startExplorerListener } from './services/bulkExplorer';
 import { requestNetworkMiddleware } from './services/networkContext';
 
@@ -290,6 +292,7 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/wallet', walletRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/explorer', explorerRoutes);
+app.use('/api/predeposit', predepositRoutes);
 
 // Debug endpoint to check cache status
 app.get('/debug/cache', async (req, res) => {
@@ -348,6 +351,9 @@ async function start() {
     // a deploy never pays the cold rebuild. Must start after listen()
     // because it warms by fetching our own endpoints over localhost.
     startCacheWarmer(PORT);
+    // Index BULK's pre-deposit vault from Solana mainnet (no-op until
+    // SOLANA_RPC_URL is set in env).
+    startPredepositIndexer();
   });
 }
 
