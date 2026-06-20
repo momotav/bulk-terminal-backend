@@ -97,7 +97,28 @@ interface TokenBalance {
   accountIndex: number;
   mint: string;
   owner?: string;
-  uiTokenAmount: { uiAmount: number | null; amount: string; decimals: number };
+  uiTokenAmount: { uiAmount: number | null; uiAmountString?: string; amount: string; decimals: number };
+}
+
+// Robustly extract a token balance's UI amount. `uiAmount` (a JS number)
+// can come back null from the RPC for large balances, and using `|| 0`
+// then silently zeroes big deposits — which is exactly what was making the
+// vault look like it held thousands instead of millions. Prefer the string
+// forms, which are always present and exact:
+//   1) uiAmountString (decimal string, correct precision)
+//   2) raw `amount` ÷ 10^decimals (integer string → human units)
+//   3) uiAmount number as a last resort
+function uiAmountOf(b: TokenBalance): number {
+  const t = b.uiTokenAmount;
+  if (t.uiAmountString != null && t.uiAmountString !== '') {
+    const n = parseFloat(t.uiAmountString);
+    if (!Number.isNaN(n)) return n;
+  }
+  if (t.amount != null && t.amount !== '') {
+    const raw = parseFloat(t.amount);
+    if (!Number.isNaN(raw)) return raw / Math.pow(10, t.decimals ?? 6);
+  }
+  return t.uiAmount ?? 0;
 }
 
 // Parse a single tx into a vault USDC transfer, or null if it isn't one.
@@ -126,13 +147,13 @@ function parseTransfer(sig: SignatureInfo, tx: ParsedTx): {
   for (const b of pre) {
     if (!b.owner) continue;
     const cur = byOwner.get(b.owner) || { pre: 0, post: 0 };
-    cur.pre = b.uiTokenAmount.uiAmount || 0;
+    cur.pre = uiAmountOf(b);
     byOwner.set(b.owner, cur);
   }
   for (const b of post) {
     if (!b.owner) continue;
     const cur = byOwner.get(b.owner) || { pre: 0, post: 0 };
-    cur.post = b.uiTokenAmount.uiAmount || 0;
+    cur.post = uiAmountOf(b);
     byOwner.set(b.owner, cur);
   }
 
@@ -269,7 +290,11 @@ export async function runPredepositIndexer(): Promise<void> {
     if (!backfillComplete) {
       let pagesThisRun = 0;
       let before = oldestSig || undefined;
-      while (pagesThisRun < 3) {
+      // ~21K vault txns / 1000 per page ≈ 21 pages total. 10 pages per run
+      // clears the whole backfill in ~2-3 runs (a few minutes) instead of
+      // dribbling 3 pages every 2 min. resolveTransfers caps RPC concurrency
+      // at 5 so this stays within Helius free-tier RPS.
+      while (pagesThisRun < 10) {
         const page = await getSignatures({ before });
         if (page.length === 0) {
           backfillComplete = true;
