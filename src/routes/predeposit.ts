@@ -73,7 +73,7 @@ router.get('/kpis', async (_req: Request, res: Response) => {
       largestDeposit: parseFloat(r?.largest_deposit || '0'),
       timestamp: Date.now(),
     };
-    await setCache(cacheKey, result, 30);
+    await setCache(cacheKey, result, 15);
     res.json(result);
   } catch (error) {
     console.error('predeposit kpis error:', error);
@@ -133,7 +133,7 @@ router.get('/tvl-history', async (_req: Request, res: Response) => {
       liveBalance: parseFloat(r.live_balance),
     }));
     const result = { data, timestamp: Date.now() };
-    await setCache(cacheKey, result, 60);
+    await setCache(cacheKey, result, 15);
     res.json(result);
   } catch (error) {
     console.error('predeposit tvl-history error:', error);
@@ -202,7 +202,7 @@ router.get('/distribution', async (_req: Request, res: Response) => {
       pctDeposits: parseFloat(r.pct_deposits || '0'),
     }));
     const result = { data, timestamp: Date.now() };
-    await setCache(cacheKey, result, 60);
+    await setCache(cacheKey, result, 15);
     res.json(result);
   } catch (error) {
     console.error('predeposit distribution error:', error);
@@ -293,7 +293,7 @@ router.get('/leaderboard', async (req: Request, res: Response) => {
       twitterAvatar: r.twitter_avatar,
     }));
     const result = { data, timestamp: Date.now() };
-    await setCache(cacheKey, result, 60);
+    await setCache(cacheKey, result, 15);
     res.json(result);
   } catch (error) {
     console.error('predeposit leaderboard error:', error);
@@ -321,6 +321,42 @@ router.get('/status', async (_req: Request, res: Response) => {
   } catch (error) {
     console.error('predeposit status error:', error);
     res.status(500).json({ error: 'Failed to read status' });
+  }
+});
+
+// ---- Debug: indexed coverage (date range, counts) — confirms the table
+// holds the full campaign window, not just recent txns. Handy while the
+// backfill runs to verify it's reaching all-time data.
+router.get('/debug', async (_req: Request, res: Response) => {
+  try {
+    const rows = await query<{
+      total: string;
+      deposits: string;
+      withdrawals: string;
+      earliest: string | null;
+      latest: string | null;
+      sum_dep: string;
+      sum_wd: string;
+    }>(`
+      SELECT
+        COUNT(*)::text AS total,
+        COUNT(*) FILTER (WHERE direction = 'deposit')::text AS deposits,
+        COUNT(*) FILTER (WHERE direction = 'withdrawal')::text AS withdrawals,
+        MIN(block_time)::text AS earliest,
+        MAX(block_time)::text AS latest,
+        COALESCE(SUM(amount_usdc) FILTER (WHERE direction = 'deposit'), 0)::text AS sum_dep,
+        COALESCE(SUM(amount_usdc) FILTER (WHERE direction = 'withdrawal'), 0)::text AS sum_wd
+      FROM predeposit_transfers
+    `);
+    const stateRows = await query<{
+      backfill_complete: boolean; oldest_signature: string | null;
+      newest_signature: string | null; last_run: string | null;
+    }>(`SELECT backfill_complete, oldest_signature, newest_signature, last_run::text
+        FROM predeposit_index_state WHERE id = 1`);
+    res.json({ table: rows[0], state: stateRows[0] });
+  } catch (error) {
+    console.error('predeposit debug error:', error);
+    res.status(500).json({ error: 'debug failed' });
   }
 });
 
