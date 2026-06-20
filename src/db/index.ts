@@ -1,363 +1,513 @@
-import express from 'express';
-import cors from 'cors';
+import { Pool, PoolClient } from 'pg';
 import dotenv from 'dotenv';
 
-// Load environment variables
 dotenv.config();
 
-import { testConnection, initializeDatabase, query } from './db';
-import { startDataCollector } from './jobs/dataCollector';
-import { startCacheWarmer } from './jobs/cacheWarmer';
-import { startPredepositIndexer } from './services/solanaIndexer';
-import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
-import { initRedis, getCacheStats } from './services/cache';
-
-// Import routes
-import authRoutes from './routes/auth';
-import leaderboardRoutes from './routes/leaderboard';
-import analyticsRoutes from './routes/analytics';
-import walletRoutes from './routes/wallet';
-import userRoutes from './routes/users';
-import explorerRoutes from './routes/explorer';
-import predepositRoutes from './routes/predeposit';
-import { startExplorerListener } from './services/bulkExplorer';
-import { requestNetworkMiddleware } from './services/networkContext';
-
-const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Allowed origins
-const allowedOrigins = [
-  'http://localhost:3000',
-  'https://bulkstats.com',
-  'https://www.bulkstats.com',
-  'https://bulk-terminal.vercel.app',
-  process.env.FRONTEND_URL,
-].filter(Boolean);
-
-// Middleware
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      console.log('Blocked by CORS:', origin);
-      callback(null, true); // Allow all for now, log blocked ones
-    }
-  },
-  credentials: true,
-}));
-app.use(express.json());
-
-// Request logging
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
-  next();
+// Database connection pool with production settings
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  // Connection pool settings - optimized for high throughput
+  max: 15,                        // Reduced from 20 - fewer but healthier connections
+  min: 2,                         // Keep minimum connections alive
+  idleTimeoutMillis: 60000,       // Close idle clients after 60 seconds (was 30)
+  connectionTimeoutMillis: 10000, // 10 second timeout to get connection
+  allowExitOnIdle: false,         // Keep pool alive
 });
 
-// Network context middleware. Reads `?net=<testnet|devnet>` from the
-// query string and stashes the parsed value in async-local storage so
-// every BULK upstream call inside this request gets routed to the
-// chosen network's URLs. Without this middleware, all fetches go to
-// testnet (the safe default).
-app.use(requestNetworkMiddleware);
-
-// Health check
-app.get('/health', (req, res) => {
-  const wsStats = getWebSocketStats();
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    websocket: wsStats,
-  });
+// Monitor pool health
+pool.on('error', (err) => {
+  console.error('❌ Unexpected pool error:', err.message);
 });
 
-// Debug endpoint to check actual database values
-app.get('/debug/db', async (req, res) => {
+pool.on('connect', () => {
+  console.log('🔗 New database connection established');
+});
+
+pool.on('remove', () => {
+  console.log('🔌 Database connection removed from pool');
+});
+
+// Log pool stats periodically
+setInterval(() => {
+  console.log(`📊 Pool stats: total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`);
+}, 60000);
+
+// Test connection
+export async function testConnection(): Promise<boolean> {
   try {
-    const traders = await query('SELECT wallet_address, total_pnl, total_volume, total_trades, total_liquidations, liquidation_value FROM traders ORDER BY last_seen DESC LIMIT 10');
-    const snapshots = await query('SELECT wallet_address, pnl, unrealized_pnl, total_notional, positions_count, timestamp FROM trader_snapshots ORDER BY timestamp DESC LIMIT 10');
-    const marketStats = await query('SELECT symbol, price, open_interest, volume_24h, funding_rate, timestamp FROM market_stats ORDER BY timestamp DESC LIMIT 20');
-    const marketStatsCount = await query('SELECT COUNT(*) as count FROM market_stats');
-    const liquidations = await query('SELECT * FROM liquidations ORDER BY timestamp DESC LIMIT 10');
-    const liquidationsCount = await query('SELECT COUNT(*) as count FROM liquidations');
-    const trades = await query('SELECT * FROM trades ORDER BY timestamp DESC LIMIT 10');
-    const tradesCount = await query('SELECT COUNT(*) as count FROM trades');
-    res.json({ traders, snapshots, marketStats, marketStatsCount, liquidations, liquidationsCount, trades, tradesCount });
+    const client = await pool.connect();
+    await client.query('SELECT NOW()');
+    client.release();
+    console.log('✅ Database connected');
+    return true;
   } catch (error) {
-    res.status(500).json({ error: String(error) });
+    console.error('❌ Database connection failed:', error);
+    return false;
   }
-});
-
-// Debug endpoint to check WebSocket status
-app.get('/debug/ws', async (req, res) => {
-  const wsStats = getWebSocketStats();
-  res.json(wsStats);
-});
-
-// Debug endpoint to force WebSocket reconnect
-app.get('/debug/ws/reconnect', async (req, res) => {
-  forceReconnect();
-  // Wait a moment for connection attempt
-  await new Promise(resolve => setTimeout(resolve, 2000));
-  const wsStats = getWebSocketStats();
-  res.json({ 
-    message: 'Reconnect initiated', 
-    ...wsStats 
-  });
-});
-
-// Debug endpoint to clear test liquidations
-app.get('/debug/clear-test-liquidations', async (req, res) => {
-  try {
-    await query(`DELETE FROM liquidations WHERE wallet_address LIKE 'TEST_WALLET_%'`);
-    await query(`DELETE FROM traders WHERE wallet_address LIKE 'TEST_WALLET_%'`);
-    res.json({ message: 'Test liquidations cleared' });
-  } catch (error) {
-    res.status(500).json({ error: String(error) });
-  }
-});
-
-// Debug endpoint to insert a test liquidation (for testing UI)
-app.get('/debug/test-liquidation', async (req, res) => {
-  try {
-    const testWallet = 'TEST_WALLET_' + Math.random().toString(36).substring(7);
-    const symbols = ['BTC-USD', 'ETH-USD', 'SOL-USD'];
-    const symbol = symbols[Math.floor(Math.random() * symbols.length)];
-    const side = Math.random() > 0.5 ? 'long' : 'short';
-    const price = symbol === 'BTC-USD' ? 71000 + Math.random() * 1000 : symbol === 'ETH-USD' ? 2100 + Math.random() * 50 : 88 + Math.random() * 2;
-    const size = Math.random() * 10;
-    const value = price * size;
-    
-    await query(
-      `INSERT INTO liquidations (wallet_address, symbol, side, size, price, value, timestamp)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
-      [testWallet, symbol, side, size, price, value]
-    );
-    
-    await query(
-      `INSERT INTO traders (wallet_address, total_liquidations, liquidation_value, last_seen)
-       VALUES ($1, 1, $2, NOW())
-       ON CONFLICT (wallet_address) DO UPDATE SET
-         total_liquidations = traders.total_liquidations + 1,
-         liquidation_value = traders.liquidation_value + $2,
-         last_seen = NOW()`,
-      [testWallet, value]
-    );
-    
-    res.json({ 
-      message: 'Test liquidation inserted',
-      liquidation: { wallet: testWallet, symbol, side, size, price, value }
-    });
-  } catch (error) {
-    res.status(500).json({ error: String(error) });
-  }
-});
-
-// Debug endpoint to manually trigger market stats collection
-app.get('/debug/collect', async (req, res) => {
-  try {
-    const { bulkApi } = await import('./services/bulkApi');
-    const tickers = await bulkApi.getAllTickers();
-    res.json({ 
-      message: 'Fetched tickers',
-      count: tickers.length,
-      tickers 
-    });
-  } catch (error) {
-    res.status(500).json({ error: String(error) });
-  }
-});
-
-// Debug endpoint to run arbitrary SELECT queries with timing
-app.post('/debug/sql', async (req, res) => {
-  try {
-    const { sql } = req.body;
-    
-    if (!sql) {
-      return res.status(400).json({ error: 'Missing sql parameter' });
-    }
-    
-    // Security: Only allow SELECT statements
-    const trimmedSql = sql.trim().toLowerCase();
-    if (!trimmedSql.startsWith('select')) {
-      return res.status(400).json({ error: 'Only SELECT queries allowed' });
-    }
-    
-    // Disallow dangerous patterns
-    const dangerous = ['insert', 'update', 'delete', 'drop', 'truncate', 'alter', 'create', 'grant', 'revoke', ';'];
-    for (const pattern of dangerous) {
-      if (trimmedSql.includes(pattern) && pattern !== ';') {
-        return res.status(400).json({ error: `Query contains forbidden keyword: ${pattern}` });
-      }
-    }
-    
-    // Remove trailing semicolon if present
-    const cleanSql = sql.trim().replace(/;$/, '');
-    
-    const startTime = process.hrtime.bigint();
-    const result = await query(cleanSql);
-    const endTime = process.hrtime.bigint();
-    
-    const durationMs = Number(endTime - startTime) / 1_000_000;
-    
-    res.json({
-      success: true,
-      query: cleanSql,
-      rows: result,
-      rowCount: result.length,
-      durationMs: Math.round(durationMs * 100) / 100,
-      durationFormatted: durationMs < 1000 
-        ? `${Math.round(durationMs)}ms` 
-        : `${(durationMs / 1000).toFixed(2)}s`
-    });
-  } catch (error: any) {
-    res.status(500).json({ 
-      success: false,
-      error: error.message || String(error),
-      hint: error.hint || null,
-      position: error.position || null
-    });
-  }
-});
-
-// GET version for simple queries via URL
-app.get('/debug/sql', async (req, res) => {
-  try {
-    const sql = req.query.q as string;
-    
-    if (!sql) {
-      return res.status(400).json({ 
-        error: 'Missing q parameter',
-        usage: '/debug/sql?q=SELECT COUNT(*) FROM trades',
-        examples: [
-          '/debug/sql?q=SELECT COUNT(*) FROM trades',
-          '/debug/sql?q=SELECT COUNT(*) FROM traders',
-          '/debug/sql?q=SELECT * FROM trades ORDER BY timestamp DESC LIMIT 5',
-          '/debug/sql?q=SELECT wallet_address, total_volume, total_pnl FROM traders ORDER BY total_volume DESC LIMIT 10',
-        ]
-      });
-    }
-    
-    // Security: Only allow SELECT statements
-    const trimmedSql = sql.trim().toLowerCase();
-    if (!trimmedSql.startsWith('select')) {
-      return res.status(400).json({ error: 'Only SELECT queries allowed' });
-    }
-    
-    // Disallow dangerous patterns
-    const dangerous = ['insert', 'update', 'delete', 'drop', 'truncate', 'alter', 'create', 'grant', 'revoke'];
-    for (const pattern of dangerous) {
-      if (trimmedSql.includes(pattern)) {
-        return res.status(400).json({ error: `Query contains forbidden keyword: ${pattern}` });
-      }
-    }
-    
-    // Remove trailing semicolon if present
-    const cleanSql = sql.trim().replace(/;$/, '');
-    
-    const startTime = process.hrtime.bigint();
-    const result = await query(cleanSql);
-    const endTime = process.hrtime.bigint();
-    
-    const durationMs = Number(endTime - startTime) / 1_000_000;
-    
-    res.json({
-      success: true,
-      query: cleanSql,
-      rows: result,
-      rowCount: result.length,
-      durationMs: Math.round(durationMs * 100) / 100,
-      durationFormatted: durationMs < 1000 
-        ? `${Math.round(durationMs)}ms` 
-        : `${(durationMs / 1000).toFixed(2)}s`
-    });
-  } catch (error: any) {
-    res.status(500).json({ 
-      success: false,
-      error: error.message || String(error),
-      hint: error.hint || null,
-      position: error.position || null
-    });
-  }
-});
-
-// API Routes
-app.use('/api/auth', authRoutes);
-app.use('/api/leaderboard', leaderboardRoutes);
-app.use('/api/analytics', analyticsRoutes);
-app.use('/api/wallet', walletRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/explorer', explorerRoutes);
-app.use('/api/predeposit', predepositRoutes);
-
-// Debug endpoint to check cache status
-app.get('/debug/cache', async (req, res) => {
-  try {
-    const stats = await getCacheStats();
-    res.json(stats);
-  } catch (error) {
-    res.status(500).json({ error: String(error) });
-  }
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
-
-// Error handler
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  console.error('Error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// Start server
-async function start() {
-  console.log('🚀 Starting BULK Terminal Backend...');
-  
-  // Test database connection
-  const dbConnected = await testConnection();
-  if (!dbConnected) {
-    console.error('❌ Cannot start without database connection');
-    process.exit(1);
-  }
-  
-  // Initialize database schema
-  await initializeDatabase();
-  
-  // Initialize Redis cache (optional - falls back to memory if unavailable)
-  const redisConnected = await initRedis();
-  console.log(`📦 Cache: ${redisConnected ? 'Redis' : 'In-Memory (REDIS_URL not set)'}`);
-  
-  // Start data collector cron jobs
-  startDataCollector();
-  
-  // Start WebSocket listener for live trades/liquidations
-  startWebSocketListener();
-
-  // Start explorer WS listener for live block/throughput metrics
-  startExplorerListener();
-  
-  // Start HTTP server
-  app.listen(PORT, () => {
-    console.log(`✅ Server running on port ${PORT}`);
-    console.log(`   Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
-    console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
-    // Pre-populate hot analytics caches so the first real visitor after
-    // a deploy never pays the cold rebuild. Must start after listen()
-    // because it warms by fetching our own endpoints over localhost.
-    startCacheWarmer(PORT);
-    // Index BULK's pre-deposit vault from Solana mainnet (no-op until
-    // SOLANA_RPC_URL is set in env).
-    startPredepositIndexer();
-  });
 }
 
-start().catch(error => {
-  console.error('Failed to start server:', error);
-  process.exit(1);
-});
+// Initialize database schema
+export async function initializeDatabase(): Promise<void> {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+
+    // Users table (for auth - supports both legacy email and Privy wallet auth)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE,
+        password_hash VARCHAR(255),
+        username VARCHAR(50) UNIQUE,
+        wallet_address VARCHAR(64) UNIQUE,
+        privy_id VARCHAR(100) UNIQUE,
+        twitter_id VARCHAR(100),
+        twitter_handle VARCHAR(50),
+        twitter_name VARCHAR(100),
+        twitter_avatar TEXT,
+        display_name VARCHAR(100),
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    // Add Privy columns if they don't exist (for existing databases)
+    await client.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='wallet_address') THEN
+          ALTER TABLE users ADD COLUMN wallet_address VARCHAR(64) UNIQUE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='privy_id') THEN
+          ALTER TABLE users ADD COLUMN privy_id VARCHAR(100) UNIQUE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='twitter_id') THEN
+          ALTER TABLE users ADD COLUMN twitter_id VARCHAR(100);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='twitter_handle') THEN
+          ALTER TABLE users ADD COLUMN twitter_handle VARCHAR(50);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='twitter_name') THEN
+          ALTER TABLE users ADD COLUMN twitter_name VARCHAR(100);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='twitter_avatar') THEN
+          ALTER TABLE users ADD COLUMN twitter_avatar TEXT;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='display_name') THEN
+          ALTER TABLE users ADD COLUMN display_name VARCHAR(100);
+        END IF;
+        -- Make email and password_hash nullable for Privy-only users
+        ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
+        ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+      END $$;
+    `);
+
+    // Traders table (tracked wallets)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS traders (
+        wallet_address VARCHAR(64) PRIMARY KEY,
+        first_seen TIMESTAMP DEFAULT NOW(),
+        last_seen TIMESTAMP DEFAULT NOW(),
+        total_volume DECIMAL(20, 2) DEFAULT 0,
+        total_trades INTEGER DEFAULT 0,
+        total_pnl DECIMAL(20, 2) DEFAULT 0,
+        total_liquidations INTEGER DEFAULT 0,
+        liquidation_value DECIMAL(20, 2) DEFAULT 0,
+        total_adl INTEGER DEFAULT 0,
+        adl_value DECIMAL(20, 2) DEFAULT 0
+      );
+    `);
+
+    // Add missing columns if they don't exist (for existing databases)
+    await client.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='traders' AND column_name='total_adl') THEN
+          ALTER TABLE traders ADD COLUMN total_adl INTEGER DEFAULT 0;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='traders' AND column_name='adl_value') THEN
+          ALTER TABLE traders ADD COLUMN adl_value DECIMAL(20, 2) DEFAULT 0;
+        END IF;
+      END $$;
+    `);
+
+    // Trader snapshots (for historical tracking)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS trader_snapshots (
+        id SERIAL PRIMARY KEY,
+        wallet_address VARCHAR(64) NOT NULL,
+        timestamp TIMESTAMP DEFAULT NOW(),
+        pnl DECIMAL(20, 2) DEFAULT 0,
+        unrealized_pnl DECIMAL(20, 2) DEFAULT 0,
+        volume_24h DECIMAL(20, 2) DEFAULT 0,
+        positions_count INTEGER DEFAULT 0,
+        total_notional DECIMAL(20, 2) DEFAULT 0,
+        FOREIGN KEY (wallet_address) REFERENCES traders(wallet_address)
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_snapshots_wallet_time 
+      ON trader_snapshots(wallet_address, timestamp DESC);
+    `);
+
+    // Liquidations table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS liquidations (
+        id SERIAL PRIMARY KEY,
+        wallet_address VARCHAR(64),
+        symbol VARCHAR(20) NOT NULL,
+        side VARCHAR(10) NOT NULL,
+        size DECIMAL(20, 8) NOT NULL,
+        price DECIMAL(20, 2) NOT NULL,
+        value DECIMAL(20, 2) NOT NULL,
+        timestamp TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_liquidations_time 
+      ON liquidations(timestamp DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_liquidations_wallet 
+      ON liquidations(wallet_address);
+    `);
+    
+    // Add unique constraint to prevent duplicate liquidations
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_indexes 
+          WHERE indexname = 'idx_liquidations_unique'
+        ) THEN
+          BEGIN
+            CREATE UNIQUE INDEX idx_liquidations_unique
+            ON liquidations(wallet_address, symbol, timestamp)
+            WHERE wallet_address IS NOT NULL;
+            RAISE NOTICE 'Created idx_liquidations_unique';
+          EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not create idx_liquidations_unique: %', SQLERRM;
+          END;
+        END IF;
+      END $$;
+    `);
+
+    // Trades table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS trades (
+        id SERIAL PRIMARY KEY,
+        wallet_address VARCHAR(64),
+        symbol VARCHAR(20) NOT NULL,
+        side VARCHAR(10) NOT NULL,
+        size DECIMAL(20, 8) NOT NULL,
+        price DECIMAL(20, 2) NOT NULL,
+        value DECIMAL(20, 2) NOT NULL,
+        timestamp TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_trades_time 
+      ON trades(timestamp DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_trades_value 
+      ON trades(value DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_trades_wallet 
+      ON trades(wallet_address);
+      
+      CREATE INDEX IF NOT EXISTS idx_trades_symbol 
+      ON trades(symbol);
+      
+      -- Composite index for time-based wallet aggregations (FAST leaderboards)
+      CREATE INDEX IF NOT EXISTS idx_trades_wallet_time 
+      ON trades(wallet_address, timestamp DESC);
+      
+      -- Composite index for symbol + time queries
+      CREATE INDEX IF NOT EXISTS idx_trades_symbol_time 
+      ON trades(symbol, timestamp DESC);
+      
+      -- OPTIMIZED: Index for daily unique trader counts (covers DATE(timestamp) queries)
+      CREATE INDEX IF NOT EXISTS idx_trades_date_wallet_symbol
+      ON trades(DATE(timestamp), wallet_address, symbol)
+      WHERE wallet_address IS NOT NULL;
+    `);
+
+    // Pre-aggregated daily statistics table (FAST queries)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS daily_stats (
+        id SERIAL PRIMARY KEY,
+        day DATE NOT NULL,
+        symbol VARCHAR(20),
+        unique_traders INTEGER DEFAULT 0,
+        trade_count INTEGER DEFAULT 0,
+        volume DECIMAL(20,2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(day, symbol)
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_daily_stats_day 
+      ON daily_stats(day DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_daily_stats_day_symbol 
+      ON daily_stats(day, symbol);
+    `);
+    
+    // Daily total unique traders (across all symbols)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS daily_unique_traders (
+        id SERIAL PRIMARY KEY,
+        day DATE NOT NULL UNIQUE,
+        total_unique INTEGER DEFAULT 0,
+        new_users INTEGER DEFAULT 0,
+        cumulative_users INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_daily_unique_day 
+      ON daily_unique_traders(day DESC);
+    `);
+
+    // ADL (Auto-Deleveraging) events table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS adl_events (
+        id SERIAL PRIMARY KEY,
+        wallet_address VARCHAR(64),
+        counterparty VARCHAR(64),
+        symbol VARCHAR(20) NOT NULL,
+        side VARCHAR(10) NOT NULL,
+        size DECIMAL(20, 8) NOT NULL,
+        price DECIMAL(20, 2) NOT NULL,
+        value DECIMAL(20, 2) NOT NULL,
+        timestamp TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_adl_events_time 
+      ON adl_events(timestamp DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_adl_events_wallet 
+      ON adl_events(wallet_address);
+      
+      CREATE INDEX IF NOT EXISTS idx_adl_events_symbol 
+      ON adl_events(symbol);
+    `);
+
+    // Market stats (for analytics charts)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS market_stats (
+        id SERIAL PRIMARY KEY,
+        timestamp TIMESTAMP DEFAULT NOW(),
+        symbol VARCHAR(20) NOT NULL,
+        price DECIMAL(20, 2),
+        open_interest DECIMAL(20, 2),
+        volume_24h DECIMAL(20, 2),
+        funding_rate DECIMAL(20, 8),
+        long_open_interest DECIMAL(20, 2),
+        short_open_interest DECIMAL(20, 2)
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_market_stats_symbol_time 
+      ON market_stats(symbol, timestamp DESC);
+    `);
+
+    // Ticker snapshots (for OI/Funding/Regime charts - collected every minute by wsListener)
+    // UPDATED: Added regime, regime_vol, fair_book_px columns
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ticker_snapshots (
+        id SERIAL PRIMARY KEY,
+        symbol VARCHAR(20) NOT NULL,
+        open_interest_coins DECIMAL(20, 8),
+        open_interest_usd DECIMAL(20, 2),
+        funding_rate DECIMAL(20, 8),
+        mark_price DECIMAL(20, 2),
+        regime INTEGER,
+        regime_vol DECIMAL(20, 8),
+        fair_book_px DECIMAL(20, 2),
+        timestamp TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_ticker_snapshots_symbol_time 
+      ON ticker_snapshots(symbol, timestamp DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_ticker_snapshots_time 
+      ON ticker_snapshots(timestamp DESC);
+    `);
+
+    // Add new columns to ticker_snapshots if they don't exist
+    await client.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ticker_snapshots' AND column_name='regime') THEN
+          ALTER TABLE ticker_snapshots ADD COLUMN regime INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ticker_snapshots' AND column_name='regime_vol') THEN
+          ALTER TABLE ticker_snapshots ADD COLUMN regime_vol DECIMAL(20, 8);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ticker_snapshots' AND column_name='fair_book_px') THEN
+          ALTER TABLE ticker_snapshots ADD COLUMN fair_book_px DECIMAL(20, 2);
+        END IF;
+      END $$;
+    `);
+
+    // NEW: Fee snapshots (for protocol revenue tracking)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS fee_snapshots (
+        id SERIAL PRIMARY KEY,
+        total_maker_fees DECIMAL(20, 2),
+        total_taker_fees DECIMAL(20, 2),
+        total_protocol_settlement DECIMAL(20, 2),
+        settled_fills BIGINT,
+        timestamp TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_fee_snapshots_time 
+      ON fee_snapshots(timestamp DESC);
+    `);
+
+    // Wallet follows (Privy auth - users following wallets)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS wallet_follows (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        followed_wallet VARCHAR(64) NOT NULL,
+        nickname VARCHAR(100),
+        created_at TIMESTAMP DEFAULT NOW(),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE(user_id, followed_wallet)
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_wallet_follows_user 
+      ON wallet_follows(user_id);
+      
+      CREATE INDEX IF NOT EXISTS idx_wallet_follows_wallet 
+      ON wallet_follows(followed_wallet);
+    `);
+
+    // Watchlist (legacy - users following wallets via email auth)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS watchlist (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        wallet_address VARCHAR(64) NOT NULL,
+        nickname VARCHAR(50),
+        created_at TIMESTAMP DEFAULT NOW(),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE(user_id, wallet_address)
+      );
+    `);
+
+    // Notifications for followed wallets activity
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        wallet_address VARCHAR(64) NOT NULL,
+        type VARCHAR(20) NOT NULL,
+        symbol VARCHAR(20),
+        side VARCHAR(10),
+        size DECIMAL(20, 8),
+        price DECIMAL(20, 2),
+        value DECIMAL(20, 2),
+        read BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW(),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_time 
+      ON notifications(user_id, created_at DESC);
+      
+      CREATE INDEX IF NOT EXISTS idx_notifications_unread 
+      ON notifications(user_id, read) WHERE read = false;
+    `);
+
+    // Alerts
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS alerts (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        alert_type VARCHAR(50) NOT NULL,
+        config JSONB NOT NULL,
+        enabled BOOLEAN DEFAULT true,
+        last_triggered TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+    `);
+
+    // Comments
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS comments (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        target_type VARCHAR(50) NOT NULL,
+        target_id VARCHAR(100) NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_comments_target 
+      ON comments(target_type, target_id);
+    `);
+
+    // Pre-deposit vault transfers — indexed directly from Solana mainnet.
+    // One row per USDC transfer into or out of BULK's pre-deposit vault
+    // (7Wpp33Dn5KKUFjaij4zKYy1XZ9kdBtHjUatAT6NcjjGt). The predeposit
+    // indexer job (jobs/predepositIndexer.ts) pages getSignaturesForAddress
+    // and upserts here; the analytics routes compute KPIs / charts /
+    // distribution / leaderboard from this table. `signature` is unique so
+    // re-indexing is idempotent. `counterparty` is the depositor/withdrawer
+    // wallet (the side that isn't the vault); `direction` is deposit|withdrawal.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS predeposit_transfers (
+        signature      VARCHAR(96) PRIMARY KEY,
+        block_slot     BIGINT NOT NULL,
+        block_time     TIMESTAMPTZ NOT NULL,
+        direction      VARCHAR(12) NOT NULL,   -- 'deposit' | 'withdrawal'
+        counterparty   VARCHAR(64) NOT NULL,   -- the non-vault wallet
+        amount_usdc    NUMERIC(20, 6) NOT NULL,
+        created_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_predeposit_block_time
+        ON predeposit_transfers(block_time);
+      CREATE INDEX IF NOT EXISTS idx_predeposit_counterparty
+        ON predeposit_transfers(counterparty);
+      CREATE INDEX IF NOT EXISTS idx_predeposit_direction
+        ON predeposit_transfers(direction);
+
+      -- Cursor table so the indexer knows where it left off (oldest fully
+      -- backfilled signature + newest seen). Single row, id=1.
+      CREATE TABLE IF NOT EXISTS predeposit_index_state (
+        id                  INT PRIMARY KEY DEFAULT 1,
+        newest_signature    VARCHAR(96),
+        oldest_signature    VARCHAR(96),
+        backfill_complete   BOOLEAN DEFAULT FALSE,
+        last_run            TIMESTAMPTZ,
+        total_indexed       BIGINT DEFAULT 0,
+        CONSTRAINT predeposit_index_state_singleton CHECK (id = 1)
+      );
+      INSERT INTO predeposit_index_state (id) VALUES (1)
+        ON CONFLICT (id) DO NOTHING;
+    `);
+
+    await client.query('COMMIT');
+    console.log('✅ Database schema initialized');
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('❌ Database initialization failed:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// Helper function to run queries
+export async function query<T = any>(text: string, params?: any[]): Promise<T[]> {
+  const result = await pool.query(text, params);
+  return result.rows as T[];
+}
+
+export async function queryOne<T = any>(text: string, params?: any[]): Promise<T | null> {
+  const rows = await query<T>(text, params);
+  return rows[0] || null;
+}
