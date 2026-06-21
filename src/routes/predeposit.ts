@@ -301,6 +301,99 @@ router.get('/leaderboard', async (req: Request, res: Response) => {
   }
 });
 
+// ---- Depositor growth: new depositors per day + cumulative -----------------
+router.get('/depositor-growth', async (_req: Request, res: Response) => {
+  const cacheKey = 'predeposit:depositor_growth';
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const rows = await query<{
+      day: string;
+      new_depositors: string;
+      cumulative_depositors: string;
+    }>(`
+      WITH days AS (
+        SELECT generate_series(DATE '${CAMPAIGN_START}', CURRENT_DATE, INTERVAL '1 day')::date AS day
+      ),
+      firsts AS (
+        -- first day each wallet ever deposited
+        SELECT counterparty, MIN(block_time::date) AS first_day
+        FROM predeposit_transfers
+        WHERE direction = 'deposit' AND block_time >= '${CAMPAIGN_START}'
+        GROUP BY counterparty
+      ),
+      per_day AS (
+        SELECT first_day AS day, COUNT(*) AS new_depositors
+        FROM firsts GROUP BY first_day
+      )
+      SELECT
+        d.day,
+        COALESCE(p.new_depositors, 0)::text AS new_depositors,
+        SUM(COALESCE(p.new_depositors, 0)) OVER (ORDER BY d.day)::text AS cumulative_depositors
+      FROM days d
+      LEFT JOIN per_day p ON p.day = d.day
+      ORDER BY d.day
+    `);
+    const data = rows.map((r) => ({
+      day: r.day,
+      newDepositors: parseInt(r.new_depositors, 10),
+      cumulativeDepositors: parseInt(r.cumulative_depositors, 10),
+    }));
+    const result = { data, timestamp: Date.now() };
+    await setCache(cacheKey, result, 15);
+    res.json(result);
+  } catch (error) {
+    console.error('predeposit depositor-growth error:', error);
+    res.status(500).json({ error: 'Failed to compute depositor growth' });
+  }
+});
+
+// ---- Daily activity: active depositors + deposit txns per day --------------
+router.get('/daily-activity', async (_req: Request, res: Response) => {
+  const cacheKey = 'predeposit:daily_activity';
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const rows = await query<{
+      day: string;
+      active_depositors: string;
+      deposit_txns: string;
+    }>(`
+      WITH days AS (
+        SELECT generate_series(DATE '${CAMPAIGN_START}', CURRENT_DATE, INTERVAL '1 day')::date AS day
+      ),
+      daily AS (
+        SELECT block_time::date AS day,
+               COUNT(DISTINCT counterparty) AS active_depositors,
+               COUNT(*)                     AS deposit_txns
+        FROM predeposit_transfers
+        WHERE direction = 'deposit' AND block_time >= '${CAMPAIGN_START}'
+        GROUP BY 1
+      )
+      SELECT
+        d.day,
+        COALESCE(dl.active_depositors, 0)::text AS active_depositors,
+        COALESCE(dl.deposit_txns, 0)::text      AS deposit_txns
+      FROM days d
+      LEFT JOIN daily dl ON dl.day = d.day
+      ORDER BY d.day
+    `);
+    const data = rows.map((r) => ({
+      day: r.day,
+      activeDepositors: parseInt(r.active_depositors, 10),
+      depositTxns: parseInt(r.deposit_txns, 10),
+    }));
+    const result = { data, timestamp: Date.now() };
+    await setCache(cacheKey, result, 15);
+    res.json(result);
+  } catch (error) {
+    console.error('predeposit daily-activity error:', error);
+    res.status(500).json({ error: 'Failed to compute daily activity' });
+  }
+});
+
 // ---- Indexer status (for an "indexing…" banner while backfill runs) -------
 router.get('/status', async (_req: Request, res: Response) => {
   try {
