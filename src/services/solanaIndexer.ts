@@ -315,6 +315,8 @@ export async function runPredepositIndexer(): Promise<void> {
     // signature history. On the first run (backfill not complete) we drain
     // the FULL history to the campaign start. On later runs we only fetch
     // signatures newer than the last newest we saw (incremental).
+    console.log(`💰 Indexer run: targets = [${indexTargets.map((t) => t.slice(0, 8)).join(', ')}], backfillComplete=${backfillComplete}`);
+    let reachedEndForAll = true;
     for (const target of indexTargets) {
       if (!backfillComplete) {
         // Full backfill: page backward until campaign start or empty. This
@@ -323,19 +325,24 @@ export async function runPredepositIndexer(): Promise<void> {
         // sig. May take a few minutes; runs once.
         let before: string | undefined = undefined;
         let pages = 0;
-        const MAX_PAGES = 100; // safety cap (100k txns)
+        let reachedEnd = false;
+        const MAX_PAGES = 200; // safety cap
         while (pages < MAX_PAGES) {
           const page = await getSignatures(target, { before });
-          if (page.length === 0) break;
+          if (page.length === 0) { reachedEnd = true; break; }
           if (newestSig === null && pages === 0) newestSig = page[0].signature;
           const transfers = await resolveTransfers(page);
           totalNew += await persistTransfers(transfers);
           before = page[page.length - 1].signature;
           const oldestTime = page[page.length - 1].blockTime;
-          if (oldestTime !== null && oldestTime < CAMPAIGN_START) break;
+          if (oldestTime !== null && oldestTime < CAMPAIGN_START) { reachedEnd = true; break; }
           pages += 1;
         }
-        console.log(`💰 Backfill drained ${target.slice(0, 8)}… (${pages + 1} pages)`);
+        // If we hit MAX_PAGES without reaching the end, backfill is NOT
+        // complete for this target — leave the flag false so the next run
+        // resumes rather than falsely declaring done.
+        if (!reachedEnd) reachedEndForAll = false;
+        console.log(`💰 Backfill ${target.slice(0, 8)}…: ${pages} pages, reachedEnd=${reachedEnd}`);
       } else {
         // Incremental: only signatures newer than our last newest.
         const fresh = await getSignatures(target, { until: state?.newest_signature || undefined });
@@ -347,7 +354,11 @@ export async function runPredepositIndexer(): Promise<void> {
       }
     }
 
-    if (!backfillComplete) backfillComplete = true; // first run drains everything
+    // Only declare backfill complete if EVERY target genuinely reached its
+    // end this run. A partial/capped/errored run leaves the flag false so
+    // the next run resumes the drain instead of silently switching to
+    // incremental-only (which was leaving it stuck at a partial count).
+    if (!backfillComplete && reachedEndForAll) backfillComplete = true;
     if (totalNew > 0) console.log(`💰 Pre-deposit indexer: +${totalNew} transfers this run`);
 
     // Persist cursor + counters.
