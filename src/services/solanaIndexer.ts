@@ -38,6 +38,34 @@ const CAMPAIGN_START = Date.parse('2026-06-01T00:00:00Z') / 1000;
 
 const RPC_URL = process.env.SOLANA_RPC_URL || '';
 
+// The addresses we page signatures for. The vault OWNER (7Wpp…) only
+// directly references a subset of transactions; the USDC actually lives in
+// token accounts (ATAs) OWNED by the vault, and getSignaturesForAddress on
+// the owner does NOT include token-account txns. So at startup we resolve
+// the vault's USDC token account(s) via getTokenAccountsByOwner and index
+// signatures for those — that's where deposit/withdrawal txns reference.
+// Falls back to the owner address if resolution fails.
+let indexTargets: string[] = [VAULT];
+
+async function resolveTokenAccounts(): Promise<void> {
+  try {
+    const result = await rpc<{ value: { pubkey: string }[] }>('getTokenAccountsByOwner', [
+      VAULT,
+      { mint: USDC_MINT },
+      { encoding: 'jsonParsed' },
+    ]);
+    const atas = (result?.value || []).map((v) => v.pubkey);
+    if (atas.length > 0) {
+      // Index the token accounts (where deposits reference). Keep the owner
+      // too in case some txns reference it directly.
+      indexTargets = [...atas, VAULT];
+      console.log(`💰 Vault USDC token accounts resolved: ${atas.join(', ')}`);
+    }
+  } catch (e) {
+    console.error('Could not resolve vault token accounts, indexing owner only:', e);
+  }
+}
+
 export function isIndexerConfigured(): boolean {
   return RPC_URL.length > 0;
 }
@@ -71,9 +99,9 @@ interface SignatureInfo {
 // Page signatures for the vault. `until` stops once we reach a signature
 // we've already indexed (incremental runs); `before` pages backward
 // (backfill). Returns newest→oldest.
-async function getSignatures(opts: { before?: string; until?: string }): Promise<SignatureInfo[]> {
+async function getSignatures(target: string, opts: { before?: string; until?: string }): Promise<SignatureInfo[]> {
   const params: [string, Record<string, unknown>] = [
-    VAULT,
+    target,
     { limit: 1000, ...(opts.before ? { before: opts.before } : {}), ...(opts.until ? { until: opts.until } : {}) },
   ];
   return rpc<SignatureInfo[]>('getSignaturesForAddress', params);
@@ -240,7 +268,7 @@ async function persistTransfers(
 // rate-limit-sensitive, so we throttle with a small concurrency cap.
 async function resolveTransfers(sigs: SignatureInfo[]) {
   const out: NonNullable<ReturnType<typeof parseTransfer>>[] = [];
-  const CONCURRENCY = 5;
+  const CONCURRENCY = 20;
   for (let i = 0; i < sigs.length; i += CONCURRENCY) {
     const batch = sigs.slice(i, i + CONCURRENCY);
     const txs = await Promise.all(
@@ -272,47 +300,55 @@ export async function runPredepositIndexer(): Promise<void> {
   if (running) return; // don't overlap runs
   running = true;
   try {
-    const state = await getState();
-
-    // 1) Incremental: newest signatures since last run.
-    const fresh = await getSignatures({ until: state?.newest_signature || undefined });
-    let newestSig = state?.newest_signature || null;
-    if (fresh.length > 0) {
-      newestSig = fresh[0].signature; // newest is first
-      const transfers = await resolveTransfers(fresh);
-      const n = await persistTransfers(transfers);
-      console.log(`💰 Pre-deposit indexer: +${n} new transfers (scanned ${fresh.length} sigs)`);
+    // Resolve the vault's USDC token accounts once (deposits reference the
+    // ATA, not the owner — getSignaturesForAddress on the owner misses them).
+    if (indexTargets.length === 1) {
+      await resolveTokenAccounts();
     }
 
-    // 2) Backfill: page backward a few pages per run until campaign start.
-    let oldestSig = state?.oldest_signature || null;
+    const state = await getState();
     let backfillComplete = state?.backfill_complete || false;
-    if (!backfillComplete) {
-      let pagesThisRun = 0;
-      let before = oldestSig || undefined;
-      // ~21K vault txns / 1000 per page ≈ 21 pages total. 10 pages per run
-      // clears the whole backfill in ~2-3 runs (a few minutes) instead of
-      // dribbling 3 pages every 2 min. resolveTransfers caps RPC concurrency
-      // at 5 so this stays within Helius free-tier RPS.
-      while (pagesThisRun < 10) {
-        const page = await getSignatures({ before });
-        if (page.length === 0) {
-          backfillComplete = true;
-          break;
+    let newestSig = state?.newest_signature || null;
+    let totalNew = 0;
+
+    // For each target address (vault token accounts + owner), walk its
+    // signature history. On the first run (backfill not complete) we drain
+    // the FULL history to the campaign start. On later runs we only fetch
+    // signatures newer than the last newest we saw (incremental).
+    for (const target of indexTargets) {
+      if (!backfillComplete) {
+        // Full backfill: page backward until campaign start or empty. This
+        // walks every signature for the target in one run — for ~21K txns
+        // that's ~21 pages of getSignaturesForAddress + getTransaction per
+        // sig. May take a few minutes; runs once.
+        let before: string | undefined = undefined;
+        let pages = 0;
+        const MAX_PAGES = 100; // safety cap (100k txns)
+        while (pages < MAX_PAGES) {
+          const page = await getSignatures(target, { before });
+          if (page.length === 0) break;
+          if (newestSig === null && pages === 0) newestSig = page[0].signature;
+          const transfers = await resolveTransfers(page);
+          totalNew += await persistTransfers(transfers);
+          before = page[page.length - 1].signature;
+          const oldestTime = page[page.length - 1].blockTime;
+          if (oldestTime !== null && oldestTime < CAMPAIGN_START) break;
+          pages += 1;
         }
-        const transfers = await resolveTransfers(page);
-        await persistTransfers(transfers);
-        oldestSig = page[page.length - 1].signature;
-        before = oldestSig;
-        // If the oldest sig in this page predates the campaign, we're done.
-        const oldestTime = page[page.length - 1].blockTime;
-        if (oldestTime !== null && oldestTime < CAMPAIGN_START) {
-          backfillComplete = true;
-          break;
+        console.log(`💰 Backfill drained ${target.slice(0, 8)}… (${pages + 1} pages)`);
+      } else {
+        // Incremental: only signatures newer than our last newest.
+        const fresh = await getSignatures(target, { until: state?.newest_signature || undefined });
+        if (fresh.length > 0) {
+          if (newestSig === null || newestSig === state?.newest_signature) newestSig = fresh[0].signature;
+          const transfers = await resolveTransfers(fresh);
+          totalNew += await persistTransfers(transfers);
         }
-        pagesThisRun += 1;
       }
     }
+
+    if (!backfillComplete) backfillComplete = true; // first run drains everything
+    if (totalNew > 0) console.log(`💰 Pre-deposit indexer: +${totalNew} transfers this run`);
 
     // Persist cursor + counters.
     const totalRow = await query<{ c: string }>(
@@ -321,12 +357,11 @@ export async function runPredepositIndexer(): Promise<void> {
     await query(
       `UPDATE predeposit_index_state
          SET newest_signature = $1,
-             oldest_signature = $2,
-             backfill_complete = $3,
+             backfill_complete = $2,
              last_run = NOW(),
-             total_indexed = $4
+             total_indexed = $3
        WHERE id = 1`,
-      [newestSig, oldestSig, backfillComplete, parseInt(totalRow[0]?.c || '0', 10)],
+      [newestSig, backfillComplete, parseInt(totalRow[0]?.c || '0', 10)],
     );
   } catch (e) {
     console.error('Pre-deposit indexer error:', e);
