@@ -360,4 +360,28 @@ router.get('/debug', async (_req: Request, res: Response) => {
   }
 });
 
+// ---- Admin: reset the indexer so it re-runs a full backfill. Use after
+// fixing indexing logic (e.g. switching to token-account indexing) so the
+// drain restarts instead of staying stuck on a partial count. Clears the
+// table and the cursor. Guarded by a token to avoid accidental wipes.
+router.post('/reset', async (req: Request, res: Response) => {
+  const token = req.query.token as string;
+  if (token !== (process.env.PREDEPOSIT_RESET_TOKEN || 'bulkstats-reset')) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  try {
+    await query(`TRUNCATE predeposit_transfers`);
+    await query(
+      `UPDATE predeposit_index_state
+         SET newest_signature = NULL, oldest_signature = NULL,
+             backfill_complete = FALSE, total_indexed = 0, last_run = NULL
+       WHERE id = 1`,
+    );
+    res.json({ ok: true, message: 'Indexer reset — full backfill will run on next cycle' });
+  } catch (error) {
+    console.error('predeposit reset error:', error);
+    res.status(500).json({ error: 'reset failed' });
+  }
+});
+
 export default router;
