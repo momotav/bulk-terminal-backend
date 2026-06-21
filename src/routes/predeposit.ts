@@ -394,6 +394,45 @@ router.get('/daily-activity', async (_req: Request, res: Response) => {
   }
 });
 
+// ---- Avg deposit size per day — signals whale arrival vs retail tail ------
+router.get('/avg-deposit-trend', async (_req: Request, res: Response) => {
+  const cacheKey = 'predeposit:avg_deposit_trend';
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const rows = await query<{ day: string; avg_deposit: string; median_deposit: string }>(`
+      WITH days AS (
+        SELECT generate_series(DATE '${CAMPAIGN_START}', CURRENT_DATE, INTERVAL '1 day')::date AS day
+      ),
+      daily AS (
+        SELECT block_time::date AS day,
+               AVG(amount_usdc)                                              AS avg_deposit,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY amount_usdc)      AS median_deposit
+        FROM predeposit_transfers
+        WHERE direction = 'deposit' AND block_time >= '${CAMPAIGN_START}'
+        GROUP BY 1
+      )
+      SELECT d.day,
+             COALESCE(dl.avg_deposit, 0)::text    AS avg_deposit,
+             COALESCE(dl.median_deposit, 0)::text AS median_deposit
+      FROM days d LEFT JOIN daily dl ON dl.day = d.day
+      ORDER BY d.day
+    `);
+    const data = rows.map((r) => ({
+      day: r.day,
+      avgDeposit: parseFloat(r.avg_deposit),
+      medianDeposit: parseFloat(r.median_deposit),
+    }));
+    const result = { data, timestamp: Date.now() };
+    await setCache(cacheKey, result, 15);
+    res.json(result);
+  } catch (error) {
+    console.error('predeposit avg-deposit-trend error:', error);
+    res.status(500).json({ error: 'Failed to compute avg deposit trend' });
+  }
+});
+
 // ---- Indexer status (for an "indexing…" banner while backfill runs) -------
 router.get('/status', async (_req: Request, res: Response) => {
   try {
