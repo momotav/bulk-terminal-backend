@@ -350,7 +350,11 @@ export async function runPredepositIndexer(): Promise<void> {
         // walks every signature for the target in one run — for ~21K txns
         // that's ~21 pages of getSignaturesForAddress + getTransaction per
         // sig. May take a few minutes; runs once.
-        let before: string | undefined = undefined;
+        // Resume the backfill from where the last run left off, not from
+        // the newest signature every time. Without this, each run restarts
+        // at the top and — if it gets cut short before reaching June 1 —
+        // never makes backward progress (earliest stayed stuck at ~June 17).
+        let before: string | undefined = state?.oldest_signature || undefined;
         let pages = 0;
         let reachedEnd = false;
         const MAX_PAGES = 200; // safety cap
@@ -368,6 +372,20 @@ export async function runPredepositIndexer(): Promise<void> {
             const transfers = await resolveTransfers(page);
             totalNew += await persistTransfers(transfers);
             before = page[page.length - 1].signature;
+            // Persist progress AFTER EACH PAGE, not just at the end of the
+            // run. The backfill can take many minutes; if we only saved
+            // state at the end, a restart/redeploy/long-run-overlap would
+            // lose all progress and last_run stayed null forever. Saving
+            // per-page makes progress durable and visible in /debug.
+            await query(
+              `UPDATE predeposit_index_state
+                 SET newest_signature = COALESCE($1, newest_signature),
+                     oldest_signature = $2,
+                     last_run = NOW(),
+                     total_indexed = (SELECT COUNT(*) FROM predeposit_transfers)
+               WHERE id = 1`,
+              [newestSig, before],
+            );
             const oldestTime = page[page.length - 1].blockTime;
             if (oldestTime !== null && oldestTime < CAMPAIGN_START) { reachedEnd = true; break; }
             pages += 1;
@@ -380,6 +398,13 @@ export async function runPredepositIndexer(): Promise<void> {
         // complete for this target — leave the flag false so the next run
         // resumes rather than falsely declaring done.
         if (!reachedEnd) reachedEndForAll = false;
+        // When this target finished (reached campaign start / empty), clear
+        // the shared oldest cursor so the NEXT target starts its own walk
+        // from the top rather than resuming from this target's position.
+        if (reachedEnd) {
+          await query(`UPDATE predeposit_index_state SET oldest_signature = NULL WHERE id = 1`);
+          state && (state.oldest_signature = null);
+        }
         console.log(`💰 Backfill ${target.slice(0, 8)}…: ${pages} pages, reachedEnd=${reachedEnd}`);
       } else {
         // Incremental: only signatures newer than our last newest.
