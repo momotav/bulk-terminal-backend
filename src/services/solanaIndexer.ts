@@ -77,16 +77,31 @@ interface RpcResponse<T> {
 
 let rpcId = 0;
 async function rpc<T>(method: string, params: unknown[]): Promise<T> {
-  const res = await fetch(RPC_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method, params }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!res.ok) throw new Error(`RPC ${method} HTTP ${res.status}`);
-  const json = (await res.json()) as RpcResponse<T>;
-  if (json.error) throw new Error(`RPC ${method}: ${json.error.message}`);
-  return json.result as T;
+  // Retry transient failures (429 rate limits, 5xx, network blips) with
+  // exponential backoff. Without this, a single rate-limited page request
+  // would throw and (before the per-page guard) abort the whole backfill.
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch(RPC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method, params }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (res.status === 429 || res.status >= 500) {
+        throw new Error(`RPC ${method} HTTP ${res.status}`);
+      }
+      if (!res.ok) throw new Error(`RPC ${method} HTTP ${res.status}`);
+      const json = (await res.json()) as RpcResponse<T>;
+      if (json.error) throw new Error(`RPC ${method}: ${json.error.message}`);
+      return json.result as T;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 300 * 2 ** attempt));
+    }
+  }
+  throw lastErr;
 }
 
 interface SignatureInfo {
@@ -268,17 +283,29 @@ async function persistTransfers(
 // rate-limit-sensitive, so we throttle with a small concurrency cap.
 async function resolveTransfers(sigs: SignatureInfo[]) {
   const out: NonNullable<ReturnType<typeof parseTransfer>>[] = [];
-  const CONCURRENCY = 20;
+  // Concurrency 8 balances speed against Helius free-tier RPS. Higher (20)
+  // was getting rate-limited, and since failed getTransaction calls were
+  // silently dropped, that meant most transactions in a page vanished —
+  // producing the tiny partial counts. Each call now retries with backoff
+  // so a transient 429 doesn't permanently drop a real transfer.
+  const CONCURRENCY = 8;
+  const getTxWithRetry = async (sig: string): Promise<ParsedTx | null> => {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        return await rpc<ParsedTx>('getTransaction', [
+          sig,
+          { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 },
+        ]);
+      } catch {
+        // Exponential backoff: 250ms, 500ms, 1s before final give-up.
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
+      }
+    }
+    return null; // genuinely couldn't fetch after retries
+  };
   for (let i = 0; i < sigs.length; i += CONCURRENCY) {
     const batch = sigs.slice(i, i + CONCURRENCY);
-    const txs = await Promise.all(
-      batch.map((s) =>
-        rpc<ParsedTx>('getTransaction', [
-          s.signature,
-          { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 },
-        ]).catch(() => null),
-      ),
-    );
+    const txs = await Promise.all(batch.map((s) => getTxWithRetry(s.signature)));
     txs.forEach((tx, j) => {
       if (tx) {
         const parsed = parseTransfer(batch[j], tx);
@@ -328,15 +355,26 @@ export async function runPredepositIndexer(): Promise<void> {
         let reachedEnd = false;
         const MAX_PAGES = 200; // safety cap
         while (pages < MAX_PAGES) {
-          const page = await getSignatures(target, { before });
-          if (page.length === 0) { reachedEnd = true; break; }
-          if (newestSig === null && pages === 0) newestSig = page[0].signature;
-          const transfers = await resolveTransfers(page);
-          totalNew += await persistTransfers(transfers);
-          before = page[page.length - 1].signature;
-          const oldestTime = page[page.length - 1].blockTime;
-          if (oldestTime !== null && oldestTime < CAMPAIGN_START) { reachedEnd = true; break; }
-          pages += 1;
+          // Per-page try/catch: a single failed getSignatures/getTransaction
+          // (RPC hiccup, rate limit, one malformed tx) must NOT abort the
+          // whole backfill — otherwise the run dies before persisting state
+          // and we never make progress (the "stuck at N" symptom). On error
+          // we stop this target cleanly, leave reachedEnd false so the next
+          // run resumes from where the cursor was persisted.
+          try {
+            const page = await getSignatures(target, { before });
+            if (page.length === 0) { reachedEnd = true; break; }
+            if (newestSig === null && pages === 0) newestSig = page[0].signature;
+            const transfers = await resolveTransfers(page);
+            totalNew += await persistTransfers(transfers);
+            before = page[page.length - 1].signature;
+            const oldestTime = page[page.length - 1].blockTime;
+            if (oldestTime !== null && oldestTime < CAMPAIGN_START) { reachedEnd = true; break; }
+            pages += 1;
+          } catch (pageErr) {
+            console.error(`💰 Backfill page error on ${target.slice(0, 8)}… (page ${pages}):`, pageErr);
+            break; // stop this target; next run retries
+          }
         }
         // If we hit MAX_PAGES without reaching the end, backfill is NOT
         // complete for this target — leave the flag false so the next run
