@@ -20,6 +20,7 @@ import walletRoutes from './routes/wallet';
 import userRoutes from './routes/users';
 import explorerRoutes from './routes/explorer';
 import predepositRoutes from './routes/predeposit';
+import streamRoutes from './routes/stream';
 import { startExplorerListener } from './services/bulkExplorer';
 import { requestNetworkMiddleware } from './services/networkContext';
 
@@ -293,6 +294,7 @@ app.use('/api/wallet', walletRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/explorer', explorerRoutes);
 app.use('/api/predeposit', predepositRoutes);
+app.use('/api/stream', streamRoutes);
 
 // Debug endpoint to check cache status
 app.get('/debug/cache', async (req, res) => {
