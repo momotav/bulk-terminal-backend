@@ -3,6 +3,7 @@ import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
 import { getActiveSymbols } from '../services/markets';
 import { bulkFetch } from '../services/bulkAuth';
+import { publishMarketUpdate } from '../services/marketStream';
 
 const WS_URL = process.env.BULK_WS_URL || 'wss://exchange-ws1.bulk.trade';
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
@@ -119,6 +120,11 @@ async function snapshotTickersFallback(): Promise<void> {
       lastTickerSnapshotTime.set(symbol, Date.now());
       stats.tickerSnapshots++;
       stats.lastTickerSnapshot = new Date();
+      // Keep live chart subscribers fed even when the WS ticker is down —
+      // coarser (30–60s) than WS, but the modal won't go silent.
+      if (markPrice > 0) {
+        publishMarketUpdate({ symbol, price: markPrice, kind: 'mark', ts: Date.now() });
+      }
       
       console.log(`📊 Ticker (REST): ${symbol} | OI: $${openInterestUsd.toFixed(0)} | Funding: ${(fundingRate * 100).toFixed(4)}% | Regime: ${regime}`);
     } catch (error) {
@@ -590,6 +596,8 @@ function processMessage(data: WebSocket.Data): void {
       if (markPrice > 0) {
         // Save to ticker_snapshots (same as before, but now real-time!)
         recordTickerSnapshot(symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice);
+        // Fan out to live chart subscribers (PositionChartModal).
+        publishMarketUpdate({ symbol, price: markPrice, kind: 'mark', ts: Date.now() });
       }
       return;
     }
@@ -671,6 +679,15 @@ function processMessage(data: WebSocket.Data): void {
           console.log(`⚠️ Invalid trade data: price=${price}, size=${size}`);
           continue;
         }
+
+        // Fan out the last traded price to live chart subscribers. Every
+        // valid print counts (incl. liq/adl) — they all move the tape.
+        publishMarketUpdate({
+          symbol,
+          price,
+          kind: 'trade',
+          ts: typeof time === 'number' && time > 1e12 ? time : Date.now(),
+        });
         
         if (isADL) {
           console.log(`⚡ ADL detected: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
