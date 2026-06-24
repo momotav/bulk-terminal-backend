@@ -10,6 +10,7 @@ import { startDataCollector } from './jobs/dataCollector';
 import { startCacheWarmer } from './jobs/cacheWarmer';
 import { startPredepositIndexer } from './services/solanaIndexer';
 import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
+import { startDevnetPoller } from './jobs/devnetPoller';
 import { initRedis, getCacheStats } from './services/cache';
 
 // Import routes
@@ -340,6 +341,10 @@ async function start() {
   
   // Start WebSocket listener for live trades/liquidations
   startWebSocketListener();
+
+  // Start devnet ticker poller (isolated; collects devnet OI/funding/regime
+  // into ticker_snapshots tagged network='devnet').
+  startDevnetPoller();
 
   // Start explorer WS listener for live block/throughput metrics
   startExplorerListener();
