@@ -698,6 +698,7 @@ router.get('/open-interest-history/:symbol', async (req: Request, res: Response)
              AVG(open_interest_usd) as value
       FROM ticker_snapshots
       WHERE symbol = $1 AND timestamp >= NOW() - INTERVAL '${hours} hours'
+        AND network = '${getRequestNetwork()}'
       GROUP BY 1
       ORDER BY 1 ASC
     `, [symbol]);
@@ -738,6 +739,7 @@ router.get('/funding-rate-history/:symbol', async (req: Request, res: Response) 
              AVG(funding_rate) as value
       FROM ticker_snapshots
       WHERE symbol = $1 AND timestamp >= NOW() - INTERVAL '${hours} hours'
+        AND network = '${getRequestNetwork()}'
       GROUP BY 1
       ORDER BY 1 ASC
     `, [symbol]);
@@ -787,6 +789,7 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
           AVG(open_interest_usd) as value
         FROM ticker_snapshots
         WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
+          AND network = '${getRequestNetwork()}'
         GROUP BY 1, symbol
         ORDER BY 1 ASC
       `),
@@ -912,6 +915,7 @@ router.get('/funding-chart', async (req: Request, res: Response) => {
           AVG(funding_rate) as value
         FROM ticker_snapshots
         WHERE timestamp >= NOW() - INTERVAL '${hours} hours'
+          AND network = '${getRequestNetwork()}'
         GROUP BY 1, symbol
         ORDER BY 1 ASC
       `),
@@ -2191,6 +2195,7 @@ router.get('/volatility-chart', async (req: Request, res: Response) => {
         AVG(regime_vol) as vol
       FROM ticker_snapshots
       WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+        AND network = '${getRequestNetwork()}'
         AND regime_vol IS NOT NULL
       GROUP BY time_bucket, symbol
       ORDER BY time_bucket ASC
@@ -2248,6 +2253,7 @@ router.get('/fair-spread-chart', async (req: Request, res: Response) => {
         AVG(fair_book_px) as avg_fair
       FROM ticker_snapshots
       WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+        AND network = '${getRequestNetwork()}'
         AND symbol = $1
         AND fair_book_px IS NOT NULL
       GROUP BY time_bucket
