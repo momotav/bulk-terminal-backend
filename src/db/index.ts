@@ -489,6 +489,43 @@ export async function initializeDatabase(): Promise<void> {
         ON CONFLICT (id) DO NOTHING;
     `);
 
+    // ---- Per-network tagging migration -------------------------------------
+    // Market-data tables get a `network` column so testnet and devnet data can
+    // coexist in one DB. Existing rows + the existing collector (which doesn't
+    // specify the column) default to 'testnet', so this is a no-op for current
+    // behavior. Idempotent: safe to run on every boot.
+    await client.query(`
+      DO $$
+      DECLARE t text;
+      BEGIN
+        FOREACH t IN ARRAY ARRAY[
+          'trades','ticker_snapshots','liquidations','adl_events',
+          'daily_stats','daily_unique_traders','fee_snapshots',
+          'market_stats','traders','trader_snapshots'
+        ]
+        LOOP
+          IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = t) THEN
+            IF NOT EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_name = t AND column_name = 'network'
+            ) THEN
+              EXECUTE format(
+                'ALTER TABLE %I ADD COLUMN network VARCHAR(16) NOT NULL DEFAULT %L',
+                t, 'testnet'
+              );
+            END IF;
+          END IF;
+        END LOOP;
+      END $$;
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_ticker_snapshots_net_ts ON ticker_snapshots(network, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_trades_net_ts ON trades(network, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_liquidations_net_ts ON liquidations(network, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_adl_events_net_ts ON adl_events(network, timestamp);
+    `);
+
     await client.query('COMMIT');
     console.log('✅ Database schema initialized');
     
