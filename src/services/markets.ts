@@ -17,6 +17,8 @@
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
 import { bulkFetch } from './bulkAuth';
+import { getRequestNetwork } from './networkContext';
+import type { NetworkId } from './networks';
 
 // 5-minute cache. BULK adds/delists markets infrequently so this is plenty
 // fresh, and it keeps us from hammering /exchangeInfo on every reconnect.
@@ -45,8 +47,13 @@ const FALLBACK_SYMBOLS: readonly string[] = [
   'FARTCOIN-USD',
 ];
 
-let cache: { symbols: string[]; expiresAt: number } | null = null;
-let inflight: Promise<string[]> | null = null;
+// Per-network caches. The symbol list differs between testnet and devnet
+// (devnet lists markets testnet hasn't, e.g. MU-USD / MINIMAX-USD), and
+// `bulkFetch` already routes /exchangeInfo to the right host based on the
+// current request's network — so the cache MUST be keyed by network too,
+// otherwise whichever network warms the cache first is served to both.
+const cache = new Map<NetworkId, { symbols: string[]; expiresAt: number }>();
+const inflight = new Map<NetworkId, Promise<string[]>>();
 
 interface ExchangeInfoMarket {
   symbol?: unknown;
@@ -90,43 +97,46 @@ async function fetchFromBulk(): Promise<string[]> {
  * so the rest of the app can keep making progress.
  */
 export async function getActiveSymbols(forceRefresh = false): Promise<string[]> {
+  const net = getRequestNetwork();
   const now = Date.now();
 
-  if (!forceRefresh && cache && cache.expiresAt > now) {
-    return cache.symbols;
+  const entry = cache.get(net);
+  if (!forceRefresh && entry && entry.expiresAt > now) {
+    return entry.symbols;
   }
 
-  // De-dupe concurrent refreshes
-  if (inflight) return inflight;
+  // De-dupe concurrent refreshes for THIS network
+  const pending = inflight.get(net);
+  if (pending) return pending;
 
-  inflight = (async () => {
+  const p = (async () => {
     try {
       const symbols = await fetchFromBulk();
-      cache = { symbols, expiresAt: Date.now() + CACHE_TTL_MS };
-      console.log(`📋 Market list refreshed: ${symbols.length} symbols — ${symbols.join(', ')}`);
+      cache.set(net, { symbols, expiresAt: Date.now() + CACHE_TTL_MS });
+      console.log(`📋 [${net}] Market list refreshed: ${symbols.length} symbols — ${symbols.join(', ')}`);
       return symbols;
     } catch (err) {
-      console.error('⚠️  Failed to fetch /exchangeInfo, using fallback symbol list:', err);
+      console.error(`⚠️  [${net}] Failed to fetch /exchangeInfo, using fallback symbol list:`, err);
       // Populate cache with the fallback so we don't retry on every single call;
       // short TTL so we try BULK again soon.
-      cache = {
-        symbols: [...FALLBACK_SYMBOLS],
-        expiresAt: Date.now() + 30 * 1000, // 30s retry window after failure
-      };
-      return cache.symbols;
+      const fb = [...FALLBACK_SYMBOLS];
+      cache.set(net, { symbols: fb, expiresAt: Date.now() + 30 * 1000 });
+      return fb;
     } finally {
-      inflight = null;
+      inflight.delete(net);
     }
   })();
 
-  return inflight;
+  inflight.set(net, p);
+  return p;
 }
 
 /**
- * Synchronous accessor — returns the last cached list or the fallback. Use
- * only in code paths that MUST NOT await (e.g. inside a hot WebSocket handler
- * reading allowed symbols). Production callers should prefer getActiveSymbols().
+ * Synchronous accessor — returns the last cached list for the current network
+ * or the fallback. Use only in code paths that MUST NOT await (e.g. inside a
+ * hot WebSocket handler reading allowed symbols). Production callers should
+ * prefer getActiveSymbols().
  */
 export function getActiveSymbolsSync(): string[] {
-  return cache?.symbols ?? [...FALLBACK_SYMBOLS];
+  return cache.get(getRequestNetwork())?.symbols ?? [...FALLBACK_SYMBOLS];
 }
