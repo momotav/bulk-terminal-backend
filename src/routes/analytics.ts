@@ -5,6 +5,7 @@ import { getActiveSymbols } from '../services/markets';
 import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coinShape';
 import { filterOutSystemWallets } from '../services/systemWallets';
 import { bulkFetch } from '../services/bulkAuth';
+import { getRequestNetwork } from '../services/networkContext';
 
 const router = Router();
 
@@ -2682,7 +2683,9 @@ router.get('/risk-surfaces/:coin', async (req: Request, res: Response) => {
 //
 // Cached aggressively (5 minutes) because market metadata changes infrequently.
 router.get('/exchange-info', async (_req: Request, res: Response) => {
-  const cacheKey = 'analytics:exchange_info';
+  // Key the cache by network — devnet and testnet list different markets,
+  // and bulkFetch already routes /exchangeInfo to the matching host.
+  const cacheKey = `analytics:exchange_info:${getRequestNetwork()}`;
 
   const cached = await getCache<unknown>(cacheKey);
   if (cached) {
