@@ -54,3 +54,11 @@ export function requestNetworkMiddleware(
 export function getRequestNetwork(): NetworkId {
   return networkContext.getStore() ?? DEFAULT_NETWORK;
 }
+
+// Run a function with an explicit network bound to the async context, so
+// getRequestNetwork()/bulkFetch/getActiveSymbols resolve to it. For
+// background jobs (pollers/collectors) that have no HTTP request to read
+// `?net=` from. Re-invoke per tick so timer callbacks always carry the store.
+export function runWithNetwork<T>(net: NetworkId, fn: () => T): T {
+  return networkContext.run(net, fn);
+}
