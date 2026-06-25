@@ -2192,7 +2192,14 @@ router.get('/volatility-chart', async (req: Request, res: Response) => {
       SELECT 
         date_trunc('${bucketInterval}', timestamp) as time_bucket,
         symbol,
-        AVG(regime_vol) as vol
+        -- Volume-weighted volatility: weight each snapshot's regime_vol by its
+        -- open interest (the only size/activity measure stored alongside it —
+        -- ticker_snapshots has no traded-volume column). Falls back to a plain
+        -- average when OI is missing/zero so older rows still produce a value.
+        COALESCE(
+          SUM(regime_vol * open_interest_usd) / NULLIF(SUM(open_interest_usd), 0),
+          AVG(regime_vol)
+        ) as vol
       FROM ticker_snapshots
       WHERE timestamp > NOW() - INTERVAL '${hours} hours'
         AND network = '${getRequestNetwork()}'
