@@ -199,6 +199,33 @@ async function runBulkSol(epoch: number): Promise<void> {
   console.log(`💧 BulkSOL snapshot: ${supply.toFixed(0)} BulkSOL · ${tvlSol.toFixed(0)} SOL · rate ${exchangeRate.toFixed(4)}`);
 }
 
+// Per-validator active stake for the BulkSOL multi-validator pool. Reads the
+// pool's validator-list account and parses each ValidatorStakeInfo entry
+// (73 bytes: active_stake u64 @0, vote_account Pubkey @41).
+export async function getValidatorDistribution(): Promise<{ voteAccount: string; activeStake: number }[]> {
+  const poolAcct = await rpc<{ value: AccountInfoB64 | null }>('getAccountInfo', [BULKSOL_POOL, { encoding: 'base64' }]);
+  if (!poolAcct.value) return [];
+  const pbuf = Buffer.from(poolAcct.value.data[0], 'base64');
+  const vlPubkey = bs58.encode(pbuf.subarray(OFF_VALIDATOR_LIST, OFF_VALIDATOR_LIST + 32));
+
+  const vl = await rpc<{ value: AccountInfoB64 | null }>('getAccountInfo', [vlPubkey, { encoding: 'base64' }]);
+  if (!vl.value) return [];
+  const buf = Buffer.from(vl.value.data[0], 'base64');
+
+  const count = buf.readUInt32LE(5); // Vec length after 1-byte type + 4-byte max
+  const ENTRY = 73;
+  const START = 9;
+  const out: { voteAccount: string; activeStake: number }[] = [];
+  for (let i = 0; i < count; i++) {
+    const base = START + i * ENTRY;
+    if (base + ENTRY > buf.length) break;
+    const active = readU64LE(buf, base) / LAMPORTS_PER_SOL;
+    const voteAccount = bs58.encode(buf.subarray(base + 41, base + 41 + 32));
+    out.push({ voteAccount, activeStake: active });
+  }
+  return out.sort((a, b) => b.activeStake - a.activeStake);
+}
+
 export async function runStakingIndexer(): Promise<void> {
   if (!isStakingConfigured()) return;
   try {
