@@ -9,7 +9,7 @@
 import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db';
 import { getCache, setCache } from '../services/cache';
-import { BULK_VOTE_ACCOUNT, BULK_IDENTITY, BULKSOL_MINT, BULKSOL_POOL, getValidatorDistribution } from '../services/stakingIndexer';
+import { BULK_VOTE_ACCOUNT, BULK_IDENTITY, BULKSOL_MINT, BULKSOL_POOL, getValidatorDistribution, getHolderBalances } from '../services/stakingIndexer';
 
 const router = Router();
 
@@ -184,6 +184,77 @@ router.get('/bulksol/validators', async (_req: Request, res: Response) => {
   } catch (e) {
     console.error('staking/bulksol/validators error:', (e as Error).message);
     res.status(500).json({ error: 'Failed to load validator distribution' });
+  }
+});
+
+// ---- BulkSOL: daily flows (mint/burn/net) — all-time from the indexer -----
+router.get('/bulksol/flows', async (req: Request, res: Response) => {
+  const range = String(req.query.range || 'all');
+  const cacheKey = `staking:bulksol:flows:${range}`;
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+  try {
+    const where = range === '7d' ? "WHERE day > now() - interval '7 days'"
+      : range === '30d' ? "WHERE day > now() - interval '30 days'" : '';
+    const rows = await query<{ day: string; mint_amount: string; burn_amount: string; new_wallets: number }>(
+      `SELECT day, mint_amount, burn_amount, new_wallets FROM bulksol_daily ${where} ORDER BY day ASC`,
+    );
+    let cumSupply = 0, cumWallets = 0;
+    const result = rows.map((r) => {
+      const mint = Number(r.mint_amount), burn = Number(r.burn_amount);
+      cumSupply += mint - burn; cumWallets += r.new_wallets;
+      return {
+        t: new Date(r.day).getTime(),
+        mint, burn, net: mint - burn,
+        supply: cumSupply, newWallets: r.new_wallets, cumWallets,
+      };
+    });
+    await setCache(cacheKey, result, 120);
+    res.json(result);
+  } catch (e) {
+    console.error('staking/bulksol/flows error:', (e as Error).message);
+    res.status(500).json({ error: 'Failed to load BulkSOL flows' });
+  }
+});
+
+// ---- BulkSOL: current holder distribution + whale concentration -----------
+const BUCKETS: { label: string; min: number; max: number }[] = [
+  { label: '< 1', min: 0, max: 1 },
+  { label: '1–10', min: 1, max: 10 },
+  { label: '10–100', min: 10, max: 100 },
+  { label: '100–1K', min: 100, max: 1_000 },
+  { label: '1K–10K', min: 1_000, max: 10_000 },
+  { label: '10K–100K', min: 10_000, max: 100_000 },
+  { label: '> 100K', min: 100_000, max: Infinity },
+];
+
+router.get('/bulksol/holders', async (_req: Request, res: Response) => {
+  const cacheKey = 'staking:bulksol:holders';
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+  try {
+    const balances = await getHolderBalances(); // sorted desc
+    const total = balances.reduce((a, b) => a + b.amount, 0);
+
+    const distribution = BUCKETS.map((bk) => {
+      const inBucket = balances.filter((b) => b.amount >= bk.min && b.amount < bk.max);
+      return { label: bk.label, holders: inBucket.length, total: inBucket.reduce((a, b) => a + b.amount, 0) };
+    });
+    const shareOf = (n: number) => {
+      const top = balances.slice(0, n).reduce((a, b) => a + b.amount, 0);
+      return { count: n, amount: top, share: total > 0 ? top / total : 0 };
+    };
+    const result = {
+      holders: balances.length,
+      total,
+      distribution,
+      concentration: [shareOf(1), shareOf(10), shareOf(100)],
+    };
+    await setCache(cacheKey, result, 120);
+    res.json(result);
+  } catch (e) {
+    console.error('staking/bulksol/holders error:', (e as Error).message);
+    res.status(500).json({ error: 'Failed to load holder distribution' });
   }
 });
 
