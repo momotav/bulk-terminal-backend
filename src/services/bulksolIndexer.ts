@@ -143,6 +143,42 @@ async function fetchTx(sig: string): Promise<ParsedTx | null> {
   return rpc<ParsedTx | null>('getTransaction', [sig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
 }
 
+// Diagnostic: fetch the N most recent mint txns and return BOTH what the
+// parser extracted AND the raw spl-token-ish instructions it saw, so we can
+// see exactly how Sanctum represents mint/burn instead of guessing.
+export async function debugSample(n = 5): Promise<unknown> {
+  const recent = await rpc<{ signature: string; err: unknown }[]>('getSignaturesForAddress', [
+    BULKSOL_MINT, { limit: n },
+  ]);
+  const out: unknown[] = [];
+  for (const s of recent) {
+    if (s.err) continue;
+    const tx = await fetchTx(s.signature).catch(() => null);
+    if (!tx) { out.push({ sig: s.signature, error: 'fetch failed' }); continue; }
+    const parsed = parseTx(tx);
+    const topIx = tx.transaction?.message?.instructions || [];
+    const innerIx = (tx.meta?.innerInstructions || []).flatMap((g) => g.instructions);
+    const summarize = (ix: ParsedIx) => ({
+      program: ix.program ?? null,
+      programId: ix.programId ?? null,
+      type: ix.parsed?.type ?? null,
+      // only include info keys + mint/amount fields to keep output small
+      infoKeys: ix.parsed?.info ? Object.keys(ix.parsed.info) : null,
+      mint: (ix.parsed?.info as Record<string, unknown> | undefined)?.mint ?? null,
+      amount: (ix.parsed?.info as Record<string, unknown> | undefined)?.amount ?? null,
+      tokenAmount: (ix.parsed?.info as Record<string, unknown> | undefined)?.tokenAmount ?? null,
+    });
+    out.push({
+      sig: s.signature,
+      blockTime: tx.blockTime,
+      parsedResult: parsed,
+      topLevel: topIx.map(summarize),
+      inner: innerIx.map(summarize),
+    });
+  }
+  return out;
+}
+
 /** Aggregate a batch of signatures into daily rows + first-seen owners. */
 async function ingest(signatures: string[]): Promise<number> {
   let processed = 0;
