@@ -10,7 +10,7 @@ import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db';
 import { getCache, setCache } from '../services/cache';
 import { BULK_VOTE_ACCOUNT, BULK_IDENTITY, BULKSOL_MINT, BULKSOL_POOL, getValidatorDistribution, getHolderBalances } from '../services/stakingIndexer';
-import { isBulkSolHistoryConfigured, resetBulkSolHistory } from '../services/bulksolIndexer';
+import { isBulkSolHistoryConfigured, resetBulkSolHistory, debugSample } from '../services/bulksolIndexer';
 
 const router = Router();
 
@@ -310,6 +310,20 @@ router.post('/bulksol/reset', async (req: Request, res: Response) => {
   } catch (e) {
     console.error('staking/bulksol/reset error:', (e as Error).message);
     res.status(500).json({ error: 'reset failed' });
+  }
+});
+
+// ---- BulkSOL: parser diagnostics (token-guarded) ---------------------------
+router.get('/bulksol/debug', async (req: Request, res: Response) => {
+  const token = req.query.token || req.headers['x-reset-token'];
+  if (token !== 'bulkstats-reset') return res.status(403).json({ error: 'forbidden' });
+  try {
+    const n = Math.min(Number(req.query.n) || 5, 10);
+    const sample = await debugSample(n);
+    res.json(sample);
+  } catch (e) {
+    console.error('staking/bulksol/debug error:', (e as Error).message);
+    res.status(500).json({ error: (e as Error).message });
   }
 });
 
