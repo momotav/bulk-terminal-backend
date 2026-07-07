@@ -96,6 +96,32 @@ async function ensureSchema(): Promise<void> {
       captured_at    timestamptz NOT NULL DEFAULT now()
     )
   `);
+  // Append-only time-series (one row per run) so the charts fill in within
+  // hours instead of waiting ~2 days for a new epoch. Epoch tables above stay
+  // for the "official" per-epoch summary.
+  await query(`
+    CREATE TABLE IF NOT EXISTS staking_native_ts (
+      id              bigserial PRIMARY KEY,
+      captured_at     timestamptz NOT NULL DEFAULT now(),
+      epoch           integer NOT NULL,
+      active_stake    numeric NOT NULL,
+      delegator_count integer NOT NULL,
+      apy             numeric
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_staking_native_ts_time ON staking_native_ts(captured_at)`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS staking_bulksol_ts (
+      id            bigserial PRIMARY KEY,
+      captured_at   timestamptz NOT NULL DEFAULT now(),
+      epoch         integer NOT NULL,
+      tvl_sol       numeric NOT NULL,
+      supply        numeric NOT NULL,
+      exchange_rate numeric NOT NULL,
+      holders       integer
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_staking_bulksol_ts_time ON staking_bulksol_ts(captured_at)`);
 }
 
 // ---- RPC result shapes (only the fields we read) --------------------------
@@ -165,6 +191,11 @@ async function runBulkSol(epoch: number): Promise<void> {
        validators = EXCLUDED.validators, captured_at = now()`,
     [epoch, tvlSol, supply, exchangeRate, holders, validators],
   );
+  await query(
+    `INSERT INTO staking_bulksol_ts (captured_at, epoch, tvl_sol, supply, exchange_rate, holders)
+     VALUES (now(), $1, $2, $3, $4, $5)`,
+    [epoch, tvlSol, supply, exchangeRate, holders],
+  );
   console.log(`💧 BulkSOL snapshot: ${supply.toFixed(0)} BulkSOL · ${tvlSol.toFixed(0)} SOL · rate ${exchangeRate.toFixed(4)}`);
 }
 
@@ -223,6 +254,12 @@ export async function runStakingIndexer(): Promise<void> {
          apy = EXCLUDED.apy,
          captured_at = now()`,
       [epoch, activeStake, delegatorCount, commission, activating, deactivating, apy],
+    );
+    // Append to the time-series so the chart gets a point every run.
+    await query(
+      `INSERT INTO staking_native_ts (captured_at, epoch, active_stake, delegator_count, apy)
+       VALUES (now(), $1, $2, $3, $4)`,
+      [epoch, activeStake, delegatorCount, apy],
     );
 
     console.log(`🥩 Staking snapshot: epoch ${epoch} · ${activeStake.toFixed(0)} SOL · ${delegatorCount} delegators`);
