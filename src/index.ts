@@ -10,6 +10,7 @@ import { startDataCollector } from './jobs/dataCollector';
 import { startCacheWarmer } from './jobs/cacheWarmer';
 import { startPredepositIndexer } from './services/solanaIndexer';
 import { startStakingIndexer } from './services/stakingIndexer';
+import { startBulkSolHistory } from './services/bulksolIndexer';
 import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
 import { startDevnetPoller } from './jobs/devnetPoller';
 import { initRedis, getCacheStats } from './services/cache';
@@ -366,6 +367,7 @@ async function start() {
     startPredepositIndexer();
     // Index BULK's native validator staking from Solana mainnet.
     startStakingIndexer();
+    startBulkSolHistory();
   });
 }
 
