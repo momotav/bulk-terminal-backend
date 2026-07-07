@@ -327,4 +327,35 @@ router.get('/bulksol/debug', async (req: Request, res: Response) => {
   }
 });
 
+// ---- Native: all-time per-epoch stake (Stakewiz-backfilled) ----------------
+const EPOCH_MS = 2 * 86_400_000; // Solana epoch ≈ 2 days
+
+router.get('/native/epochs', async (_req: Request, res: Response) => {
+  const cacheKey = 'staking:native:epochs';
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+  try {
+    const rows = await query<{ epoch: number; stake: string }>(
+      `SELECT epoch, stake FROM staking_native_epochs ORDER BY epoch ASC`,
+    );
+    // Anchor epoch→time on the latest live snapshot (exact), fall back to now.
+    const anchor = (await query<{ epoch: number; captured_at: string }>(
+      `SELECT epoch, captured_at FROM staking_native_snapshots ORDER BY epoch DESC LIMIT 1`,
+    ))[0];
+    const anchorEpoch = anchor?.epoch ?? (rows.length ? rows[rows.length - 1].epoch : 0);
+    const anchorTime = anchor ? new Date(anchor.captured_at).getTime() : Date.now();
+
+    const result = rows.map((r) => ({
+      epoch: r.epoch,
+      t: anchorTime - (anchorEpoch - r.epoch) * EPOCH_MS,
+      activeStake: Number(r.stake),
+    }));
+    await setCache(cacheKey, result, 300);
+    res.json(result);
+  } catch (e) {
+    console.error('staking/native/epochs error:', (e as Error).message);
+    res.status(500).json({ error: 'Failed to load epoch history' });
+  }
+});
+
 export default router;
