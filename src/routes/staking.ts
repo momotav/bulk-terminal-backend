@@ -10,6 +10,7 @@ import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db';
 import { getCache, setCache } from '../services/cache';
 import { BULK_VOTE_ACCOUNT, BULK_IDENTITY, BULKSOL_MINT, BULKSOL_POOL, getValidatorDistribution, getHolderBalances } from '../services/stakingIndexer';
+import { isBulkSolHistoryConfigured } from '../services/bulksolIndexer';
 
 const router = Router();
 
@@ -255,6 +256,47 @@ router.get('/bulksol/holders', async (_req: Request, res: Response) => {
   } catch (e) {
     console.error('staking/bulksol/holders error:', (e as Error).message);
     res.status(500).json({ error: 'Failed to load holder distribution' });
+  }
+});
+
+// ---- BulkSOL: backfill progress -------------------------------------------
+const BULKSOL_LAUNCH = new Date('2025-10-15').getTime(); // approx mint launch
+
+router.get('/bulksol/status', async (_req: Request, res: Response) => {
+  try {
+    let st: { backfill_complete: boolean; total_indexed: string } | null = null;
+    let range: { earliest: string | null; latest: string | null; days: number } | null = null;
+    try {
+      st = (await query<{ backfill_complete: boolean; total_indexed: string }>(
+        `SELECT backfill_complete, total_indexed FROM bulksol_index_state WHERE id = 1`,
+      ))[0] ?? null;
+      range = (await query<{ earliest: string | null; latest: string | null; days: number }>(
+        `SELECT MIN(day) AS earliest, MAX(day) AS latest, COUNT(*)::int AS days FROM bulksol_daily`,
+      ))[0] ?? null;
+    } catch { /* tables not created yet — indexer hasn't run */ }
+
+    const backfillComplete = st?.backfill_complete ?? false;
+    const earliest = range?.earliest ?? null;
+    let progress = 0;
+    if (backfillComplete) progress = 1;
+    else if (earliest) {
+      const now = Date.now();
+      const span = now - BULKSOL_LAUNCH;
+      progress = span > 0 ? Math.min(1, Math.max(0, (now - new Date(earliest).getTime()) / span)) : 0;
+    }
+
+    res.json({
+      configured: isBulkSolHistoryConfigured(),
+      backfillComplete,
+      totalIndexed: st ? Number(st.total_indexed) : 0,
+      earliestDay: earliest,
+      latestDay: range?.latest ?? null,
+      days: range?.days ?? 0,
+      progress,
+    });
+  } catch (e) {
+    console.error('staking/bulksol/status error:', (e as Error).message);
+    res.status(500).json({ error: 'Failed to load backfill status' });
   }
 });
 
