@@ -89,9 +89,12 @@ interface SigInfo { signature: string; blockTime: number | null; err: unknown }
 interface ParsedIx { program?: string; programId?: string; parsed?: { type?: string; info?: Record<string, unknown> } }
 interface ParsedTx {
   blockTime: number | null;
-  meta: { err: unknown; postTokenBalances?: { accountIndex: number; owner?: string; mint: string }[] } | null;
+  meta: {
+    err: unknown;
+    postTokenBalances?: { accountIndex: number; owner?: string; mint: string }[];
+    innerInstructions?: { instructions: ParsedIx[] }[];
+  } | null;
   transaction: { message: { accountKeys: { pubkey: string }[] | string[]; instructions: ParsedIx[] } };
-  meta_inner?: unknown;
 }
 
 function sigs(before?: string): Promise<SigInfo[]> {
@@ -110,7 +113,12 @@ function parseTx(tx: ParsedTx | null): { day: string; mint: number; burn: number
     if (b.mint === BULKSOL_MINT && b.owner && keys[b.accountIndex]) ownerOf.set(keys[b.accountIndex], b.owner);
   }
 
-  const allIx: ParsedIx[] = [...tx.transaction.message.instructions];
+  // Stake-pool mint/burn happen via CPI, so the token instructions live in
+  // meta.innerInstructions — must walk both, not just top-level.
+  const allIx: ParsedIx[] = [
+    ...tx.transaction.message.instructions,
+    ...(tx.meta.innerInstructions || []).flatMap((g) => g.instructions),
+  ];
   let mint = 0, burn = 0, mintCount = 0, burnCount = 0;
   const newOwners: string[] = [];
   for (const ix of allIx) {
@@ -222,10 +230,8 @@ export async function runBulkSolHistory(): Promise<void> {
         before = page[page.length - 1].signature;
         await query(`UPDATE bulksol_index_state SET oldest_signature = $1, total_indexed = total_indexed + $2 WHERE id = 1`, [before, page.length]);
         pages++;
-        if (page.length < 1000) {
-          await query(`UPDATE bulksol_index_state SET backfill_complete = true WHERE id = 1`);
-          break;
-        }
+        // Only an EMPTY page means we've truly reached the mint's first tx. A
+        // short-but-nonempty page can happen mid-history, so we keep paging.
       }
     }
     console.log('💧 BulkSOL history pass complete');
@@ -234,6 +240,17 @@ export async function runBulkSolHistory(): Promise<void> {
   } finally {
     running = false;
   }
+}
+
+// Wipe indexed history and re-walk from scratch. Needed after a parser change
+// because daily counts are additive — re-running without a reset double-counts.
+export async function resetBulkSolHistory(): Promise<void> {
+  await ensureSchema();
+  await query(`TRUNCATE bulksol_daily`);
+  await query(`TRUNCATE bulksol_first_seen`);
+  await query(`UPDATE bulksol_index_state SET newest_signature = NULL, oldest_signature = NULL, backfill_complete = false, total_indexed = 0 WHERE id = 1`);
+  console.log('🔄 BulkSOL history reset — will re-walk from scratch');
+  void runBulkSolHistory();
 }
 
 const POLL_MS = 15 * 60_000;
