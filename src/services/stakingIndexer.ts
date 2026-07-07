@@ -122,6 +122,16 @@ async function ensureSchema(): Promise<void> {
     )
   `);
   await query(`CREATE INDEX IF NOT EXISTS idx_staking_bulksol_ts_time ON staking_bulksol_ts(captured_at)`);
+  // Per-epoch native stake history, backfilled from Stakewiz's public API
+  // (they've indexed this validator since its first epoch — raw RPC cannot
+  // return past stake). Merged into the history endpoints for all-time charts.
+  await query(`
+    CREATE TABLE IF NOT EXISTS staking_native_epochs (
+      epoch  integer PRIMARY KEY,
+      stake  numeric NOT NULL,
+      source text NOT NULL DEFAULT 'stakewiz'
+    )
+  `);
 }
 
 // ---- RPC result shapes (only the fields we read) --------------------------
@@ -325,6 +335,31 @@ export async function runStakingIndexer(): Promise<void> {
 const POLL_MS = 20 * 60_000;
 let timer: NodeJS.Timeout | null = null;
 
+// Backfill per-epoch total stake from Stakewiz's public API. One cheap HTTP
+// call; upserts so re-runs refresh recent epochs and pick up new ones.
+export async function backfillStakewizEpochs(): Promise<void> {
+  try {
+    await ensureSchema();
+    const url = `https://api.stakewiz.com/validator_total_stakes/${BULK_VOTE_ACCOUNT}?sort=epoch&limit=1000`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const rows = (await res.json()) as { epoch: number; stake: number | string }[];
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    for (const r of rows) {
+      const stake = Number(r.stake);
+      if (!Number.isFinite(stake) || !Number.isFinite(r.epoch)) continue;
+      await query(
+        `INSERT INTO staking_native_epochs (epoch, stake) VALUES ($1, $2)
+         ON CONFLICT (epoch) DO UPDATE SET stake = EXCLUDED.stake`,
+        [r.epoch, stake],
+      );
+    }
+    console.log(`🥩 Stakewiz epoch backfill: ${rows.length} epochs stored`);
+  } catch (e) {
+    console.error('❌ Stakewiz backfill error:', (e as Error).message);
+  }
+}
+
 export function startStakingIndexer(): void {
   if (!isStakingConfigured()) {
     console.log('ℹ️  Staking indexer disabled (SOLANA_RPC_URL not set)');
@@ -333,5 +368,10 @@ export function startStakingIndexer(): void {
   setTimeout(() => void runStakingIndexer(), 12_000);
   timer = setInterval(() => void runStakingIndexer(), POLL_MS);
   timer.unref?.();
-  console.log('🥩 Native staking indexer scheduled (every 20m)');
+  // Stakewiz epoch history: once shortly after boot, then refresh every 6h
+  // (epochs are ~2 days, so this comfortably captures each new one).
+  setTimeout(() => void backfillStakewizEpochs(), 20_000);
+  const wizTimer = setInterval(() => void backfillStakewizEpochs(), 6 * 3_600_000);
+  wizTimer.unref?.();
+  console.log('🥩 Native staking indexer scheduled (every 20m + Stakewiz epochs every 6h)');
 }
