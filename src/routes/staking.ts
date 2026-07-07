@@ -9,7 +9,7 @@
 import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db';
 import { getCache, setCache } from '../services/cache';
-import { BULK_VOTE_ACCOUNT, BULK_IDENTITY } from '../services/stakingIndexer';
+import { BULK_VOTE_ACCOUNT, BULK_IDENTITY, BULKSOL_MINT, BULKSOL_POOL } from '../services/stakingIndexer';
 
 const router = Router();
 
@@ -88,6 +88,78 @@ router.get('/native/history', async (_req: Request, res: Response) => {
   } catch (e) {
     console.error('staking/native/history error:', (e as Error).message);
     res.status(500).json({ error: 'Failed to load staking history' });
+  }
+});
+
+// ---- BulkSOL: latest live snapshot (+ APY from exchange-rate growth) ------
+const EPOCHS_PER_YEAR = 182; // Solana epoch ≈ 2 days
+
+router.get('/bulksol/summary', async (_req: Request, res: Response) => {
+  const cacheKey = 'staking:bulksol:summary';
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const rows = await query<{
+      epoch: number; tvl_sol: string; supply: string; exchange_rate: string;
+      holders: number | null; validators: number | null; captured_at: string;
+    }>(
+      `SELECT epoch, tvl_sol, supply, exchange_rate, holders, validators, captured_at
+       FROM staking_bulksol_snapshots ORDER BY epoch DESC LIMIT 2`,
+    );
+    const latest = rows[0];
+    const prev = rows[1];
+
+    // APY from per-epoch pool-token appreciation, compounded to a year.
+    let apy: number | null = null;
+    if (latest && prev && Number(prev.exchange_rate) > 0) {
+      const g = Number(latest.exchange_rate) / Number(prev.exchange_rate) - 1;
+      const span = latest.epoch - prev.epoch || 1;
+      apy = +((Math.pow(1 + g / span, EPOCHS_PER_YEAR) - 1) * 100).toFixed(2);
+    }
+
+    const result = {
+      mint: BULKSOL_MINT,
+      pool: BULKSOL_POOL,
+      epoch: latest?.epoch ?? null,
+      tvlSol: latest ? Number(latest.tvl_sol) : 0,
+      supply: latest ? Number(latest.supply) : 0,
+      exchangeRate: latest ? Number(latest.exchange_rate) : 0,
+      holders: latest?.holders ?? null,
+      validators: latest?.validators ?? null,
+      apy,
+      updatedAt: latest?.captured_at ?? null,
+    };
+    await setCache(cacheKey, result, 60);
+    res.json(result);
+  } catch (e) {
+    console.error('staking/bulksol/summary error:', (e as Error).message);
+    res.status(500).json({ error: 'Failed to load BulkSOL summary' });
+  }
+});
+
+// ---- BulkSOL: per-epoch history -------------------------------------------
+router.get('/bulksol/history', async (_req: Request, res: Response) => {
+  const cacheKey = 'staking:bulksol:history';
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const rows = await query<{ epoch: number; tvl_sol: string; supply: string; exchange_rate: string }>(
+      `SELECT epoch, tvl_sol, supply, exchange_rate
+       FROM staking_bulksol_snapshots ORDER BY epoch ASC`,
+    );
+    const result = rows.map((r) => ({
+      epoch: r.epoch,
+      tvlSol: Number(r.tvl_sol),
+      supply: Number(r.supply),
+      exchangeRate: Number(r.exchange_rate),
+    }));
+    await setCache(cacheKey, result, 60);
+    res.json(result);
+  } catch (e) {
+    console.error('staking/bulksol/history error:', (e as Error).message);
+    res.status(500).json({ error: 'Failed to load BulkSOL history' });
   }
 });
 
