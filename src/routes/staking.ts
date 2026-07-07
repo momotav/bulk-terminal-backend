@@ -10,7 +10,7 @@ import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db';
 import { getCache, setCache } from '../services/cache';
 import { BULK_VOTE_ACCOUNT, BULK_IDENTITY, BULKSOL_MINT, BULKSOL_POOL, getValidatorDistribution, getHolderBalances } from '../services/stakingIndexer';
-import { isBulkSolHistoryConfigured } from '../services/bulksolIndexer';
+import { isBulkSolHistoryConfigured, resetBulkSolHistory } from '../services/bulksolIndexer';
 
 const router = Router();
 
@@ -297,6 +297,19 @@ router.get('/bulksol/status', async (_req: Request, res: Response) => {
   } catch (e) {
     console.error('staking/bulksol/status error:', (e as Error).message);
     res.status(500).json({ error: 'Failed to load backfill status' });
+  }
+});
+
+// ---- BulkSOL: reset + re-walk history (token-guarded) ---------------------
+router.post('/bulksol/reset', async (req: Request, res: Response) => {
+  const token = req.query.token || req.headers['x-reset-token'];
+  if (token !== 'bulkstats-reset') return res.status(403).json({ error: 'forbidden' });
+  try {
+    await resetBulkSolHistory();
+    res.json({ ok: true, message: 'BulkSOL history cleared — re-walking from scratch' });
+  } catch (e) {
+    console.error('staking/bulksol/reset error:', (e as Error).message);
+    res.status(500).json({ error: 'reset failed' });
   }
 });
 
