@@ -226,6 +226,28 @@ export async function getValidatorDistribution(): Promise<{ voteAccount: string;
   return out.sort((a, b) => b.activeStake - a.activeStake);
 }
 
+// Current BulkSOL holder balances (owner → amount) from the token accounts.
+// Powers wallet-distribution buckets and whale concentration (current state).
+export async function getHolderBalances(): Promise<{ owner: string; amount: number }[]> {
+  const accts = await rpc<{ account: { data: [string, string] } }[]>('getProgramAccounts', [
+    TOKEN_PROGRAM,
+    {
+      encoding: 'base64',
+      dataSlice: { offset: 32, length: 40 }, // owner (32) + amount (8)
+      filters: [{ dataSize: 165 }, { memcmp: { offset: 0, bytes: BULKSOL_MINT } }],
+    },
+  ]);
+  const byOwner = new Map<string, number>();
+  for (const a of accts) {
+    const b = Buffer.from(a.account.data[0], 'base64');
+    const amount = Number(b.readBigUInt64LE(32)) / LAMPORTS_PER_SOL;
+    if (amount <= 0) continue;
+    const owner = bs58.encode(b.subarray(0, 32));
+    byOwner.set(owner, (byOwner.get(owner) || 0) + amount); // sum an owner's ATAs
+  }
+  return Array.from(byOwner, ([owner, amount]) => ({ owner, amount })).sort((a, b) => b.amount - a.amount);
+}
+
 export async function runStakingIndexer(): Promise<void> {
   if (!isStakingConfigured()) return;
   try {
