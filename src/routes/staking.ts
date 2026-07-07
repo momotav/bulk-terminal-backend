@@ -9,7 +9,7 @@
 import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db';
 import { getCache, setCache } from '../services/cache';
-import { BULK_VOTE_ACCOUNT, BULK_IDENTITY, BULKSOL_MINT, BULKSOL_POOL } from '../services/stakingIndexer';
+import { BULK_VOTE_ACCOUNT, BULK_IDENTITY, BULKSOL_MINT, BULKSOL_POOL, getValidatorDistribution } from '../services/stakingIndexer';
 
 const router = Router();
 
@@ -162,6 +162,28 @@ router.get('/bulksol/history', async (req: Request, res: Response) => {
   } catch (e) {
     console.error('staking/bulksol/history error:', (e as Error).message);
     res.status(500).json({ error: 'Failed to load BulkSOL history' });
+  }
+});
+
+// ---- BulkSOL: per-validator stake distribution (live from the pool) -------
+router.get('/bulksol/validators', async (_req: Request, res: Response) => {
+  const cacheKey = 'staking:bulksol:validators';
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const dist = await getValidatorDistribution();
+    const total = dist.reduce((a, v) => a + v.activeStake, 0);
+    const result = {
+      total,
+      count: dist.length,
+      validators: dist.map((v) => ({ ...v, share: total > 0 ? v.activeStake / total : 0 })),
+    };
+    await setCache(cacheKey, result, 120);
+    res.json(result);
+  } catch (e) {
+    console.error('staking/bulksol/validators error:', (e as Error).message);
+    res.status(500).json({ error: 'Failed to load validator distribution' });
   }
 });
 
