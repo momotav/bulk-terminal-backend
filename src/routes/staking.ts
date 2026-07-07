@@ -58,31 +58,31 @@ router.get('/native/summary', async (_req: Request, res: Response) => {
   }
 });
 
-// ---- Native: per-epoch history for charts ---------------------------------
-router.get('/native/history', async (_req: Request, res: Response) => {
-  const cacheKey = 'staking:native:history';
+// ---- Native: time-series history for charts (?range=7d|30d|all) -----------
+function rangeWhere(range: string | undefined): string {
+  if (range === '7d') return "WHERE captured_at > now() - interval '7 days'";
+  if (range === '30d') return "WHERE captured_at > now() - interval '30 days'";
+  return '';
+}
+
+router.get('/native/history', async (req: Request, res: Response) => {
+  const range = String(req.query.range || 'all');
+  const cacheKey = `staking:native:history:${range}`;
   const cached = await getCache<unknown>(cacheKey);
   if (cached) return res.json(cached);
 
   try {
-    const rows = await query<{
-      epoch: number;
-      active_stake: string;
-      delegator_count: number;
-      apy: string | null;
-    }>(
-      `SELECT epoch, active_stake, delegator_count, apy
-       FROM staking_native_snapshots
-       ORDER BY epoch ASC`,
+    const rows = await query<{ captured_at: string; active_stake: string; delegator_count: number; apy: string | null }>(
+      `SELECT captured_at, active_stake, delegator_count, apy
+       FROM staking_native_ts ${rangeWhere(range)}
+       ORDER BY captured_at ASC`,
     );
-
     const result = rows.map((r) => ({
-      epoch: r.epoch,
+      t: new Date(r.captured_at).getTime(),
       activeStake: Number(r.active_stake),
       delegatorCount: r.delegator_count,
       apy: r.apy != null ? Number(r.apy) : null,
     }));
-
     await setCache(cacheKey, result, 60);
     res.json(result);
   } catch (e) {
@@ -138,19 +138,21 @@ router.get('/bulksol/summary', async (_req: Request, res: Response) => {
   }
 });
 
-// ---- BulkSOL: per-epoch history -------------------------------------------
-router.get('/bulksol/history', async (_req: Request, res: Response) => {
-  const cacheKey = 'staking:bulksol:history';
+// ---- BulkSOL: time-series history (?range=7d|30d|all) ---------------------
+router.get('/bulksol/history', async (req: Request, res: Response) => {
+  const range = String(req.query.range || 'all');
+  const cacheKey = `staking:bulksol:history:${range}`;
   const cached = await getCache<unknown>(cacheKey);
   if (cached) return res.json(cached);
 
   try {
-    const rows = await query<{ epoch: number; tvl_sol: string; supply: string; exchange_rate: string }>(
-      `SELECT epoch, tvl_sol, supply, exchange_rate
-       FROM staking_bulksol_snapshots ORDER BY epoch ASC`,
+    const rows = await query<{ captured_at: string; tvl_sol: string; supply: string; exchange_rate: string }>(
+      `SELECT captured_at, tvl_sol, supply, exchange_rate
+       FROM staking_bulksol_ts ${rangeWhere(range)}
+       ORDER BY captured_at ASC`,
     );
     const result = rows.map((r) => ({
-      epoch: r.epoch,
+      t: new Date(r.captured_at).getTime(),
       tvlSol: Number(r.tvl_sol),
       supply: Number(r.supply),
       exchangeRate: Number(r.exchange_rate),
