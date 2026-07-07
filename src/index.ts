@@ -9,6 +9,7 @@ import { testConnection, initializeDatabase, query } from './db';
 import { startDataCollector } from './jobs/dataCollector';
 import { startCacheWarmer } from './jobs/cacheWarmer';
 import { startPredepositIndexer } from './services/solanaIndexer';
+import { startStakingIndexer } from './services/stakingIndexer';
 import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
 import { startDevnetPoller } from './jobs/devnetPoller';
 import { initRedis, getCacheStats } from './services/cache';
@@ -21,6 +22,7 @@ import walletRoutes from './routes/wallet';
 import userRoutes from './routes/users';
 import explorerRoutes from './routes/explorer';
 import predepositRoutes from './routes/predeposit';
+import stakingRoutes from './routes/staking';
 import streamRoutes from './routes/stream';
 import { startExplorerListener } from './services/bulkExplorer';
 import { requestNetworkMiddleware } from './services/networkContext';
@@ -295,6 +297,7 @@ app.use('/api/wallet', walletRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/explorer', explorerRoutes);
 app.use('/api/predeposit', predepositRoutes);
+app.use('/api/staking', stakingRoutes);
 app.use('/api/stream', streamRoutes);
 
 // Debug endpoint to check cache status
@@ -361,6 +364,8 @@ async function start() {
     // Index BULK's pre-deposit vault from Solana mainnet (no-op until
     // SOLANA_RPC_URL is set in env).
     startPredepositIndexer();
+    // Index BULK's native validator staking from Solana mainnet.
+    startStakingIndexer();
   });
 }
 
