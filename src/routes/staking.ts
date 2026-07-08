@@ -54,6 +54,7 @@ router.get('/native/summary', async (_req: Request, res: Response) => {
       activating: row ? Number(row.activating) : 0,
       deactivating: row ? Number(row.deactivating) : 0,
       apy: row?.apy != null ? Number(row.apy) : null,
+      solPriceUsd: await getSolPrice(),
       updatedAt: row?.captured_at ?? null,
     };
 
@@ -98,6 +99,26 @@ router.get('/native/history', async (req: Request, res: Response) => {
   }
 });
 
+// Current SOL/USD price via CoinGecko's free endpoint, cached 5 min. Used to
+// express staking TVL in dollars; null on failure (frontend shows —).
+async function getSolPrice(): Promise<number | null> {
+  const cached = await getCache<number>('staking:solprice');
+  if (cached) return cached;
+  try {
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) return null;
+    const j = (await r.json()) as { solana?: { usd?: number } };
+    const p = j?.solana?.usd;
+    if (typeof p === 'number' && p > 0) {
+      await setCache('staking:solprice', p, 300);
+      return p;
+    }
+  } catch { /* price optional */ }
+  return null;
+}
+
 // ---- BulkSOL: latest live snapshot (+ APY from exchange-rate growth) ------
 const EPOCHS_PER_YEAR = 182; // Solana epoch ≈ 2 days
 
@@ -135,6 +156,7 @@ router.get('/bulksol/summary', async (_req: Request, res: Response) => {
       holders: latest?.holders ?? null,
       validators: latest?.validators ?? null,
       apy,
+      solPriceUsd: await getSolPrice(),
       updatedAt: latest?.captured_at ?? null,
     };
     await setCache(cacheKey, result, 60);
