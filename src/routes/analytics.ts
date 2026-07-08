@@ -2641,12 +2641,26 @@ router.get('/risk-surfaces/:coin', async (req: Request, res: Response) => {
     return res.json(cached);
   }
 
+  // Last-known-good copy, kept for 7 days. Served (flagged `stale: true`)
+  // whenever the upstream fails — BULK's /riskSurfaces has a history of
+  // timing out (408s) after network upgrades, and surfaces change rarely
+  // enough that a stale one is far better than an empty Margin Surface.
+  const staleKey = `analytics:risk_surfaces_stale:${coin}`;
+  const serveStale = async (reason: string) => {
+    const stale = await getCache<Record<string, unknown>>(staleKey);
+    if (stale) {
+      console.warn(`Serving stale risk surfaces for ${coin} (${reason})`);
+      return res.json({ ...stale, stale: true });
+    }
+    return res.status(502).json({ error: 'Upstream risk surfaces unavailable' });
+  };
+
   try {
     const url = `${BULK_API_BASE}/riskSurfaces?market=${encodeURIComponent(coin)}`;
     const upstream = await bulkFetch(url);
     if (!upstream.ok) {
       console.error(`BULK /riskSurfaces returned ${upstream.status} for ${coin}`);
-      return res.status(502).json({ error: 'Upstream risk surfaces unavailable' });
+      return serveStale(`HTTP ${upstream.status}`);
     }
     const raw: any = await upstream.json();
 
@@ -2655,7 +2669,7 @@ router.get('/risk-surfaces/:coin', async (req: Request, res: Response) => {
     // empty heatmap, which is confusing — better to surface an upstream error.
     if (!raw || typeof raw !== 'object' || !Array.isArray(raw.surfaces) || raw.surfaces.length === 0) {
       console.error('Unexpected /riskSurfaces shape:', JSON.stringify(raw).slice(0, 200));
-      return res.status(502).json({ error: 'Malformed upstream response' });
+      return serveStale('malformed upstream response');
     }
 
     // Round numeric fields to 6 decimals. JSON.stringify of IEEE-754 floats
@@ -2680,10 +2694,12 @@ router.get('/risk-surfaces/:coin', async (req: Request, res: Response) => {
 
     // 5-minute cache — surfaces rarely change, liveRegime refreshes acceptably.
     await setCache(cacheKey, trimmed, 300);
+    // Refresh the last-known-good copy (7 days) for stale-if-error fallback.
+    await setCache(staleKey, trimmed, 7 * 86400);
     return res.json(trimmed);
   } catch (err) {
     console.error(`Failed to fetch /riskSurfaces for ${coin}:`, err);
-    return res.status(502).json({ error: 'Failed to fetch risk surfaces' });
+    return serveStale('fetch failed');
   }
 });
 
