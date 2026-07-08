@@ -14,6 +14,12 @@ import { isBulkSolHistoryConfigured, resetBulkSolHistory, debugSample } from '..
 
 const router = Router();
 
+// Hard floor for all staking history: BULK's staking era starts here. Any
+// rows/epochs before this date (e.g. pre-launch artifacts from third-party
+// backfills) are clipped from every endpoint.
+const STAKING_START = new Date('2025-10-21T00:00:00Z').getTime();
+const STAKING_START_DAY = '2025-10-21';
+
 // ---- Native: latest live snapshot -----------------------------------------
 router.get('/native/summary', async (_req: Request, res: Response) => {
   const cacheKey = 'staking:native:summary';
@@ -195,10 +201,12 @@ router.get('/bulksol/flows', async (req: Request, res: Response) => {
   const cached = await getCache<unknown>(cacheKey);
   if (cached) return res.json(cached);
   try {
-    const where = range === '7d' ? "WHERE day > now() - interval '7 days'"
-      : range === '30d' ? "WHERE day > now() - interval '30 days'" : '';
+    const where = range === '7d' ? "WHERE day > now() - interval '7 days' AND day >= $1"
+      : range === '30d' ? "WHERE day > now() - interval '30 days' AND day >= $1"
+      : 'WHERE day >= $1';
     const rows = await query<{ day: string; mint_amount: string; burn_amount: string; new_wallets: number }>(
       `SELECT day, mint_amount, burn_amount, new_wallets FROM bulksol_daily ${where} ORDER BY day ASC`,
+      [STAKING_START_DAY],
     );
     let cumSupply = 0, cumWallets = 0;
     const result = rows.map((r) => {
@@ -260,7 +268,7 @@ router.get('/bulksol/holders', async (_req: Request, res: Response) => {
 });
 
 // ---- BulkSOL: backfill progress -------------------------------------------
-const BULKSOL_LAUNCH = new Date('2025-10-15').getTime(); // approx mint launch
+const BULKSOL_LAUNCH = STAKING_START; // unified staking-era floor (2025-10-21)
 
 router.get('/bulksol/status', async (_req: Request, res: Response) => {
   try {
@@ -345,11 +353,13 @@ router.get('/native/epochs', async (_req: Request, res: Response) => {
     const anchorEpoch = anchor?.epoch ?? (rows.length ? rows[rows.length - 1].epoch : 0);
     const anchorTime = anchor ? new Date(anchor.captured_at).getTime() : Date.now();
 
-    const result = rows.map((r) => ({
-      epoch: r.epoch,
-      t: anchorTime - (anchorEpoch - r.epoch) * EPOCH_MS,
-      activeStake: Number(r.stake),
-    }));
+    const result = rows
+      .map((r) => ({
+        epoch: r.epoch,
+        t: anchorTime - (anchorEpoch - r.epoch) * EPOCH_MS,
+        activeStake: Number(r.stake),
+      }))
+      .filter((r) => r.t >= STAKING_START);
     await setCache(cacheKey, result, 300);
     res.json(result);
   } catch (e) {
