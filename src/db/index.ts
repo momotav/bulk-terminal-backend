@@ -6,7 +6,7 @@ dotenv.config();
 // Database connection pool with production settings
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  ssl: process.env.DATABASE_SSL === 'require' ? { rejectUnauthorized: false } : false,
   // Connection pool settings - optimized for high throughput
   max: 15,                        // Reduced from 20 - fewer but healthier connections
   min: 2,                         // Keep minimum connections alive
