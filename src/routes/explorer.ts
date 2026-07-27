@@ -16,6 +16,8 @@ import { Router, Request, Response } from 'express';
 import { getThroughput, getRecentBlocks } from '../services/bulkExplorer';
 import { getCache, setCache } from '../services/cache';
 import { bulkFetch } from '../services/bulkAuth';
+import { sampleActionBreakdown } from '../services/networkBreakdown';
+import { query } from '../db';
 
 const router = Router();
 
@@ -121,6 +123,125 @@ router.get('/tx/:txhash', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('explorer /tx proxy failed:', error.message);
     return res.status(502).json({ error: 'failed to reach BULK explorer' });
+  }
+});
+
+// Historical network metrics (block time, throughput) aggregated from the
+// 1-minute snapshots in network_metrics. Serves the analytics Network page's
+// Block-Time and Throughput charts. `range` picks the window + bucket:
+//   1d  → hourly buckets over the last day
+//   7d  → daily buckets over the last week (default)
+//   30d → daily buckets over the last month
+// Samples with < 2 blocks in their window are excluded so a momentary WS
+// reconnect can't drag the averages. Data only exists from first deploy
+// forward (no backfill), so an empty array early on is expected.
+router.get('/network-history', async (req: Request, res: Response) => {
+  try {
+    const range = String(req.query.range || '7d');
+    const cfg =
+      range === '1d' ? { bucket: 'hour', interval: '1 day' } :
+      range === '30d' ? { bucket: 'day', interval: '30 days' } :
+      { bucket: 'day', interval: '7 days' };
+    const network = req.query.net === 'devnet' ? 'devnet' : 'testnet';
+
+    const cacheKey = `explorer:nethist:${network}:${range}`;
+    const cached = await getCache(cacheKey);
+    if (cached) {
+      res.setHeader('X-Bulkstats-Cache', 'fresh');
+      return res.json(cached);
+    }
+
+    const rows = await query(
+      `SELECT
+         date_trunc($1, timestamp)              AS bucket,
+         AVG(tps)::float8                        AS tps,
+         AVG(aps)::float8                        AS aps,
+         AVG(block_time_ms)::float8              AS block_time_ms,
+         (MAX(latest_round) - MIN(latest_round)) AS blocks_produced,
+         COUNT(*)::int                           AS samples
+       FROM network_metrics
+       WHERE timestamp >= NOW() - $2::interval
+         AND sample_blocks >= 2
+         AND network = $3
+       GROUP BY bucket
+       ORDER BY bucket ASC`,
+      [cfg.bucket, cfg.interval, network]
+    );
+
+    const payload = { range, bucket: cfg.bucket, network, points: rows };
+    // Short cache — the newest bucket keeps updating as snapshots land.
+    await setCache(cacheKey, payload, 30);
+    res.setHeader('X-Bulkstats-Cache', 'miss');
+    return res.json(payload);
+  } catch (error: any) {
+    console.error('explorer /network-history failed:', error.message);
+    return res.status(500).json({ error: 'failed to read network history' });
+  }
+});
+
+// Live "Operations by Type" / "Transactions by Type" composition — a fresh
+// sample of recent block detail, tallied by action code. Powers the donut
+// charts. Returns raw codes; the frontend maps them to labels/categories.
+router.get('/action-breakdown', async (_req: Request, res: Response) => {
+  try {
+    const cacheKey = 'explorer:action-breakdown';
+    const cached = await getCache(cacheKey);
+    if (cached) {
+      res.setHeader('X-Bulkstats-Cache', 'fresh');
+      return res.json(cached);
+    }
+    const b = await sampleActionBreakdown(30);
+    // Cache 15s — recent composition is stable minute to minute and this
+    // fetches block detail, so we don't want to re-sample on every request.
+    await setCache(cacheKey, b, 15);
+    res.setHeader('X-Bulkstats-Cache', 'miss');
+    return res.json(b);
+  } catch (error: any) {
+    console.error('explorer /action-breakdown failed:', error.message);
+    return res.status(500).json({ error: 'failed to sample action breakdown' });
+  }
+});
+
+// Historical per-type action/transaction counts aggregated from the sampled
+// snapshots in network_action_metrics. Serves the by-type stacked charts.
+// Same range/bucket scheme as /network-history. Builds forward from deploy.
+router.get('/action-history', async (req: Request, res: Response) => {
+  try {
+    const range = String(req.query.range || '7d');
+    const cfg =
+      range === '1d' ? { bucket: 'hour', interval: '1 day' } :
+      range === '30d' ? { bucket: 'day', interval: '30 days' } :
+      { bucket: 'day', interval: '7 days' };
+    const network = req.query.net === 'devnet' ? 'devnet' : 'testnet';
+
+    const cacheKey = `explorer:acthist:${network}:${range}`;
+    const cached = await getCache(cacheKey);
+    if (cached) {
+      res.setHeader('X-Bulkstats-Cache', 'fresh');
+      return res.json(cached);
+    }
+
+    const rows = await query(
+      `SELECT
+         date_trunc($1, timestamp) AS bucket,
+         action_code               AS code,
+         SUM(op_count)::float8      AS ops,
+         SUM(tx_count)::float8      AS txs
+       FROM network_action_metrics
+       WHERE timestamp >= NOW() - $2::interval
+         AND network = $3
+       GROUP BY bucket, action_code
+       ORDER BY bucket ASC`,
+      [cfg.bucket, cfg.interval, network]
+    );
+
+    const payload = { range, bucket: cfg.bucket, network, points: rows };
+    await setCache(cacheKey, payload, 30);
+    res.setHeader('X-Bulkstats-Cache', 'miss');
+    return res.json(payload);
+  } catch (error: any) {
+    console.error('explorer /action-history failed:', error.message);
+    return res.status(500).json({ error: 'failed to read action history' });
   }
 });
 

@@ -489,6 +489,54 @@ export async function initializeDatabase(): Promise<void> {
         ON CONFLICT (id) DO NOTHING;
     `);
 
+    // Network metrics — 1-minute snapshots of live BULK throughput (TPS/APS),
+    // block time, and the monotonic round number. Powers the analytics Network
+    // page's historical Block-Time / Throughput charts. History only builds
+    // forward from first deploy; there is no backfill. See
+    // jobs/networkMetricsCollector.ts (writer) and routes/explorer.ts
+    // /network-history (reader).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS network_metrics (
+        id            SERIAL PRIMARY KEY,
+        timestamp     TIMESTAMP DEFAULT NOW(),
+        network       VARCHAR(20) DEFAULT 'testnet',
+        tps           DECIMAL(14,4),
+        aps           DECIMAL(14,4),
+        block_time_ms DECIMAL(12,3),
+        latest_round  BIGINT,
+        sample_blocks INTEGER,
+        status        VARCHAR(20)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_network_metrics_time
+      ON network_metrics(timestamp DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_network_metrics_net_time
+      ON network_metrics(network, timestamp DESC);
+    `);
+
+    // Per-type action/transaction counts, sampled from recent block detail once
+    // a minute (see jobs/networkMetricsCollector.ts). One row per action code
+    // per sample. Powers the "Operations by Type" / "Transactions by Type"
+    // historical stacked charts; the live donuts read a fresh sample directly.
+    // Raw codes are stored ('l','cx','px',…) and mapped to labels on the client.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS network_action_metrics (
+        id          SERIAL PRIMARY KEY,
+        timestamp   TIMESTAMP DEFAULT NOW(),
+        network     VARCHAR(20) DEFAULT 'testnet',
+        action_code VARCHAR(24) NOT NULL,
+        op_count    BIGINT DEFAULT 0,
+        tx_count    BIGINT DEFAULT 0
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_network_action_time
+      ON network_action_metrics(timestamp DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_network_action_net_time
+      ON network_action_metrics(network, timestamp DESC);
+    `);
+
     // ---- Per-network tagging migration -------------------------------------
     // Market-data tables get a `network` column so testnet and devnet data can
     // coexist in one DB. Existing rows + the existing collector (which doesn't

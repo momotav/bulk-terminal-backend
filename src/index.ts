@@ -27,6 +27,7 @@ import predepositRoutes from './routes/predeposit';
 import stakingRoutes from './routes/staking';
 import streamRoutes from './routes/stream';
 import { startExplorerListener } from './services/bulkExplorer';
+import { startNetworkMetricsCollector } from './jobs/networkMetricsCollector';
 import { requestNetworkMiddleware } from './services/networkContext';
 
 const app = express();
@@ -353,7 +354,11 @@ async function start() {
 
   // Start explorer WS listener for live block/throughput metrics
   startExplorerListener();
-  
+
+  // Snapshot live throughput into network_metrics every 60s so the analytics
+  // Network page has historical block-time / throughput data (builds forward).
+  startNetworkMetricsCollector();
+
   // Start HTTP server
   app.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
