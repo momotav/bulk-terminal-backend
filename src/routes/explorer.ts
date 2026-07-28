@@ -139,6 +139,7 @@ router.get('/network-history', async (req: Request, res: Response) => {
   try {
     const range = String(req.query.range || '7d');
     const cfg =
+      range === '1h' ? { bucket: 'minute', interval: '1 hour' } :
       range === '1d' ? { bucket: 'hour', interval: '1 day' } :
       range === '30d' ? { bucket: 'day', interval: '30 days' } :
       { bucket: 'day', interval: '7 days' };
@@ -209,6 +210,7 @@ router.get('/action-history', async (req: Request, res: Response) => {
   try {
     const range = String(req.query.range || '7d');
     const cfg =
+      range === '1h' ? { bucket: 'minute', interval: '1 hour' } :
       range === '1d' ? { bucket: 'hour', interval: '1 day' } :
       range === '30d' ? { bucket: 'day', interval: '30 days' } :
       { bucket: 'day', interval: '7 days' };
