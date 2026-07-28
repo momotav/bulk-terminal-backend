@@ -247,4 +247,122 @@ router.get('/action-history', async (req: Request, res: Response) => {
   }
 });
 
+// Scalar summary stats over a window, computed at query time from
+// network_metrics: peak TPS/APS and the TPS/APS percentile spread (P50/P90/P99).
+// Powers the peak KPIs and the rolling-percentiles display.
+router.get('/network-stats', async (req: Request, res: Response) => {
+  try {
+    const range = String(req.query.range || '1d');
+    const interval = range === '30d' ? '30 days' : range === '7d' ? '7 days' : '1 day';
+    const network = req.query.net === 'devnet' ? 'devnet' : 'testnet';
+    const cacheKey = `explorer:netstats:${network}:${range}`;
+    const cached = await getCache(cacheKey);
+    if (cached) { res.setHeader('X-Bulkstats-Cache', 'fresh'); return res.json(cached); }
+
+    const rows = await query(
+      `SELECT
+         MAX(tps)::float8 AS peak_tps,
+         MAX(aps)::float8 AS peak_aps,
+         percentile_cont(0.5)  WITHIN GROUP (ORDER BY tps)::float8 AS tps_p50,
+         percentile_cont(0.9)  WITHIN GROUP (ORDER BY tps)::float8 AS tps_p90,
+         percentile_cont(0.99) WITHIN GROUP (ORDER BY tps)::float8 AS tps_p99,
+         percentile_cont(0.5)  WITHIN GROUP (ORDER BY aps)::float8 AS aps_p50,
+         percentile_cont(0.9)  WITHIN GROUP (ORDER BY aps)::float8 AS aps_p90,
+         percentile_cont(0.99) WITHIN GROUP (ORDER BY aps)::float8 AS aps_p99,
+         COUNT(*)::int AS samples
+       FROM network_metrics
+       WHERE timestamp >= NOW() - $1::interval AND sample_blocks >= 2 AND network = $2`,
+      [interval, network]
+    );
+    const payload = { range, network, ...(rows[0] || {}) };
+    await setCache(cacheKey, payload, 30);
+    res.setHeader('X-Bulkstats-Cache', 'miss');
+    return res.json(payload);
+  } catch (error: any) {
+    console.error('explorer /network-stats failed:', error.message);
+    return res.status(500).json({ error: 'failed to read network stats' });
+  }
+});
+
+// Average TPS by day-of-week × hour-of-day over the last `days`, for the
+// activity heatmap. dow: 0=Sun..6=Sat (Postgres extract convention).
+router.get('/network-heatmap', async (req: Request, res: Response) => {
+  try {
+    const days = Math.min(60, Math.max(1, parseInt(String(req.query.days || '14'), 10) || 14));
+    const network = req.query.net === 'devnet' ? 'devnet' : 'testnet';
+    const cacheKey = `explorer:heatmap:${network}:${days}`;
+    const cached = await getCache(cacheKey);
+    if (cached) { res.setHeader('X-Bulkstats-Cache', 'fresh'); return res.json(cached); }
+
+    const cells = await query(
+      `SELECT
+         EXTRACT(DOW  FROM timestamp)::int AS dow,
+         EXTRACT(HOUR FROM timestamp)::int AS hour,
+         AVG(tps)::float8 AS tps,
+         COUNT(*)::int    AS samples
+       FROM network_metrics
+       WHERE timestamp >= NOW() - ($1 || ' days')::interval
+         AND sample_blocks >= 2 AND network = $2
+       GROUP BY dow, hour
+       ORDER BY dow, hour`,
+      [String(days), network]
+    );
+    const payload = { days, network, cells };
+    await setCache(cacheKey, payload, 60);
+    res.setHeader('X-Bulkstats-Cache', 'miss');
+    return res.json(payload);
+  } catch (error: any) {
+    console.error('explorer /network-heatmap failed:', error.message);
+    return res.status(500).json({ error: 'failed to read heatmap' });
+  }
+});
+
+// Per-block detail aggregated from network_block_metrics: block-time
+// percentiles, empty-block %, avg/largest block size over time, plus the
+// range's largest block. Bucketing matches /network-history.
+router.get('/block-metrics', async (req: Request, res: Response) => {
+  try {
+    const range = String(req.query.range || '7d');
+    const cfg =
+      range === '1h' ? { bucket: 'minute', interval: '1 hour' } :
+      range === '1d' ? { bucket: 'hour', interval: '1 day' } :
+      range === '30d' ? { bucket: 'day', interval: '30 days' } :
+      { bucket: 'day', interval: '7 days' };
+    const network = req.query.net === 'devnet' ? 'devnet' : 'testnet';
+    const cacheKey = `explorer:blockmetrics:${network}:${range}`;
+    const cached = await getCache(cacheKey);
+    if (cached) { res.setHeader('X-Bulkstats-Cache', 'fresh'); return res.json(cached); }
+
+    const points = await query(
+      `SELECT
+         date_trunc($1, timestamp) AS bucket,
+         AVG(bt_p50)::float8 AS bt_p50,
+         AVG(bt_p95)::float8 AS bt_p95,
+         AVG(bt_p99)::float8 AS bt_p99,
+         AVG(avg_tx)::float8      AS avg_tx,
+         AVG(avg_actions)::float8 AS avg_actions,
+         MAX(max_tx)::int         AS max_tx,
+         SUM(empty_blocks)::float8 AS empty_blocks,
+         SUM(blocks_seen)::float8  AS total_blocks
+       FROM network_block_metrics
+       WHERE timestamp >= NOW() - $2::interval AND network = $3
+       GROUP BY bucket ORDER BY bucket ASC`,
+      [cfg.bucket, cfg.interval, network]
+    );
+    const totals = await query(
+      `SELECT MAX(max_tx)::int AS largest_tx, MAX(max_actions)::int AS largest_actions
+       FROM network_block_metrics
+       WHERE timestamp >= NOW() - $1::interval AND network = $2`,
+      [cfg.interval, network]
+    );
+    const payload = { range, bucket: cfg.bucket, network, points, ...(totals[0] || {}) };
+    await setCache(cacheKey, payload, 30);
+    res.setHeader('X-Bulkstats-Cache', 'miss');
+    return res.json(payload);
+  } catch (error: any) {
+    console.error('explorer /block-metrics failed:', error.message);
+    return res.status(500).json({ error: 'failed to read block metrics' });
+  }
+});
+
 export default router;

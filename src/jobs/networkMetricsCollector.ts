@@ -14,11 +14,18 @@
 // samples with >= 2 blocks so a momentary WS reconnect can't dent the averages.
 
 import cron from 'node-cron';
-import { getThroughput } from '../services/bulkExplorer';
+import { getThroughput, getRecentBlocks } from '../services/bulkExplorer';
 import { sampleActionBreakdown } from '../services/networkBreakdown';
 import { query } from '../db';
 
 const NETWORK = 'testnet'; // the network the explorer WS is connected to
+
+// Nearest-rank percentile of a pre-sorted ascending array.
+function pct(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const i = Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * p)));
+  return sorted[i];
+}
 
 // Snapshot the instantaneous throughput reading (TPS/APS/block time).
 async function snapshotThroughput(): Promise<void> {
@@ -64,13 +71,58 @@ async function snapshotBreakdown(): Promise<void> {
   }
 }
 
+// Sample the recent-blocks buffer for per-block detail the minute-averaged
+// throughput can't express: the block-time distribution (percentiles), empty
+// vs non-empty counts, and block-size stats. In-memory read (no HTTP), cheap.
+async function snapshotBlockMetrics(): Promise<void> {
+  try {
+    const blocks = getRecentBlocks(1000);
+    if (blocks.length < 5) return;
+    // Ascending by round so consecutive-block time deltas are well-defined.
+    const asc = [...blocks].sort((a, b) => a.round - b.round);
+    const times: number[] = [];
+    for (let i = 1; i < asc.length; i++) {
+      const dtMs = (asc[i].timestampNs - asc[i - 1].timestampNs) / 1e6;
+      if (dtMs > 0 && dtMs < 60_000) times.push(dtMs); // drop gaps / bad clocks
+    }
+    times.sort((a, b) => a - b);
+
+    let empty = 0, maxTx = 0, maxAct = 0, sumTx = 0, sumAct = 0;
+    for (const b of asc) {
+      if (b.txCount === 0) empty += 1;
+      if (b.txCount > maxTx) maxTx = b.txCount;
+      if (b.actionCount > maxAct) maxAct = b.actionCount;
+      sumTx += b.txCount;
+      sumAct += b.actionCount;
+    }
+    const n = asc.length;
+
+    await query(
+      `INSERT INTO network_block_metrics
+         (network, blocks_seen, empty_blocks, bt_p50, bt_p95, bt_p99, bt_min, bt_max,
+          max_tx, max_actions, avg_tx, avg_actions)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
+        NETWORK, n, empty,
+        pct(times, 0.5), pct(times, 0.95), pct(times, 0.99),
+        times[0] ?? 0, times[times.length - 1] ?? 0,
+        maxTx, maxAct, sumTx / n, sumAct / n,
+      ]
+    );
+  } catch (err) {
+    console.error('❌ network block-metrics snapshot failed:', (err as Error).message);
+  }
+}
+
 export function startNetworkMetricsCollector(): void {
   console.log('📈 Starting network metrics collector (60s snapshots)...');
   cron.schedule('* * * * *', () => {
     void snapshotThroughput();
     void snapshotBreakdown();
+    void snapshotBlockMetrics();
   });
   // Land the first samples immediately rather than waiting a full minute.
   void snapshotThroughput();
   void snapshotBreakdown();
+  void snapshotBlockMetrics();
 }

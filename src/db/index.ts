@@ -537,6 +537,36 @@ export async function initializeDatabase(): Promise<void> {
       ON network_action_metrics(network, timestamp DESC);
     `);
 
+    // Per-block detail sampled once a minute from the recent-blocks buffer
+    // (see jobs/networkMetricsCollector.ts). Stores the block-time distribution
+    // (percentiles), empty-vs-non-empty counts, and block-size stats that the
+    // minute-averaged network_metrics can't express. Powers block-time
+    // percentiles, empty-block %, largest-block, and avg-per-block charts.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS network_block_metrics (
+        id           SERIAL PRIMARY KEY,
+        timestamp    TIMESTAMP DEFAULT NOW(),
+        network      VARCHAR(20) DEFAULT 'testnet',
+        blocks_seen  INTEGER,
+        empty_blocks INTEGER,
+        bt_p50       DECIMAL(12,3),
+        bt_p95       DECIMAL(12,3),
+        bt_p99       DECIMAL(12,3),
+        bt_min       DECIMAL(12,3),
+        bt_max       DECIMAL(12,3),
+        max_tx       INTEGER,
+        max_actions  INTEGER,
+        avg_tx       DECIMAL(12,3),
+        avg_actions  DECIMAL(12,3)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_network_block_time
+      ON network_block_metrics(timestamp DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_network_block_net_time
+      ON network_block_metrics(network, timestamp DESC);
+    `);
+
     // ---- Per-network tagging migration -------------------------------------
     // Market-data tables get a `network` column so testnet and devnet data can
     // coexist in one DB. Existing rows + the existing collector (which doesn't
