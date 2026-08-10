@@ -2608,6 +2608,118 @@ router.get('/orderbook/:coin', async (req: Request, res: Response) => {
   }
 });
 
+// ============ CROSS-EXCHANGE ORDER-BOOK COMPARISON ============
+// Powers the Order Book page's "Compare" mode: the same depth/impact/cost tools
+// measured against other venues. Each venue's public L2 book is fetched, folded
+// to the SAME normalized shape as /orderbook (so the frontend computes slippage
+// tables uniformly), plus that venue's taker fee. One venue failing degrades to
+// { ok:false } rather than sinking the whole response — BULK's own book (which
+// the frontend already has) is always present regardless.
+
+type CmpLevel = { px: number; sz: number; n: number };
+
+// Fetch JSON with a hard timeout so a slow/hung venue can't stall the request.
+async function fetchJsonTimeout(url: string, init: RequestInit | undefined, timeoutMs: number): Promise<any | null> {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { ...init, signal: ac.signal });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Derived stats, identical math to /orderbook so venues line up with BULK.
+function computeBookStats(bids: CmpLevel[], asks: CmpLevel[]) {
+  const bestBid = bids[0] ? { px: bids[0].px, sz: bids[0].sz, n: bids[0].n } : null;
+  const bestAsk = asks[0] ? { px: asks[0].px, sz: asks[0].sz, n: asks[0].n } : null;
+  let mid: number | null = null, spreadAbs: number | null = null, spreadBps: number | null = null;
+  if (bestBid && bestAsk) {
+    mid = (bestBid.px + bestAsk.px) / 2;
+    spreadAbs = bestAsk.px - bestBid.px;
+    spreadBps = mid > 0 ? (spreadAbs / mid) * 10000 : null;
+  }
+  let bidD = 0, askD = 0;
+  if (mid) {
+    const lo = mid * 0.98, hi = mid * 1.02;
+    bidD = bids.filter((l) => l.px >= lo).reduce((s, l) => s + l.px * l.sz, 0);
+    askD = asks.filter((l) => l.px <= hi).reduce((s, l) => s + l.px * l.sz, 0);
+  }
+  const total = bidD + askD;
+  return { bestBid, bestAsk, mid, spreadAbs, spreadBps, bidDepth2pctUsd: bidD, askDepth2pctUsd: askD, imbalance: total > 0 ? (bidD - askD) / total : 0 };
+}
+
+// Venue registry. `symbol` maps BULK's base coin (BTC/ETH/SOL) to the venue's
+// ticker; `takerBps` is that venue's public taker fee (tune as schedules move);
+// `fetchBook` returns normalized bids (desc) / asks (asc).
+const CMP_VENUES: Record<string, {
+  label: string;
+  takerBps: number;
+  symbol: (base: string) => string;
+  fetchBook: (sym: string) => Promise<{ bids: CmpLevel[]; asks: CmpLevel[] } | null>;
+}> = {
+  hyperliquid: {
+    label: 'Hyperliquid',
+    takerBps: 3.5, // HL public perp taker ~0.035%
+    symbol: (b) => b,
+    fetchBook: async (sym) => {
+      const raw = await fetchJsonTimeout(
+        'https://api.hyperliquid.xyz/info',
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'l2Book', coin: sym }) },
+        4000,
+      );
+      if (!raw || !Array.isArray(raw.levels) || raw.levels.length !== 2) return null;
+      const norm = (arr: any[]): CmpLevel[] =>
+        (Array.isArray(arr) ? arr : []).map((l: any) => ({ px: Number(l.px), sz: Number(l.sz), n: Number(l.n ?? 0) }));
+      return { bids: norm(raw.levels[0]), asks: norm(raw.levels[1]) };
+    },
+  },
+};
+
+router.get('/orderbook-compare/:coin', async (req: Request, res: Response) => {
+  const coinParam = String(req.params.coin || '').toUpperCase();
+  const coin = coinParam.endsWith('-USD') ? coinParam : `${coinParam}-USD`;
+  const base = coin.replace('-USD', '');
+
+  // Only BULK's live markets (keeps parity with /orderbook and avoids arbitrary input).
+  const allowed = await getActiveSymbols();
+  if (!allowed.includes(coin)) {
+    return res.status(400).json({ error: `Unsupported market: ${coinParam}` });
+  }
+
+  const requested = String(req.query.venues ?? 'hyperliquid')
+    .split(',').map((s) => s.trim().toLowerCase()).filter((v) => v in CMP_VENUES);
+  const venues = requested.length ? requested : ['hyperliquid'];
+  const cacheKey = `analytics:ob-compare:${base}:${venues.join('+')}`;
+
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
+  const results = await Promise.all(venues.map(async (id) => {
+    const v = CMP_VENUES[id];
+    try {
+      const book = await v.fetchBook(v.symbol(base));
+      if (!book || book.bids.length === 0 || book.asks.length === 0) {
+        return { id, label: v.label, ok: false as const };
+      }
+      return {
+        id, label: v.label, ok: true as const, takerBps: v.takerBps,
+        bids: book.bids, asks: book.asks, stats: computeBookStats(book.bids, book.asks),
+      };
+    } catch {
+      return { id, label: v.label, ok: false as const };
+    }
+  }));
+
+  const result = { coin, base, venues: results };
+  await setCache(cacheKey, result, 2); // 2s TTL, same as /orderbook
+  res.json(result);
+});
+
 // ============ RISK SURFACES (margin model per coin) ============
 
 // Proxy BULK's /riskSurfaces with caching. The upstream response is heavy
