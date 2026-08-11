@@ -2517,7 +2517,10 @@ router.get('/orderbook/:coin', async (req: Request, res: Response) => {
     return res.status(400).json({ error: `Unsupported market: ${coinParam}` });
   }
 
-  const nlevels = Math.max(1, Math.min(50, parseInt(String(req.query.nlevels ?? '20'), 10) || 20));
+  // Cap raised to 1000 so the depth/impact tools can walk deep into the book
+  // (the ladder still only renders the top ~20). BULK returns however many real
+  // levels exist, so this is an upper bound, not a guarantee.
+  const nlevels = Math.max(1, Math.min(1000, parseInt(String(req.query.nlevels ?? '20'), 10) || 20));
   const cacheKey = `analytics:orderbook:${coin}:${nlevels}`;
 
   const cached = await getCache<unknown>(cacheKey);
