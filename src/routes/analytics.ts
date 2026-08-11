@@ -2681,6 +2681,71 @@ const CMP_VENUES: Record<string, {
       return { bids: norm(raw.levels[0]), asks: norm(raw.levels[1]) };
     },
   },
+  binance: {
+    label: 'Binance',
+    takerBps: 5, // USDT-M futures taker 0.05% (regular tier)
+    symbol: (b) => `${b}USDT`,
+    fetchBook: async (sym) => {
+      // [["px","qty"],…] tuples; bids come best-first (desc), asks best-first (asc).
+      const raw = await fetchJsonTimeout(
+        `https://fapi.binance.com/fapi/v1/depth?symbol=${encodeURIComponent(sym)}&limit=1000`,
+        undefined, 4000,
+      );
+      if (!raw || !Array.isArray(raw.bids) || !Array.isArray(raw.asks)) return null;
+      const norm = (arr: any[]): CmpLevel[] =>
+        arr.map((t: any) => ({ px: Number(t[0]), sz: Number(t[1]), n: 0 }));
+      return { bids: norm(raw.bids), asks: norm(raw.asks) };
+    },
+  },
+  bybit: {
+    label: 'Bybit',
+    takerBps: 5.5, // linear perp taker 0.055% (regular tier)
+    symbol: (b) => `${b}USDT`,
+    fetchBook: async (sym) => {
+      // v5 orderbook: result.b / result.a as [["px","sz"],…], best-first. Max limit 500.
+      const raw = await fetchJsonTimeout(
+        `https://api.bybit.com/v5/market/orderbook?category=linear&symbol=${encodeURIComponent(sym)}&limit=500`,
+        undefined, 4000,
+      );
+      const r = raw?.result;
+      if (!r || !Array.isArray(r.b) || !Array.isArray(r.a)) return null;
+      const norm = (arr: any[]): CmpLevel[] =>
+        arr.map((t: any) => ({ px: Number(t[0]), sz: Number(t[1]), n: 0 }));
+      return { bids: norm(r.b), asks: norm(r.a) };
+    },
+  },
+  lighter: {
+    label: 'Lighter',
+    takerBps: 0, // Lighter runs zero-fee trading for standard accounts
+    symbol: (b) => b,
+    fetchBook: async (sym) => {
+      // Lighter keys books by numeric market_id. Static map for the majors BULK
+      // shares with it; other coins simply aren't comparable there. Endpoint
+      // returns PER-ORDER rows (best-first, max limit 100/side) which we
+      // aggregate into per-price levels to match everyone else's shape.
+      const LIGHTER_MARKETS: Record<string, number> = { ETH: 0, BTC: 1, SOL: 2 };
+      const id = LIGHTER_MARKETS[sym];
+      if (id == null) return null;
+      const raw = await fetchJsonTimeout(
+        `https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders?market_id=${id}&limit=100`,
+        undefined, 4000,
+      );
+      if (!raw || !Array.isArray(raw.bids) || !Array.isArray(raw.asks)) return null;
+      const agg = (orders: any[], desc: boolean): CmpLevel[] => {
+        const map = new Map<number, CmpLevel>();
+        for (const o of orders) {
+          const px = Number(o.price);
+          const sz = Number(o.remaining_base_amount);
+          if (!isFinite(px) || !isFinite(sz) || sz <= 0) continue;
+          const cur = map.get(px) ?? { px, sz: 0, n: 0 };
+          cur.sz += sz; cur.n += 1;
+          map.set(px, cur);
+        }
+        return [...map.values()].sort((a, b) => (desc ? b.px - a.px : a.px - b.px));
+      };
+      return { bids: agg(raw.bids, true), asks: agg(raw.asks, false) };
+    },
+  },
 };
 
 router.get('/orderbook-compare/:coin', async (req: Request, res: Response) => {
