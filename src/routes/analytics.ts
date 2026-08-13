@@ -2669,16 +2669,47 @@ const CMP_VENUES: Record<string, {
     label: 'Hyperliquid',
     takerBps: 3.5, // HL public perp taker ~0.035%
     symbol: (b) => b,
+    // HL's l2Book always returns 20 levels, but `nSigFigs` changes the PRICE
+    // granularity: finest reaches ~±0.03% ($8M), nSigFigs=2 reaches ~±30%
+    // ($470M). To reconstruct a deep book we fetch several granularities and
+    // stitch them — finest near mid, each coarser one contributing only the
+    // price range BEYOND the previous (so near-mid liquidity isn't counted
+    // twice). Result: fine resolution at the touch, coarse buckets in the tail.
     fetchBook: async (sym) => {
-      const raw = await fetchJsonTimeout(
-        'https://api.hyperliquid.xyz/info',
-        { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'l2Book', coin: sym }) },
-        4000,
-      );
-      if (!raw || !Array.isArray(raw.levels) || raw.levels.length !== 2) return null;
+      const GRANS: (number | undefined)[] = [undefined, 4, 3, 2]; // finest → coarsest
+      const books = await Promise.all(GRANS.map((sf) =>
+        fetchJsonTimeout(
+          'https://api.hyperliquid.xyz/info',
+          {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(sf ? { type: 'l2Book', coin: sym, nSigFigs: sf } : { type: 'l2Book', coin: sym }),
+          },
+          4000,
+        ),
+      ));
       const norm = (arr: any[]): CmpLevel[] =>
         (Array.isArray(arr) ? arr : []).map((l: any) => ({ px: Number(l.px), sz: Number(l.sz), n: Number(l.n ?? 0) }));
-      return { bids: norm(raw.levels[0]), asks: norm(raw.levels[1]) };
+      // Per side, walk finest→coarsest and keep only levels strictly deeper than
+      // the deepest price already included (isBid: deeper = lower price).
+      const stitch = (arrays: CmpLevel[][], isBid: boolean): CmpLevel[] => {
+        const out: CmpLevel[] = [];
+        let bound: number | null = null;
+        for (const arr of arrays) {
+          for (const lvl of arr) {
+            if (bound === null || (isBid ? lvl.px < bound : lvl.px > bound)) out.push(lvl);
+          }
+          if (arr.length) {
+            const deepest = arr[arr.length - 1].px;
+            bound = bound === null ? deepest : isBid ? Math.min(bound, deepest) : Math.max(bound, deepest);
+          }
+        }
+        return out;
+      };
+      const valid = books.filter((b) => b && Array.isArray(b.levels) && b.levels.length === 2);
+      if (valid.length === 0) return null;
+      const bidArrays = valid.map((b) => norm(b.levels[0]));
+      const askArrays = valid.map((b) => norm(b.levels[1]));
+      return { bids: stitch(bidArrays, true), asks: stitch(askArrays, false) };
     },
   },
   binance: {
