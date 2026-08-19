@@ -152,14 +152,24 @@ async function fetchTickersForStats(): Promise<{ volume24h: number; openInterest
 
 // Get ticker data (includes fundingRate and openInterest)
 router.get('/ticker/:symbol', async (req: Request, res: Response) => {
-  const { symbol } = req.params;
-  
+  // Normalize to BULK's `<BASE>-USD` symbol form. Callers pass either the bare
+  // coin ("BTC") or the full market ("BTC-USD"); a bare coin was previously
+  // forwarded as-is and BULK answered 404.
+  const raw = String(req.params.symbol || '').toUpperCase();
+  const symbol = raw.endsWith('-USD') ? raw : `${raw}-USD`;
+  const cacheKey = `analytics:ticker:${symbol}`;
+
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
   try {
     const response = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
     if (!response.ok) {
       throw new Error(`BULK API returned ${response.status}`);
     }
     const data = await response.json();
+    // Short TTL to keep the ticker fresh while shielding BULK from repeated hits.
+    await setCache(cacheKey, data, 5);
     res.json(data);
   } catch (error) {
     console.error('Error fetching ticker:', error);
@@ -2505,6 +2515,87 @@ router.get('/adl-summary', async (req: Request, res: Response) => {
 // Any market BULK has listed is valid — the whitelist is resolved at request
 // time from /exchangeInfo (via the shared getActiveSymbols helper) rather
 // than being a hardcoded list, so new coins become queryable automatically.
+// --- Single-flight + last-good store for the order-book proxy --------------
+// Concurrent cache misses for the same (coin, nlevels) share ONE upstream fetch
+// instead of each firing its own request at BULK. Without this, when several
+// users are on the page and the cache entry expires, their polls stampede BULK
+// simultaneously and trip its per-IP 429 rate limit — which surfaced on the
+// page as "Upstream order book unavailable".
+const obInflight = new Map<string, Promise<any>>();
+// Last successful book per cache key, kept far longer than the cache TTL so we
+// can serve a slightly-stale book (flagged `stale`) while BULK is throttling us
+// rather than showing the page an error.
+const obLastGood = new Map<string, { result: any; at: number }>();
+const OB_STALE_MAX_MS = 5 * 60_000; // never serve a book older than 5 minutes
+
+// Fetch BULK's /l2book and fold it into our normalized snapshot shape. Throws on
+// any upstream/parse failure so the caller can decide whether to serve stale.
+async function loadOrderBook(coin: string, nlevels: number): Promise<any> {
+  const url = `${BULK_API_BASE}/l2book?type=l2book&coin=${encodeURIComponent(coin)}&nlevels=${nlevels}`;
+  const upstream = await bulkFetch(url);
+  if (!upstream.ok) throw new Error(`BULK /l2book returned ${upstream.status}`);
+  const raw: any = await upstream.json();
+  // Validate shape defensively — BULK's docs say `levels: [bids, asks]`.
+  if (!raw || !Array.isArray(raw.levels) || raw.levels.length !== 2) {
+    throw new Error(`malformed /l2book shape: ${JSON.stringify(raw).slice(0, 120)}`);
+  }
+
+  const bids = Array.isArray(raw.levels[0]) ? raw.levels[0] : [];
+  const asks = Array.isArray(raw.levels[1]) ? raw.levels[1] : [];
+
+  // Compute derived stats here so the frontend doesn't have to redo math on
+  // every refresh. All values are USD-quoted (BULK markets are USD quote).
+  const bestBid = bids[0] ? { px: Number(bids[0].px), sz: Number(bids[0].sz), n: Number(bids[0].n) } : null;
+  const bestAsk = asks[0] ? { px: Number(asks[0].px), sz: Number(asks[0].sz), n: Number(asks[0].n) } : null;
+
+  let mid: number | null = null;
+  let spreadAbs: number | null = null;
+  let spreadBps: number | null = null;
+  if (bestBid && bestAsk) {
+    mid = (bestBid.px + bestAsk.px) / 2;
+    spreadAbs = bestAsk.px - bestBid.px;
+    spreadBps = mid > 0 ? (spreadAbs / mid) * 10000 : null;
+  }
+
+  // Depth within ±2% of mid (notional USD).
+  const depth2pct = (() => {
+    if (!mid) return { bid: 0, ask: 0 };
+    const lo = mid * 0.98, hi = mid * 1.02;
+    const bidUsd = bids
+      .filter((l: any) => Number(l.px) >= lo)
+      .reduce((s: number, l: any) => s + Number(l.px) * Number(l.sz), 0);
+    const askUsd = asks
+      .filter((l: any) => Number(l.px) <= hi)
+      .reduce((s: number, l: any) => s + Number(l.px) * Number(l.sz), 0);
+    return { bid: bidUsd, ask: askUsd };
+  })();
+
+  // Book imbalance: fraction of total ±2% depth on the bid side, rebased to
+  // [-1, +1] where +1 = all bids, -1 = all asks, 0 = balanced.
+  const totalDepth = depth2pct.bid + depth2pct.ask;
+  const imbalance = totalDepth > 0 ? (depth2pct.bid - depth2pct.ask) / totalDepth : 0;
+
+  return {
+    symbol: raw.symbol || coin,
+    updateType: raw.updateType || 'snapshot',
+    // BULK returns nanoseconds despite the docs saying ms. Normalize to ms here
+    // so the client has a single time format to deal with.
+    timestamp: typeof raw.timestamp === 'number' ? Math.floor(raw.timestamp / 1_000_000) : Date.now(),
+    bids: bids.map((l: any) => ({ px: Number(l.px), sz: Number(l.sz), n: Number(l.n) })),
+    asks: asks.map((l: any) => ({ px: Number(l.px), sz: Number(l.sz), n: Number(l.n) })),
+    stats: {
+      bestBid,
+      bestAsk,
+      mid,
+      spreadAbs,
+      spreadBps,
+      bidDepth2pctUsd: depth2pct.bid,
+      askDepth2pctUsd: depth2pct.ask,
+      imbalance,
+    },
+  };
+}
+
 router.get('/orderbook/:coin', async (req: Request, res: Response) => {
   const coinParam = String(req.params.coin || '').toUpperCase();
   const coin = coinParam.endsWith('-USD') ? coinParam : `${coinParam}-USD`;
@@ -2524,90 +2615,40 @@ router.get('/orderbook/:coin', async (req: Request, res: Response) => {
   const cacheKey = `analytics:orderbook:${coin}:${nlevels}`;
 
   const cached = await getCache<unknown>(cacheKey);
-  if (cached) {
-    return res.json(cached);
-  }
+  if (cached) return res.json(cached);
 
   try {
-    const url = `${BULK_API_BASE}/l2book?type=l2book&coin=${encodeURIComponent(coin)}&nlevels=${nlevels}`;
-    const upstream = await bulkFetch(url);
-    if (!upstream.ok) {
-      console.error(`BULK /l2book returned ${upstream.status} for ${coin}`);
-      return res.status(502).json({ error: 'Upstream order book unavailable' });
+    // Coalesce concurrent misses: the first request kicks off the upstream fetch
+    // and stashes its promise; everyone else awaits that same promise instead of
+    // launching their own call at BULK.
+    let inflight = obInflight.get(cacheKey);
+    if (!inflight) {
+      inflight = (async () => {
+        try {
+          const result = await loadOrderBook(coin, nlevels);
+          // 5s TTL — books move fast, but paired with single-flight this caps
+          // BULK to ~1 request per 5s per market no matter how many users poll.
+          await setCache(cacheKey, result, 5);
+          obLastGood.set(cacheKey, { result, at: Date.now() });
+          return result;
+        } finally {
+          obInflight.delete(cacheKey);
+        }
+      })();
+      obInflight.set(cacheKey, inflight);
     }
-    const raw: any = await upstream.json();
-
-    // Validate shape defensively — BULK's docs say `levels: [bids, asks]` and we
-    // want to fail loudly rather than push a malformed payload to the client.
-    if (!raw || !Array.isArray(raw.levels) || raw.levels.length !== 2) {
-      console.error('Unexpected /l2book shape:', JSON.stringify(raw).slice(0, 200));
-      return res.status(502).json({ error: 'Malformed upstream response' });
-    }
-
-    const bids = Array.isArray(raw.levels[0]) ? raw.levels[0] : [];
-    const asks = Array.isArray(raw.levels[1]) ? raw.levels[1] : [];
-
-    // Compute derived stats here so the frontend doesn't have to redo math on
-    // every refresh. All values are USD-quoted (BULK markets are USD quote).
-    const bestBid = bids[0] ? { px: Number(bids[0].px), sz: Number(bids[0].sz), n: Number(bids[0].n) } : null;
-    const bestAsk = asks[0] ? { px: Number(asks[0].px), sz: Number(asks[0].sz), n: Number(asks[0].n) } : null;
-
-    let mid: number | null = null;
-    let spreadAbs: number | null = null;
-    let spreadBps: number | null = null;
-    if (bestBid && bestAsk) {
-      mid = (bestBid.px + bestAsk.px) / 2;
-      spreadAbs = bestAsk.px - bestBid.px;
-      spreadBps = mid > 0 ? (spreadAbs / mid) * 10000 : null;
-    }
-
-    // Depth within ±2% of mid (notional USD).
-    const depth2pct = (() => {
-      if (!mid) return { bid: 0, ask: 0 };
-      const lo = mid * 0.98, hi = mid * 1.02;
-      const bidUsd = bids
-        .filter((l: any) => Number(l.px) >= lo)
-        .reduce((s: number, l: any) => s + Number(l.px) * Number(l.sz), 0);
-      const askUsd = asks
-        .filter((l: any) => Number(l.px) <= hi)
-        .reduce((s: number, l: any) => s + Number(l.px) * Number(l.sz), 0);
-      return { bid: bidUsd, ask: askUsd };
-    })();
-
-    // Book imbalance: fraction of total ±2% depth on the bid side, rebased to
-    // [-1, +1] where +1 = all bids, -1 = all asks, 0 = balanced.
-    const totalDepth = depth2pct.bid + depth2pct.ask;
-    const imbalance = totalDepth > 0 ? (depth2pct.bid - depth2pct.ask) / totalDepth : 0;
-
-    const result = {
-      symbol: raw.symbol || coin,
-      updateType: raw.updateType || 'snapshot',
-      // BULK returns nanoseconds despite the docs saying ms. Normalize to ms
-      // here so the client has a single time format to deal with.
-      timestamp: typeof raw.timestamp === 'number'
-        ? Math.floor(raw.timestamp / 1_000_000)
-        : Date.now(),
-      bids: bids.map((l: any) => ({ px: Number(l.px), sz: Number(l.sz), n: Number(l.n) })),
-      asks: asks.map((l: any) => ({ px: Number(l.px), sz: Number(l.sz), n: Number(l.n) })),
-      stats: {
-        bestBid,
-        bestAsk,
-        mid,
-        spreadAbs,
-        spreadBps,
-        bidDepth2pctUsd: depth2pct.bid,
-        askDepth2pctUsd: depth2pct.ask,
-        imbalance,
-      },
-    };
-
-    // 2-second TTL — order books move fast, but not so fast that a cached copy
-    // for 2 seconds will mislead anyone. Prevents thundering herd against BULK.
-    await setCache(cacheKey, result, 2);
-    res.json(result);
+    return res.json(await inflight);
   } catch (error) {
-    console.error('Error fetching order book:', error);
-    res.status(500).json({ error: 'Failed to fetch order book' });
+    // Upstream failed (typically BULK 429 rate-limiting our IP). Serve the last
+    // good book, flagged `stale`, so the page keeps rendering a book instead of
+    // an error. Only fall through to 502 if we have nothing recent to show.
+    const lg = obLastGood.get(cacheKey);
+    if (lg && Date.now() - lg.at < OB_STALE_MAX_MS) {
+      console.warn(`Serving stale order book for ${coin}: ${(error as Error).message}`);
+      return res.json({ ...lg.result, stale: true, staleAgeMs: Date.now() - lg.at });
+    }
+    console.error(`Order book unavailable for ${coin}: ${(error as Error).message}`);
+    return res.status(502).json({ error: 'Upstream order book unavailable' });
   }
 });
 
