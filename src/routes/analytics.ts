@@ -2608,10 +2608,13 @@ router.get('/orderbook/:coin', async (req: Request, res: Response) => {
     return res.status(400).json({ error: `Unsupported market: ${coinParam}` });
   }
 
-  // Cap raised to 1000 so the depth/impact tools can walk deep into the book
-  // (the ladder still only renders the top ~20). BULK returns however many real
-  // levels exist, so this is an upper bound, not a guarantee.
-  const nlevels = Math.max(1, Math.min(1000, parseInt(String(req.query.nlevels ?? '20'), 10) || 20));
+  // BULK's public /l2book hard-caps at 20 levels: nlevels>20 now returns HTTP
+  // 429 (this used to return ~130 real levels). We accept whatever the client
+  // asks for but clamp the actual upstream request to BULK's real ceiling, so
+  // the deep depth/impact tools degrade to 20 levels instead of erroring out.
+  // (A deeper book would require reconstructing it from BULK's l2book WS feed.)
+  const BULK_MAX_LEVELS = 20;
+  const nlevels = Math.max(1, Math.min(BULK_MAX_LEVELS, parseInt(String(req.query.nlevels ?? '20'), 10) || 20));
   const cacheKey = `analytics:orderbook:${coin}:${nlevels}`;
 
   const cached = await getCache<unknown>(cacheKey);
