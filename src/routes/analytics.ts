@@ -3,7 +3,7 @@ import { query } from '../db';
 import { getCache, setCache, swrCache } from '../services/cache';
 import { getActiveSymbols } from '../services/markets';
 import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coinShape';
-import { filterOutSystemWallets } from '../services/systemWallets';
+import { filterOutSystemWallets, SYSTEM_WALLET_ADDRESSES } from '../services/systemWallets';
 import { bulkFetch } from '../services/bulkAuth';
 import { getRequestNetwork } from '../services/networkContext';
 
@@ -2069,12 +2069,16 @@ router.get('/liquidations/featured', async (req: Request, res: Response) => {
       return res.json(cached);
     }
 
-    let whereClause = 'WHERE timestamp > NOW() - INTERVAL \'7 days\'';
-    const params: any[] = [];
-    
+    // Exclude system wallets (notably the liquidation engine) so the featured
+    // list shows the actual liquidated parties, not the protocol counterparty
+    // that appears on every liquidation. Done in SQL because the engine's rows
+    // otherwise dominate the top of an ORDER BY value DESC.
+    let whereClause = 'WHERE timestamp > NOW() - INTERVAL \'7 days\' AND wallet_address <> ALL($1::varchar[])';
+    const params: any[] = [SYSTEM_WALLET_ADDRESSES];
+
     if (symbol && symbol !== 'ALL') {
       const dbSymbol = symbol.includes('-') ? symbol : `${symbol}-USD`;
-      whereClause += ' AND symbol = $1';
+      whereClause += ' AND symbol = $2';
       params.push(dbSymbol);
     }
 

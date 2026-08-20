@@ -4,6 +4,7 @@ import { bulkApi } from '../services/bulkApi';
 import { getActiveSymbols } from '../services/markets';
 import { bulkFetch } from '../services/bulkAuth';
 import { publishMarketUpdate } from '../services/marketStream';
+import { isSystemWallet } from '../services/systemWallets';
 
 const WS_URL = process.env.BULK_WS_URL || 'wss://exchange-ws1.bulk.trade';
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
@@ -701,10 +702,15 @@ function processMessage(data: WebSocket.Data): void {
             time,
           });
         } else if (isLiquidation) {
-          // IMPORTANT: Only record the TAKER - they are the liquidated party
-          // The maker is just a counterparty filling the liquidation order
-          // Per BULK API docs: taker = liquidated user, reason = "liquidation"
-          if (taker) {
+          // Record the TAKER — the liquidated party. BULK emits BOTH sides of a
+          // liquidation fill as separate reason="liquidation" prints: one where
+          // the taker is the real liquidated user, and one where the taker is the
+          // liquidation engine (the protocol account taking over the position).
+          // Recording the engine side makes it a phantom "liquidated party" on
+          // every liquidation, so skip any fill whose taker is a system wallet.
+          if (taker && isSystemWallet(taker)) {
+            console.log(`⏭️ LIQUIDATION skipped (engine side): ${side} ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
+          } else if (taker) {
             console.log(`🔥 LIQUIDATION detected: ${side} ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
             recordLiquidation({
               symbol,
