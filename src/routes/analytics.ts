@@ -2843,27 +2843,30 @@ router.get('/orderbook-compare/:coin', async (req: Request, res: Response) => {
   const venues = requested.length ? requested : ['hyperliquid'];
   const cacheKey = `analytics:ob-compare:${base}:${venues.join('+')}`;
 
-  const cached = await getCache<unknown>(cacheKey);
-  if (cached) return res.json(cached);
-
-  const results = await Promise.all(venues.map(async (id) => {
-    const v = CMP_VENUES[id];
-    try {
-      const book = await v.fetchBook(v.symbol(base));
-      if (!book || book.bids.length === 0 || book.asks.length === 0) {
+  // This is our heaviest OUTBOUND path: each request fans out to up to 4 external
+  // exchange APIs (Hyperliquid/Binance/Bybit/Lighter). Route it through swrCache
+  // so concurrent misses share ONE fan-out (single-flight) and a brief stale copy
+  // is served while it refreshes — otherwise N users on the page each hammer all
+  // four venues every few seconds from one datacenter IP, which reads as scraping.
+  const result = await swrCache(cacheKey, 3, async () => {
+    const results = await Promise.all(venues.map(async (id) => {
+      const v = CMP_VENUES[id];
+      try {
+        const book = await v.fetchBook(v.symbol(base));
+        if (!book || book.bids.length === 0 || book.asks.length === 0) {
+          return { id, label: v.label, ok: false as const };
+        }
+        return {
+          id, label: v.label, ok: true as const, takerBps: v.takerBps,
+          bids: book.bids, asks: book.asks, stats: computeBookStats(book.bids, book.asks),
+        };
+      } catch {
         return { id, label: v.label, ok: false as const };
       }
-      return {
-        id, label: v.label, ok: true as const, takerBps: v.takerBps,
-        bids: book.bids, asks: book.asks, stats: computeBookStats(book.bids, book.asks),
-      };
-    } catch {
-      return { id, label: v.label, ok: false as const };
-    }
-  }));
+    }));
+    return { coin, base, venues: results };
+  });
 
-  const result = { coin, base, venues: results };
-  await setCache(cacheKey, result, 2); // 2s TTL, same as /orderbook
   res.json(result);
 });
 
