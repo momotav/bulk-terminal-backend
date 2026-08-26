@@ -58,6 +58,26 @@ export interface BulkFetchOpts {
   net?: NetworkId;
 }
 
+// BULK executor upgrades (API v1.0.18) pause transaction admission and return
+// `503 { error: { code: "UPGRADE_IN_PROGRESS" } }`, optionally with a
+// `Retry-After` header. The request was NOT processed, so it's safe to retry.
+// We ride out the blip with a bounded backoff instead of surfacing an error.
+const MAX_UPGRADE_RETRIES = 3;
+const MAX_RETRY_DELAY_MS = 5000;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Parse a `Retry-After` header (delta-seconds or HTTP-date) into ms, or null.
+function parseRetryAfterMs(res: Response): number | null {
+  const h = res.headers.get('retry-after');
+  if (!h) return null;
+  const secs = Number(h);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const at = Date.parse(h);
+  if (!Number.isNaN(at)) return Math.max(0, at - Date.now());
+  return null;
+}
+
 export async function bulkFetch(
   url: string | URL,
   init?: RequestInit,
@@ -76,10 +96,27 @@ export async function bulkFetch(
   const net = opts?.net ?? getRequestNetwork();
   const targetUrl = resolveBulkUrl(typeof url === 'string' ? url : url.toString(), net);
 
-  return fetch(targetUrl, {
-    ...init,
-    headers: mergedHeaders,
-  });
+  // Retry loop scoped to the documented `UPGRADE_IN_PROGRESS` 503 only. Any
+  // other status — including a 503 that isn't an upgrade — is returned to the
+  // caller untouched, so this can't mask real errors or double-run non-upgrade
+  // requests. Only string/JSON bodies are used here, so re-sending `init` is
+  // safe (no consumed streams).
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(targetUrl, { ...init, headers: mergedHeaders });
+    if (res.status !== 503 || attempt >= MAX_UPGRADE_RETRIES) return res;
+
+    let isUpgrade = false;
+    try {
+      isUpgrade = (await res.clone().text()).includes('UPGRADE_IN_PROGRESS');
+    } catch {
+      // If the body can't be read, treat it as a normal 503 and hand it back.
+    }
+    if (!isUpgrade) return res;
+
+    const delay = Math.min(parseRetryAfterMs(res) ?? 300 * 2 ** attempt, MAX_RETRY_DELAY_MS);
+    console.warn(`BULK upgrade in progress — retry ${attempt + 1}/${MAX_UPGRADE_RETRIES} in ${delay}ms`);
+    await sleep(delay);
+  }
 }
 
 // fetch() accepts headers in three formats: plain object, Headers instance,
