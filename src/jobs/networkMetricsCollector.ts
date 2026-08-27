@@ -32,6 +32,11 @@ async function snapshotThroughput(): Promise<void> {
   try {
     const t = getThroughput();
     if (!t) return;
+    // Don't record a snapshot when the explorer feed is disconnected or observed
+    // no blocks this window. Writing zeros would poison the historical
+    // percentiles/heatmap with fake "0 TPS / 0ms" rows (e.g. when BULK's explorer
+    // node is down). A genuine gap in the series is honest; fake zeros are not.
+    if (t.status === 'disconnected' || (t.sampleCount ?? 0) === 0) return;
     await query(
       `INSERT INTO network_metrics
          (network, tps, aps, block_time_ms, latest_round, sample_blocks, status)
