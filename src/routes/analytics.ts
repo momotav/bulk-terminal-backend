@@ -2121,12 +2121,11 @@ router.get('/liquidations/featured', async (req: Request, res: Response) => {
 router.get('/regime', async (req: Request, res: Response) => {
   const cacheKey = 'analytics:regime';
 
-  const cached = await getCache<any>(cacheKey);
-  if (cached) {
-    return res.json(cached);
-  }
-
   try {
+    // swrCache: coalesce concurrent misses into ONE rebuild. The rebuild fetches
+    // a ticker per active symbol, so without this each user hitting a cache miss
+    // re-runs the whole per-symbol loop against BULK.
+    const result = await swrCache(cacheKey, 10, async () => {
     // Fetch regime data for every market BULK has listed — new coins
     // automatically appear here once BULK starts returning regime fields.
     const symbols = await getActiveSymbols();
@@ -2158,13 +2157,13 @@ router.get('/regime', async (req: Request, res: Response) => {
       ? regimeData.reduce((sum, d) => sum + (d.regime || 0), 0) / regimeData.length
       : 0;
 
-    const result = {
+    return {
       timestamp: Date.now(),
       aggregateRegime: avgRegime,
       markets: regimeData
     };
+    });
 
-    await setCache(cacheKey, result, 10); // 10 second cache for live data
     res.json(result);
   } catch (error) {
     console.error('Error fetching regime data:', error);
