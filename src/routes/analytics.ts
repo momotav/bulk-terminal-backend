@@ -183,13 +183,12 @@ router.get('/ticker/:symbol', async (req: Request, res: Response) => {
 router.get('/exchange-stats', async (req: Request, res: Response) => {
   const cacheKey = 'analytics:exchange_stats';
   
-  // Check cache first (cache for 60 seconds — see setCache below for why)
-  const cached = await getCache<any>(cacheKey);
-  if (cached) {
-    return res.json(cached);
-  }
-  
   try {
+    // swrCache: single-flight + stale-while-revalidate. The rebuild fans out one
+    // kline series per active symbol (~10+ BULK calls) plus /stats and DB queries;
+    // deduping concurrent misses into ONE rebuild keeps the heavy (and fragile)
+    // klines fan-out from stampeding, no matter how many users load the dashboard.
+    const result = await swrCache(cacheKey, 60, async () => {
     let totalVolume24h = 0;
     let totalOpenInterest = 0;
     let timestamp = Date.now();
@@ -330,20 +329,15 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       liquidations24h = 0;
     }
     
-    const result = {
+    return {
       timestamp,
       volume24h: totalVolume24h,
       openInterest: totalOpenInterest,
       activeTraders,
       liquidations24h,
     };
-    
-    // Cache for 60 seconds. We now fetch one kline series per active
-    // symbol to compute true rolling 24h volume — that's ~10 BULK API
-    // calls per cold-cache request. 60s TTL keeps load on BULK low
-    // while still feeling near-real-time on the dashboard.
-    await setCache(cacheKey, result, 60);
-    
+    });
+
     res.json(result);
   } catch (error) {
     console.error('Error fetching exchange stats:', error);
