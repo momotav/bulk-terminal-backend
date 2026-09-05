@@ -13,6 +13,7 @@ import { startStakingIndexer } from './services/stakingIndexer';
 import { startBulkSolHistory } from './services/bulksolIndexer';
 
 import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
+import { startLeaderboardEnrichment } from './jobs/leaderboardEnrichment';
 import { startDevnetPoller } from './jobs/devnetPoller';
 import { initRedis, getCacheStats } from './services/cache';
 
@@ -347,6 +348,10 @@ async function start() {
   
   // Start WebSocket listener for live trades/liquidations
   startWebSocketListener();
+
+  // Enrich the PnL leaderboard from BULK account data for our top traders by
+  // volume (BULK's own indexer leaderboard is disabled — we build it ourselves).
+  startLeaderboardEnrichment();
 
   // The site is mainnet-only. The devnet poller and the explorer/network-metrics
   // collectors ingest NON-mainnet data (devnet tickers; the testnet-chain
