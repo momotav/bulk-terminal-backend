@@ -20,9 +20,12 @@
 // `services/networkContext.ts` for the request-scoped routing
 // mechanism.
 
-export type NetworkId = 'testnet' | 'devnet';
+export type NetworkId = 'mainnet' | 'testnet' | 'devnet';
 
-export const DEFAULT_NETWORK: NetworkId = 'testnet';
+// BULK went live on mainnet (v1.0.19, 2 Sep 2026). Mainnet is now the real
+// network and the site's default; testnet is the old Paper Trading competition,
+// kept reachable via ?net=testnet for debugging but no longer surfaced.
+export const DEFAULT_NETWORK: NetworkId = 'mainnet';
 
 interface NetworkConfig {
   // Trading REST API base. Callers pass full paths, so the base just
@@ -44,6 +47,15 @@ interface NetworkConfig {
 // hardcoded across the codebase prior to this change — keep them
 // identical so behavior is unchanged when `net=testnet` (or unset).
 const NETWORKS: Record<NetworkId, NetworkConfig> = {
+  mainnet: {
+    apiBase:      'https://mainnet-api1.bulk.trade/api/v1',
+    wsUrl:        'wss://mainnet-ws1.bulk.trade',
+    // Indexer + explorer: BULK has not published mainnet-specific hosts yet,
+    // so these still point at the shared endpoints. Split when BULK ships them.
+    indexerBase:  'https://indexer.bulk.trade/v1',
+    explorerHttp: 'http://64.130.50.69:12003',
+    explorerWs:   'ws://64.130.50.69:12004',
+  },
   testnet: {
     apiBase:      'https://exchange-api.bulk.trade/api/v1',
     wsUrl:        'wss://exchange-ws1.bulk.trade',
@@ -68,14 +80,16 @@ const NETWORKS: Record<NetworkId, NetworkConfig> = {
 // validation so every caller doesn't repeat the same defensive check.
 export function getNetworkConfig(net?: string | null): NetworkConfig {
   if (net === 'devnet') return NETWORKS.devnet;
-  return NETWORKS.testnet;
+  if (net === 'testnet') return NETWORKS.testnet;
+  return NETWORKS.mainnet;
 }
 
 // Coerces an arbitrary string into a valid NetworkId. Used in route
 // handlers that read `req.query.net`.
 export function parseNetworkId(value: unknown): NetworkId {
-  if (typeof value === 'string' && value === 'devnet') return 'devnet';
-  return DEFAULT_NETWORK;
+  if (value === 'devnet') return 'devnet';
+  if (value === 'testnet') return 'testnet';
+  return DEFAULT_NETWORK; // mainnet
 }
 
 // Rewrites a URL pointed at the testnet host to the target network's
@@ -93,13 +107,20 @@ export function parseNetworkId(value: unknown): NetworkId {
 // unchanged. This makes the function safe to call on any URL
 // (including third-party ones) without side effects.
 export function resolveBulkUrl(url: string, net?: NetworkId): string {
-  const target = net || DEFAULT_NETWORK;
+  const target = net || DEFAULT_NETWORK; // mainnet by default
+  // The URL literals hardcoded across the codebase point at the TESTNET host
+  // (exchange-api / exchange-ws1). We rewrite that host to the target network's
+  // equivalent. testnet is the no-op case; mainnet (the default now) and devnet
+  // rewrite. indexer.bulk.trade is NOT rewritten — BULK has not published a
+  // per-network indexer, so all networks share it for leaderboard/wallet data.
   if (target === 'testnet') return url;
-  // Only "devnet" remaining at this point.
+  if (target === 'mainnet') {
+    return url
+      .replace(/^https:\/\/exchange-api\.bulk\.trade/, 'https://mainnet-api1.bulk.trade')
+      .replace(/^wss:\/\/exchange-ws1\.bulk\.trade/, 'wss://mainnet-ws1.bulk.trade');
+  }
+  // devnet
   return url
     .replace(/^https:\/\/exchange-api\.bulk\.trade/, 'https://staging-api.bulk.trade')
     .replace(/^wss:\/\/exchange-ws1\.bulk\.trade/, 'wss://staging-ws.bulk.trade');
-  // Note: indexer.bulk.trade NOT rewritten — devnet shares the
-  // testnet indexer for now. Add the rewrite line when BULK ships a
-  // devnet indexer.
 }

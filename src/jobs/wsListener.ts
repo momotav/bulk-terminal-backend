@@ -6,7 +6,9 @@ import { bulkFetch } from '../services/bulkAuth';
 import { publishMarketUpdate } from '../services/marketStream';
 import { isSystemWallet } from '../services/systemWallets';
 
-const WS_URL = process.env.BULK_WS_URL || 'wss://exchange-ws1.bulk.trade';
+// Mainnet is the live network (v1.0.19). The box's .env may still override this
+// via BULK_WS_URL — keep that in sync with the network the indexer should track.
+const WS_URL = process.env.BULK_WS_URL || 'wss://mainnet-ws1.bulk.trade';
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
 let ws: WebSocket | null = null;
