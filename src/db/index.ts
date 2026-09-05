@@ -499,7 +499,7 @@ export async function initializeDatabase(): Promise<void> {
       CREATE TABLE IF NOT EXISTS network_metrics (
         id            SERIAL PRIMARY KEY,
         timestamp     TIMESTAMP DEFAULT NOW(),
-        network       VARCHAR(20) DEFAULT 'testnet',
+        network       VARCHAR(20) DEFAULT 'mainnet',
         tps           DECIMAL(14,4),
         aps           DECIMAL(14,4),
         block_time_ms DECIMAL(12,3),
@@ -524,7 +524,7 @@ export async function initializeDatabase(): Promise<void> {
       CREATE TABLE IF NOT EXISTS network_action_metrics (
         id          SERIAL PRIMARY KEY,
         timestamp   TIMESTAMP DEFAULT NOW(),
-        network     VARCHAR(20) DEFAULT 'testnet',
+        network     VARCHAR(20) DEFAULT 'mainnet',
         action_code VARCHAR(24) NOT NULL,
         op_count    BIGINT DEFAULT 0,
         tx_count    BIGINT DEFAULT 0
@@ -546,7 +546,7 @@ export async function initializeDatabase(): Promise<void> {
       CREATE TABLE IF NOT EXISTS network_block_metrics (
         id           SERIAL PRIMARY KEY,
         timestamp    TIMESTAMP DEFAULT NOW(),
-        network      VARCHAR(20) DEFAULT 'testnet',
+        network      VARCHAR(20) DEFAULT 'mainnet',
         blocks_seen  INTEGER,
         empty_blocks INTEGER,
         bt_p50       DECIMAL(12,3),
@@ -568,10 +568,12 @@ export async function initializeDatabase(): Promise<void> {
     `);
 
     // ---- Per-network tagging migration -------------------------------------
-    // Market-data tables get a `network` column so testnet and devnet data can
-    // coexist in one DB. Existing rows + the existing collector (which doesn't
-    // specify the column) default to 'testnet', so this is a no-op for current
-    // behavior. Idempotent: safe to run on every boot.
+    // Market-data tables carry a `network` column. Since BULK went mainnet
+    // (v1.0.19) the site is mainnet-only, so the column defaults to 'mainnet':
+    // collectors that don't specify it (the indexer) tag their rows 'mainnet',
+    // matching what the mainnet-scoped reads filter on. The block ALSO resets
+    // the default on any pre-existing column that was created as 'testnet' (the
+    // old default), so upgrading DBs self-heal. Idempotent: safe every boot.
     await client.query(`
       DO $$
       DECLARE t text;
@@ -579,7 +581,8 @@ export async function initializeDatabase(): Promise<void> {
         FOREACH t IN ARRAY ARRAY[
           'trades','ticker_snapshots','liquidations','adl_events',
           'daily_stats','daily_unique_traders','fee_snapshots',
-          'market_stats','traders','trader_snapshots'
+          'market_stats','traders','trader_snapshots',
+          'network_metrics','network_action_metrics','network_block_metrics'
         ]
         LOOP
           IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = t) THEN
@@ -589,8 +592,11 @@ export async function initializeDatabase(): Promise<void> {
             ) THEN
               EXECUTE format(
                 'ALTER TABLE %I ADD COLUMN network VARCHAR(16) NOT NULL DEFAULT %L',
-                t, 'testnet'
+                t, 'mainnet'
               );
+            ELSE
+              -- Column already exists (older DBs had it default 'testnet').
+              EXECUTE format('ALTER TABLE %I ALTER COLUMN network SET DEFAULT %L', t, 'mainnet');
             END IF;
           END IF;
         END LOOP;

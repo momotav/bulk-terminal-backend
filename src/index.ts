@@ -348,16 +348,21 @@ async function start() {
   // Start WebSocket listener for live trades/liquidations
   startWebSocketListener();
 
-  // Start devnet ticker poller (isolated; collects devnet OI/funding/regime
-  // into ticker_snapshots tagged network='devnet').
-  startDevnetPoller();
-
-  // Start explorer WS listener for live block/throughput metrics
-  startExplorerListener();
-
-  // Snapshot live throughput into network_metrics every 60s so the analytics
-  // Network page has historical block-time / throughput data (builds forward).
-  startNetworkMetricsCollector();
+  // The site is mainnet-only. The devnet poller and the explorer/network-metrics
+  // collectors ingest NON-mainnet data (devnet tickers; the testnet-chain
+  // explorer node), so they're disabled by default to keep only mainnet data in
+  // the DB. Re-enable when there's a real mainnet source:
+  //   - EXPLORER_ENABLED=true once BULK ships a mainnet explorer WS (and set
+  //     BULK_EXPLORER_WS_URL to it) — mainnet is not running one for its first
+  //     ~30 days (load).
+  //   - DEVNET_POLLER=true only if devnet views are needed again.
+  if (process.env.DEVNET_POLLER === 'true') {
+    startDevnetPoller();
+  }
+  if (process.env.EXPLORER_ENABLED === 'true') {
+    startExplorerListener();       // live block/throughput WS
+    startNetworkMetricsCollector(); // 60s snapshots into network_metrics
+  }
 
   // Start HTTP server
   app.listen(PORT, () => {
