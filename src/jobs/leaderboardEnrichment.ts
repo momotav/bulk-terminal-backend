@@ -51,6 +51,19 @@ async function enrichOnce(): Promise<void> {
             netPnl,
             wallet_address,
           ]);
+
+          // Snapshot open-position notional so "Whale Watch" (biggest positions)
+          // ranks from live account data. Same fetch we already made for PnL.
+          const positions = acc?.positions ?? [];
+          const totalNotional = positions.reduce(
+            (s, p) => s + Math.abs(Number((p as { notional?: number }).notional) || 0),
+            0
+          );
+          await query(
+            `INSERT INTO trader_snapshots (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [wallet_address, netPnl, m.unrealizedPnl || 0, positions.length, totalNotional]
+          );
           updated++;
         }
       } catch {
@@ -58,6 +71,12 @@ async function enrichOnce(): Promise<void> {
       }
       await new Promise((r) => setTimeout(r, SPACING_MS));
     }
+
+    // Bound the snapshot table: the whales query only looks back 24h.
+    await query(`DELETE FROM trader_snapshots WHERE timestamp < NOW() - INTERVAL '25 hours'`).catch(
+      () => {}
+    );
+
     console.log(`💹 Leaderboard PnL enrichment: updated ${updated}/${rows.length} traders`);
   } catch (e) {
     console.error('Leaderboard PnL enrichment failed:', (e as Error).message);
