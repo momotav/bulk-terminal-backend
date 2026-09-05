@@ -610,6 +610,20 @@ export async function initializeDatabase(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_adl_events_net_ts ON adl_events(network, timestamp);
     `);
 
+    // Lifetime trade counter. The trades table only retains ~2 days, so the
+    // "Total Trades" stat reads this single ever-incrementing row instead of
+    // COUNT(*). The WS listener bumps total_trades_since_baseline per batch; the
+    // /stats route reports baseline + since_baseline. This table was missing in
+    // the live DB, which is why Total Trades showed 0 — create + seed it here.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS global_stats (
+        id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        total_trades_baseline BIGINT NOT NULL DEFAULT 0,
+        total_trades_since_baseline BIGINT NOT NULL DEFAULT 0
+      );
+      INSERT INTO global_stats (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+    `);
+
     await client.query('COMMIT');
     console.log('✅ Database schema initialized');
     
