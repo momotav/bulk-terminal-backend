@@ -551,12 +551,21 @@ class BulkApiService {
         );
         return [];
       }
-      const data = await res.json() as unknown[];
+      const parsed = await res.json() as unknown;
       const results: RawRiskEvent[] = [];
 
-      // Production shape: [{ riskHistory: {...one event...} }, ...]
-      // Defensive: also handle flat [event, ...] and wrapped-array
-      // [{ riskHistory: [event, ...] }] in case BULK changes its mind.
+      // BULK v1.0.17 wraps history in a paged envelope { data: [...], page: {...} };
+      // older builds returned a bare array. Normalize both to a row array so the
+      // parsing below is shape-agnostic. (Without this, the envelope object failed
+      // the Array.isArray check and every wallet's liquidations came back empty.)
+      const data: unknown[] = Array.isArray(parsed)
+        ? parsed
+        : (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).data))
+          ? ((parsed as Record<string, unknown>).data as unknown[])
+          : [];
+
+      // Row shapes handled: flat [event, ...] (current, incl. the envelope's data
+      // rows), and wrapped [{ riskHistory: {...} | [...] }, ...] (older).
       if (Array.isArray(data)) {
         for (const raw of data) {
           if (!raw || typeof raw !== 'object') continue;
