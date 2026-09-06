@@ -12,6 +12,13 @@ const router = Router();
 // BULK API base URL
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
+// BULK's executor stores ONE-SIDED open interest: ΔOI = (Δ|buyer| + Δ|seller|)/2,
+// so /stats and ticker `openInterest` report a single side. The industry /
+// DefiLlama convention is total OI = long + short = 2× the one-sided value
+// (long OI = short OI = BULK OI). We surface the two-sided total everywhere OI
+// is displayed, so multiply BULK's OI by this at each output.
+const OI_SIDE_FACTOR = 2;
+
 // NOTE: the old `const MARKETS = ['BTC-USD', ...]` constant was removed.
 // Every caller now resolves the live market list via `getActiveSymbols()`
 // from `../services/markets`, so new coins listed on BULK appear here
@@ -332,7 +339,7 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     return {
       timestamp,
       volume24h: totalVolume24h,
-      openInterest: totalOpenInterest,
+      openInterest: totalOpenInterest * OI_SIDE_FACTOR, // two-sided (long+short)
       activeTraders,
       liquidations24h,
     };
@@ -393,7 +400,7 @@ router.get('/exchange-health', async (req: Request, res: Response) => {
     
     res.json({
       total_volume_24h: totalVolume24h,
-      total_open_interest: totalOI,
+      total_open_interest: totalOI * OI_SIDE_FACTOR, // two-sided (long+short)
       total_traders: parseInt(tradersResult[0]?.count || '0'),
       total_liquidations_24h: parseInt(liqResult[0]?.count || '0'),
       liquidation_value_24h: parseFloat(liqResult[0]?.volume || '0')
@@ -709,7 +716,7 @@ router.get('/open-interest-history/:symbol', async (req: Request, res: Response)
 
     const data = result.map((row: any) => ({
       timestamp: row.timestamp,
-      value: parseFloat(row.value || 0)
+      value: parseFloat(row.value || 0) * OI_SIDE_FACTOR // two-sided (long+short)
     }));
 
     const response = { symbol, hours, dataPoints: data.length, data };
@@ -875,10 +882,13 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
       return true;
     });
 
-    // Emit additive rows.
-    const out = data.map(d =>
-      buildAdditiveRow(d.timestamp, d.coinValues, { total: d.total })
-    );
+    // Emit additive rows. Scale to two-sided OI (long+short) here — AFTER the
+    // anomaly detection above, whose thresholds are tuned to BULK's raw values.
+    const out = data.map(d => {
+      const scaled: Record<string, number> = {};
+      for (const [c, v] of Object.entries(d.coinValues)) scaled[c] = v * OI_SIDE_FACTOR;
+      return buildAdditiveRow(d.timestamp, scaled, { total: d.total * OI_SIDE_FACTOR });
+    });
 
     const response = { hours, dataPoints: out.length, data: out };
 
@@ -1444,16 +1454,17 @@ router.get('/market-stats-bulk', async (req: Request, res: Response) => {
     const markets = (stats.markets || []).map(m => ({
       symbol: m.symbol,
       volume24h: m.quoteVolume || 0,
-      openInterest: (m.openInterest || 0) * (m.markPrice || m.lastPrice || 0),
+      // Two-sided OI (long+short). openInterestCoins stays BULK's raw one-sided.
+      openInterest: (m.openInterest || 0) * (m.markPrice || m.lastPrice || 0) * OI_SIDE_FACTOR,
       openInterestCoins: m.openInterest || 0,
       fundingRate: m.fundingRate || 0,
       price: m.markPrice || m.lastPrice || 0
     }));
-    
+
     res.json({
       timestamp: stats.timestamp,
       totalVolume24h: stats.volume?.totalUsd || 0,
-      totalOpenInterest: stats.openInterest?.totalUsd || 0,
+      totalOpenInterest: (stats.openInterest?.totalUsd || 0) * OI_SIDE_FACTOR, // two-sided
       markets,
       source: 'bulk-api'
     });
