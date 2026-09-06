@@ -503,73 +503,60 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
     // for 10-20s every time the 1h all-time TTL expired. With SWR the
     // only synchronous rebuild is the very first request after deploy.
     const result = await swrCache(cacheKey, isAllTime ? 3600 : 60, async () => {
-    const now = Date.now();
-    const startTime = isAllTime ? 0 : now - (hours * 60 * 60 * 1000);
-
-    // Fetch the live list of markets from BULK (via shared helper — cached 5
-    // min, falls back to known-good list). This replaces the old hardcoded
-    // ['BTC-USD', 'ETH-USD', 'SOL-USD'] so new coins appear automatically.
     const symbols = await getActiveSymbols();
-
-    // Fetch hourly klines for every market in parallel. Any that fail return
-    // an empty array so one bad coin doesn't take down the chart.
-    const klinesResults = await Promise.all(
-      symbols.map(symbol =>
-        bulkFetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
-          .then(r => r.ok ? r.json() : [])
-          .catch(() => [])
-      )
-    );
-
-    // Build a timestamp → { coin → volume_usd } map. Each symbol contributes
-    // its hourly notional volume (base_volume * close_price).
-    const hourlyMap = new Map<number, Record<string, number>>();
-
-    symbols.forEach((symbol, i) => {
-      const coin = coinFromSymbol(symbol);
-      const klines = klinesResults[i] as any[];
-      for (const k of klines) {
-        const ts = k.t;
-        if (!hourlyMap.has(ts)) hourlyMap.set(ts, zeroCoinDict(symbols));
-        // Hourly notional USD volume = base volume * close price
-        hourlyMap.get(ts)![coin] = (k.v || 0) * (k.c || 0);
-      }
-    });
-
-    // Roll up to hourly (1D view) or daily (W/M/ALL view).
-    let outputMap: Map<number, Record<string, number>>;
-    let historicalCumulative = 0;
+    const net = getRequestNetwork();
 
     const sumOfCoins = (dict: Record<string, number>): number =>
       Object.values(dict).reduce((s, v) => s + (typeof v === 'number' ? v : 0), 0);
 
+    // Volume comes from OUR indexed trades, NOT BULK klines. BULK's kline `v`
+    // (volume) field is unreliable/inflated (BTC-alone klines volume exceeded
+    // the all-markets /stats total), which made the chart nonsensical across
+    // timeframes. Daily bars read the persistent `daily_stats` rollup (which
+    // survives the trades table's short retention); the 1D view reads hourly
+    // volume straight from `trades`. Both are exact sums of real fills.
+    const outputMap = new Map<number, Record<string, number>>();
+
     if (hours <= 24) {
-      // Hourly bars for 1D view
-      outputMap = new Map();
-      const sortedHourly = Array.from(hourlyMap.entries()).sort((a, b) => a[0] - b[0]);
-      for (const [ts, vol] of sortedHourly) {
-        if (ts >= startTime) outputMap.set(ts, vol);
-        else historicalCumulative += sumOfCoins(vol);
+      const rows = await query<{ ts: string; symbol: string; volume: string }>(
+        `SELECT date_trunc('hour', timestamp) AS ts, symbol, SUM(value) AS volume
+         FROM trades
+         WHERE network = $1 AND timestamp >= NOW() - INTERVAL '24 hours'
+         GROUP BY 1, symbol ORDER BY 1 ASC`,
+        [net]
+      );
+      for (const r of rows) {
+        const tsMs = new Date(r.ts).getTime();
+        if (!outputMap.has(tsMs)) outputMap.set(tsMs, zeroCoinDict(symbols));
+        const coin = coinFromSymbol(r.symbol);
+        if (coin) outputMap.get(tsMs)![coin] = parseFloat(r.volume) || 0;
       }
     } else {
-      // Aggregate hourly into daily bars for W/M/ALL
-      const dailyMap = new Map<number, Record<string, number>>();
-      for (const [ts, vol] of hourlyMap.entries()) {
-        const date = new Date(ts);
-        const dayStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
-        if (!dailyMap.has(dayStart)) dailyMap.set(dayStart, zeroCoinDict(symbols));
-        const day = dailyMap.get(dayStart)!;
-        for (const [coin, v] of Object.entries(vol)) {
-          day[coin] = (day[coin] || 0) + v;
-        }
-      }
-      outputMap = new Map();
-      const sortedDaily = Array.from(dailyMap.entries()).sort((a, b) => a[0] - b[0]);
-      for (const [ts, vol] of sortedDaily) {
-        if (isAllTime || ts >= startTime) outputMap.set(ts, vol);
-        else historicalCumulative += sumOfCoins(vol);
+      const rows = await query<{ day: string; symbol: string; volume: string }>(
+        `SELECT day, symbol, SUM(volume) AS volume
+         FROM daily_stats
+         WHERE network = $1 ${isAllTime ? '' : "AND day >= (NOW() - ($2 || ' hours')::interval)::date"}
+         GROUP BY day, symbol ORDER BY day ASC`,
+        isAllTime ? [net] : [net, String(hours)]
+      );
+      for (const r of rows) {
+        const tsMs = new Date(r.day).getTime();
+        if (!outputMap.has(tsMs)) outputMap.set(tsMs, zeroCoinDict(symbols));
+        const coin = coinFromSymbol(r.symbol);
+        if (coin) outputMap.get(tsMs)![coin] = (outputMap.get(tsMs)![coin] || 0) + (parseFloat(r.volume) || 0);
       }
     }
+
+    // Anchor the cumulative line to the ALL-TIME total so it ends at the same
+    // value for every timeframe (1D/W/M/…) instead of resetting per window —
+    // that per-window reset is what made the cumulative look "crazy".
+    const allTimeRow = await query<{ total: string }>(
+      `SELECT COALESCE(SUM(volume), 0) AS total FROM daily_stats WHERE network = $1`,
+      [net]
+    );
+    const allTimeTotal = parseFloat(allTimeRow[0]?.total || '0');
+    const windowTotal = Array.from(outputMap.values()).reduce((s, v) => s + sumOfCoins(v), 0);
+    const historicalCumulative = Math.max(0, allTimeTotal - windowTotal);
 
     // Emit additive rows — legacy BTC/ETH/SOL fields + new `coins` dict.
     let cumulative = historicalCumulative;
