@@ -486,96 +486,88 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
 // ============ BULK API KLINES FOR CHARTS ============
 
 // Volume chart from BULK API klines (aggregated by symbol)
+// Shared klines volume snapshot — fetched ONCE and reused for EVERY timeframe.
+// The volume chart's cumulative was inconsistent across 1D/W/M because each
+// window fetched its own klines at a different moment (and BULK /klines returns
+// a rolling window), so the windowed data wasn't a clean subset of the all-time
+// data. Caching a single snapshot under ONE key makes every `hours` request a
+// consistent slice of the same data, so the cumulative agrees everywhere.
+// Cached as a serializable array (a Map wouldn't survive JSON) and rebuilt.
+async function getVolumeKlinesSnapshot(): Promise<{ hourly: Array<[number, Record<string, number>]>; allTimeTotal: number; symbols: string[] }> {
+  return swrCache('analytics:volume_klines_snapshot', 60, async () => {
+    const symbols = await getActiveSymbols();
+    const klinesResults = await Promise.all(
+      symbols.map(symbol =>
+        bulkFetch(`${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=1000`)
+          .then(r => (r.ok ? r.json() : []))
+          .catch(() => [])
+      )
+    );
+    const map = new Map<number, Record<string, number>>();
+    let allTimeTotal = 0;
+    symbols.forEach((symbol, i) => {
+      const coin = coinFromSymbol(symbol);
+      for (const k of (klinesResults[i] as any[])) {
+        const ts = k.t;
+        if (!map.has(ts)) map.set(ts, zeroCoinDict(symbols));
+        const v = (k.v || 0) * (k.c || 0); // hourly notional USD = base vol × close
+        map.get(ts)![coin] = v;
+        allTimeTotal += v;
+      }
+    });
+    return { hourly: Array.from(map.entries()), allTimeTotal, symbols };
+  });
+}
+
 router.get('/volume-chart-api', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
   const isAllTime = hours >= 8760; // 1 year or more = ALL time
 
-  // Cache check. Previously this endpoint hit BULK's /klines once per
-  // symbol on every call, which adds up fast on a page that fetches the
-  // 24h window AND the all-time window. With ~5 symbols × 1000 klines per
-  // call, the network and parse overhead was dominating page load.
-  const cacheKey = `analytics:volume_chart_api:${hours}`;
-
   try {
-    // SWR: serve stale data instantly and rebuild in the background.
-    // The rebuild fans out to BULK klines for every active symbol
-    // (~10 fetches × 1000 bars) and used to block one unlucky request
-    // for 10-20s every time the 1h all-time TTL expired. With SWR the
-    // only synchronous rebuild is the very first request after deploy.
-    const result = await swrCache(cacheKey, isAllTime ? 3600 : 60, async () => {
-    const symbols = await getActiveSymbols();
-    const net = getRequestNetwork();
+    // One shared klines snapshot for all timeframes (see helper above).
+    const snap = await getVolumeKlinesSnapshot();
+    const symbols = snap.symbols;
+    const hourlyMap = new Map<number, Record<string, number>>(snap.hourly);
+    const allTimeTotal = snap.allTimeTotal;
 
     const sumOfCoins = (dict: Record<string, number>): number =>
       Object.values(dict).reduce((s, v) => s + (typeof v === 'number' ? v : 0), 0);
 
-    // Volume comes from OUR indexed trades, NOT BULK klines. BULK's kline `v`
-    // (volume) field is unreliable/inflated (BTC-alone klines volume exceeded
-    // the all-markets /stats total), which made the chart nonsensical across
-    // timeframes. Daily bars read the persistent `daily_stats` rollup (which
-    // survives the trades table's short retention); the 1D view reads hourly
-    // volume straight from `trades`. Both are exact sums of real fills.
-    const outputMap = new Map<number, Record<string, number>>();
+    const now = Date.now();
+    const startTime = isAllTime ? 0 : now - hours * 60 * 60 * 1000;
 
+    // Window bars: hourly for the 1D view, rolled up to daily for W/M/ALL. Both
+    // are slices of the SAME shared snapshot, so they compose consistently.
+    const outputMap = new Map<number, Record<string, number>>();
     if (hours <= 24) {
-      const rows = await query<{ ts: string; symbol: string; volume: string }>(
-        `SELECT date_trunc('hour', timestamp) AS ts, symbol, SUM(value) AS volume
-         FROM trades
-         WHERE network = $1 AND timestamp >= NOW() - INTERVAL '24 hours'
-         GROUP BY 1, symbol ORDER BY 1 ASC`,
-        [net]
-      );
-      for (const r of rows) {
-        const tsMs = new Date(r.ts).getTime();
-        if (!outputMap.has(tsMs)) outputMap.set(tsMs, zeroCoinDict(symbols));
-        const coin = coinFromSymbol(r.symbol);
-        if (coin) outputMap.get(tsMs)![coin] = parseFloat(r.volume) || 0;
-      }
+      for (const [ts, vol] of hourlyMap) if (ts >= startTime) outputMap.set(ts, vol);
     } else {
-      const rows = await query<{ day: string; symbol: string; volume: string }>(
-        `SELECT day, symbol, SUM(volume) AS volume
-         FROM daily_stats
-         WHERE network = $1 ${isAllTime ? '' : "AND day >= (NOW() - ($2 || ' hours')::interval)::date"}
-         GROUP BY day, symbol ORDER BY day ASC`,
-        isAllTime ? [net] : [net, String(hours)]
-      );
-      for (const r of rows) {
-        const tsMs = new Date(r.day).getTime();
-        if (!outputMap.has(tsMs)) outputMap.set(tsMs, zeroCoinDict(symbols));
-        const coin = coinFromSymbol(r.symbol);
-        if (coin) outputMap.get(tsMs)![coin] = (outputMap.get(tsMs)![coin] || 0) + (parseFloat(r.volume) || 0);
+      const dailyMap = new Map<number, Record<string, number>>();
+      for (const [ts, vol] of hourlyMap) {
+        const d = new Date(ts);
+        const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+        if (!dailyMap.has(dayStart)) dailyMap.set(dayStart, zeroCoinDict(symbols));
+        const day = dailyMap.get(dayStart)!;
+        for (const [c, v] of Object.entries(vol)) day[c] = (day[c] || 0) + v;
       }
+      for (const [ts, vol] of dailyMap) if (isAllTime || ts >= startTime) outputMap.set(ts, vol);
     }
 
-    // Anchor the cumulative line to the ALL-TIME total so it ends at the same
-    // value for every timeframe (1D/W/M/…) instead of resetting per window —
-    // that per-window reset is what made the cumulative look "crazy".
-    const allTimeRow = await query<{ total: string }>(
-      `SELECT COALESCE(SUM(volume), 0) AS total FROM daily_stats WHERE network = $1`,
-      [net]
-    );
-    const allTimeTotal = parseFloat(allTimeRow[0]?.total || '0');
+    // Anchor the cumulative to the shared all-time total so its END value is the
+    // SAME for every timeframe — klines holds one fixed window, so "total volume"
+    // is a single number every view should agree on.
     const windowTotal = Array.from(outputMap.values()).reduce((s, v) => s + sumOfCoins(v), 0);
-    const historicalCumulative = Math.max(0, allTimeTotal - windowTotal);
+    let cumulative = Math.max(0, allTimeTotal - windowTotal);
 
-    // Emit additive rows — legacy BTC/ETH/SOL fields + new `coins` dict.
-    let cumulative = historicalCumulative;
     const data = Array.from(outputMap.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([ts, vol]) => {
         const total = sumOfCoins(vol);
         cumulative += total;
-        return buildAdditiveRow(
-          new Date(ts).toISOString(),
-          vol,
-          { total, Cumulative: cumulative }
-        );
+        return buildAdditiveRow(new Date(ts).toISOString(), vol, { total, Cumulative: cumulative });
       });
 
-    console.log(`📊 Volume chart (${isAllTime ? 'ALL' : hours + 'h'}): ${data.length} bars, ${symbols.length} coins, cumulative: $${(cumulative/1e9).toFixed(2)}B`);
-    return { data };
-    });
-    res.json(result);
+    res.json({ data });
   } catch (error) {
     console.error('Error fetching volume chart from API:', error);
     res.status(500).json({ error: 'Failed to fetch volume chart' });
