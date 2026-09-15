@@ -329,7 +329,16 @@ class BulkApiService {
         );
         return [];
       }
-      const data = await res.json() as unknown[];
+      const parsed = await res.json() as unknown;
+      // BULK v1.0.17 wraps history in a paged envelope { data: [...], page: {...} };
+      // older builds returned a bare array. Normalize both to a row array — without
+      // this the envelope object failed the Array.isArray check below and EVERY
+      // fill was dropped (the wallet PnL chart then collapsed to a single point).
+      const data: unknown[] = Array.isArray(parsed)
+        ? parsed
+        : (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).data))
+          ? ((parsed as Record<string, unknown>).data as unknown[])
+          : [];
       const results: unknown[] = [];
 
       // Real BULK fills response shape (verified from production logs):
