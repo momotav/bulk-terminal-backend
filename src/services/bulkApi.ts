@@ -255,10 +255,16 @@ class BulkApiService {
         body: JSON.stringify({ type: 'activityHistory', user: walletAddress }),
       });
       if (!res.ok) return [];
-      const data = await res.json() as AccountResponse[];
-      if (!Array.isArray(data)) return [];
-      return data
-        .map((row) => row.activityHistory)
+      const parsed = await res.json() as unknown;
+      // v1.0.17 paged envelope { data: [...], page } vs older bare array.
+      const rows: AccountResponse[] = Array.isArray(parsed)
+        ? (parsed as AccountResponse[])
+        : (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).data))
+          ? ((parsed as Record<string, unknown>).data as AccountResponse[])
+          : [];
+      return rows
+        // Envelope rows are flat events; older rows wrap under `activityHistory`.
+        .map((row) => (row && typeof row === 'object' && 'activityHistory' in row ? row.activityHistory : row) as ActivityEvent | undefined)
         .filter((e): e is ActivityEvent => Boolean(e));
     } catch (error) {
       console.error(`Failed to fetch activity history for ${walletAddress}:`, error);
@@ -441,13 +447,17 @@ class BulkApiService {
         );
         return [];
       }
-      const data = await res.json() as unknown[];
+      const parsed = await res.json() as unknown;
+      // v1.0.17 paged envelope { data: [...], page } vs older bare array.
+      const data: unknown[] = Array.isArray(parsed)
+        ? parsed
+        : (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).data))
+          ? ((parsed as Record<string, unknown>).data as unknown[])
+          : [];
       const results: unknown[] = [];
 
-      // Try the same three shapes we've seen on /fills. Likely BULK uses
-      // [{ position: {...} }] or [{ positions: [...] }] or flat
-      // [position, ...]. Once we see a real response in the logs, we can
-      // narrow this down.
+      // Envelope rows are flat positions; older shapes wrap under one of these
+      // keys ([{ position: {...} }] / [{ positions: [...] }]). Handle both.
       const wrapperKeys = ['position', 'positions', 'closedPosition'];
       if (Array.isArray(data)) {
         for (const raw of data) {
