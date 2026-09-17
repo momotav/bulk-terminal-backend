@@ -352,6 +352,70 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
   }
 });
 
+// Sparkline series for the dashboard KPI cards (24h Volume, Open Interest,
+// Active Traders, 24h Liquidations). Small trend arrays — enough to draw an
+// inline sparkline beside each headline number — plus a change % vs the start
+// of the series. All from our own indexed data, one call, so the four cards
+// stay consistent and cheap. Values are numbers only (no timestamps needed for
+// a sparkline). OI is two-sided (×2), matching the headline.
+router.get('/dashboard-sparklines', async (req: Request, res: Response) => {
+  const net = getRequestNetwork();
+  const cacheKey = `analytics:dashboard_sparklines:${net}`;
+  try {
+    const result = await swrCache(cacheKey, 60, async () => {
+      const nums = (rows: { v: string | number }[]) =>
+        rows.map((r) => Number(r.v)).filter((n) => Number.isFinite(n));
+      const changePct = (s: number[]) => {
+        const first = s.find((v) => v > 0);
+        const last = s.length ? s[s.length - 1] : 0;
+        return first && first > 0 ? ((last - first) / first) * 100 : null;
+      };
+
+      const [volRows, oiRows, dauRows, liqRows] = await Promise.all([
+        // 24h volume, hourly, from our fills.
+        query<{ v: string }>(
+          `SELECT SUM(value) AS v FROM trades
+           WHERE network = $1 AND timestamp > NOW() - INTERVAL '24 hours'
+           GROUP BY date_trunc('hour', timestamp) ORDER BY date_trunc('hour', timestamp) ASC`, [net]
+        ).catch(() => []),
+        // Open interest, hourly avg over 24h (two-sided applied after).
+        query<{ v: string }>(
+          `SELECT AVG(open_interest_usd) AS v FROM ticker_snapshots
+           WHERE network = $1 AND timestamp > NOW() - INTERVAL '24 hours'
+           GROUP BY date_trunc('hour', timestamp) ORDER BY date_trunc('hour', timestamp) ASC`, [net]
+        ).catch(() => []),
+        // Active traders, daily, last 14 days.
+        query<{ v: string }>(
+          `SELECT total_unique AS v FROM daily_unique_traders
+           WHERE day > NOW() - INTERVAL '14 days' ORDER BY day ASC`
+        ).catch(() => []),
+        // Liquidation value, daily, last 14 days (24h view is too sparse to draw).
+        query<{ v: string }>(
+          `SELECT COALESCE(SUM(value),0) AS v FROM liquidations
+           WHERE network = $1 AND timestamp > NOW() - INTERVAL '14 days'
+           GROUP BY date_trunc('day', timestamp) ORDER BY date_trunc('day', timestamp) ASC`, [net]
+        ).catch(() => []),
+      ]);
+
+      const vol = nums(volRows);
+      const oi = nums(oiRows).map((n) => n * OI_SIDE_FACTOR);
+      const dau = nums(dauRows);
+      const liq = nums(liqRows);
+
+      return {
+        volume24h: { series: vol, changePct: changePct(vol) },
+        openInterest: { series: oi, changePct: changePct(oi) },
+        activeTraders: { series: dau, changePct: changePct(dau) },
+        liquidations24h: { series: liq, changePct: changePct(liq) },
+      };
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching dashboard sparklines:', error);
+    res.status(500).json({ error: 'Failed to fetch dashboard sparklines' });
+  }
+});
+
 // Exchange health endpoint - combines BULK API + DB data
 router.get('/exchange-health', async (req: Request, res: Response) => {
   try {
