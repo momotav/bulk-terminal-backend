@@ -39,9 +39,18 @@ function netFullAccount(account: FullAccount): FullAccount {
     unrealizedPnl: p.unrealizedPnl || 0,
   }));
 
-  const m = account.margin || ({} as FullAccount['margin']);
+  const m = (account.margin || {}) as Record<string, number> & FullAccount['margin'];
+  // BULK mainnet (v1.0.19) renamed the margin balance fields:
+  //   totalBalance    -> totalMargin
+  //   availableBalance -> availableMargin
+  // Alias the new names back to the old ones the frontend reads, so Account
+  // Value / leverage / margin-usage populate instead of showing "$-".
+  const totalBalance = (m as any).totalBalance ?? (m as any).totalMargin ?? 0;
+  const availableBalance = (m as any).availableBalance ?? (m as any).availableMargin ?? 0;
   const netMargin = {
     ...m,
+    totalBalance,
+    availableBalance,
     realizedPnl: (m.realizedPnl || 0) + (m.fees || 0) + (m.funding || 0),
     unrealizedPnl: m.unrealizedPnl || 0,
   };
@@ -846,8 +855,9 @@ router.get('/:address/hierarchy', async (req: Request, res: Response) => {
           acc.positions?.reduce((s, p) => s + (p.unrealizedPnl || 0), 0) ??
           0;
         const summary = {
-          totalBalance: m?.totalBalance ?? 0,
-          availableBalance: m?.availableBalance ?? 0,
+          // v1.0.19 renamed totalBalance->totalMargin, availableBalance->availableMargin.
+          totalBalance: (m as any)?.totalBalance ?? (m as any)?.totalMargin ?? 0,
+          availableBalance: (m as any)?.availableBalance ?? (m as any)?.availableMargin ?? 0,
           marginUsed: m?.marginUsed ?? 0,
           // notional/unrealized/realized may not be on the margin object on all
           // BULK API versions — fall back to summing positions when missing.
