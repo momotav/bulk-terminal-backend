@@ -402,11 +402,19 @@ router.get('/dashboard-sparklines', async (req: Request, res: Response) => {
       const dau = nums(dauRows);
       const liq = nums(liqRows);
 
+      // low/high of each series — real supporting stats for the KPI cards.
+      const stat = (s: number[]) => ({
+        series: s,
+        changePct: changePct(s),
+        low: s.length ? Math.min(...s) : null,
+        high: s.length ? Math.max(...s) : null,
+      });
+
       return {
-        volume24h: { series: vol, changePct: changePct(vol) },
-        openInterest: { series: oi, changePct: changePct(oi) },
-        activeTraders: { series: dau, changePct: changePct(dau) },
-        liquidations24h: { series: liq, changePct: changePct(liq) },
+        volume24h: stat(vol),
+        openInterest: stat(oi),
+        activeTraders: stat(dau),
+        liquidations24h: stat(liq),
       };
     });
     res.json(result);
