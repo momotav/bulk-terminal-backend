@@ -278,6 +278,13 @@ const tradeQueue: Array<{
   size: number;
   side: string;
   walletAddress: string | null;
+  // Both counterparties. Per-wallet volume/trade stats credit BOTH sides
+  // (each of them traded that notional), which is how BULK's own portfolio
+  // counts it — otherwise our per-wallet volume is ~half the real figure. The
+  // single trades-table row (exchange-wide volume) still counts once, via
+  // walletAddress, so exchange volume is not doubled.
+  maker: string | null;
+  taker: string | null;
   value: number;
   time: number;
 }> = [];
@@ -349,13 +356,22 @@ async function processTradeBatch(): Promise<void> {
       console.error('global_stats batch increment failed:', err);
     });
 
-    // Aggregate trader stats in memory (don't write to DB yet)
+    // Aggregate trader stats in memory (don't write to DB yet). Credit BOTH
+    // the maker and the taker: each of them traded this notional, so each
+    // wallet's lifetime volume/trade count must include it. This is how BULK's
+    // own portfolio counts a wallet's volume — crediting only the taker (the
+    // old `walletAddress`) undercounts every wallet's volume by ~half and
+    // skews the volume leaderboard. Self-trades (maker === taker) count once.
     for (const t of trades) {
-      if (t.walletAddress) {
-        const existing = traderStatsBuffer.get(t.walletAddress) || { trades: 0, volume: 0 };
+      const sides = new Set<string>();
+      if (t.maker) sides.add(t.maker);
+      if (t.taker) sides.add(t.taker);
+      if (sides.size === 0 && t.walletAddress) sides.add(t.walletAddress);
+      for (const w of sides) {
+        const existing = traderStatsBuffer.get(w) || { trades: 0, volume: 0 };
         existing.trades++;
         existing.volume += t.value;
-        traderStatsBuffer.set(t.walletAddress, existing);
+        traderStatsBuffer.set(w, existing);
       }
     }
     
@@ -447,8 +463,10 @@ async function recordTrade(trade: {
   // Filter dust trades
   if (value < 1) return;
 
-  const walletAddress = trade.taker || trade.maker || null;
-  
+  const maker = trade.maker || null;
+  const taker = trade.taker || null;
+  const walletAddress = taker || maker || null;
+
   // Add to queue (non-blocking)
   tradeQueue.push({
     symbol: trade.symbol,
@@ -456,6 +474,8 @@ async function recordTrade(trade: {
     size: trade.size,
     side: trade.side,
     walletAddress,
+    maker,
+    taker,
     value,
     time: trade.time
   });
