@@ -466,7 +466,7 @@ router.get('/exchange-health', async (req: Request, res: Response) => {
     
     // Fetch from our DB for traders and liquidations
     const [tradersResult, liqResult] = await Promise.all([
-      query(`SELECT COUNT(DISTINCT wallet_address) as count FROM trades WHERE timestamp >= NOW() - INTERVAL '24 hours'`).catch(() => [{ count: 0 }]),
+      query(`SELECT COUNT(DISTINCT p.addr) as count FROM trades CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) AS p(addr) WHERE p.addr IS NOT NULL AND timestamp >= NOW() - INTERVAL '24 hours'`).catch(() => [{ count: 0 }]),
       query(`SELECT COUNT(*) as count, COALESCE(SUM(value), 0) as volume FROM liquidations WHERE timestamp >= NOW() - INTERVAL '24 hours'`).catch(() => [{ count: 0, volume: 0 }])
     ]);
     
@@ -1600,10 +1600,12 @@ router.get('/unique-traders-by-coin', async (req: Request, res: Response) => {
         total: string;
       }>(`
         WITH daily_traders AS (
-          SELECT DATE(timestamp) as day, symbol, wallet_address
+          -- Both fill sides (taker + maker) count as distinct participants.
+          SELECT DATE(timestamp) as day, symbol, p.addr AS wallet_address
           FROM trades
+          CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) AS p(addr)
           WHERE timestamp > NOW() - INTERVAL '${hours} hours'
-            AND wallet_address IS NOT NULL
+            AND p.addr IS NOT NULL
         ),
         per_symbol AS (
           SELECT day, symbol, COUNT(DISTINCT wallet_address) as traders
@@ -1705,10 +1707,11 @@ router.get('/daily-active-users', async (req: Request, res: Response) => {
     if (data.length === 0) {
       console.log('⚠️ daily_unique_traders empty, falling back to direct query');
       const fallback = await query<{ day: string; dau: string }>(`
-        SELECT DATE(timestamp) as day, COUNT(DISTINCT wallet_address) as dau
+        SELECT DATE(timestamp) as day, COUNT(DISTINCT p.addr) as dau
         FROM trades
+        CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) AS p(addr)
         WHERE timestamp > NOW() - INTERVAL '${hours} hours'
-          AND wallet_address IS NOT NULL
+          AND p.addr IS NOT NULL
         GROUP BY DATE(timestamp)
         ORDER BY day ASC
       `);
@@ -1766,8 +1769,9 @@ router.get('/cumulative-new-users', async (req: Request, res: Response) => {
       console.log('⚠️ daily_unique_traders empty for new users, falling back to direct query');
       const fallback = await query<{ first_day: string; new_users: string; cumulative: string }>(`
         WITH first_trades AS (
-          SELECT wallet_address, DATE(MIN(timestamp)) as first_trade_date
-          FROM trades WHERE wallet_address IS NOT NULL GROUP BY wallet_address
+          SELECT p.addr AS wallet_address, DATE(MIN(timestamp)) as first_trade_date
+          FROM trades CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) AS p(addr)
+          WHERE p.addr IS NOT NULL GROUP BY p.addr
         ),
         daily_new AS (
           SELECT first_trade_date as first_day, COUNT(*) as new_users

@@ -217,13 +217,17 @@ async function aggregateDailyStats(): Promise<void> {
     // Aggregate per-symbol stats for today and yesterday
     await query(`
       INSERT INTO daily_stats (day, symbol, unique_traders, trade_count, volume)
-      SELECT 
+      SELECT
         DATE(timestamp) as day,
         symbol,
-        COUNT(DISTINCT wallet_address) as unique_traders,
-        COUNT(*) as trade_count,
-        SUM(value) as volume
+        -- Distinct participants across BOTH sides (taker + maker). trade_count
+        -- and volume stay one-per-trade via the ord = 1 (taker) filter so the
+        -- lateral unnest doesn't double them.
+        COUNT(DISTINCT p.addr) as unique_traders,
+        COUNT(*) FILTER (WHERE p.ord = 1) as trade_count,
+        SUM(value) FILTER (WHERE p.ord = 1) as volume
       FROM trades
+      CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) WITH ORDINALITY AS p(addr, ord)
       WHERE DATE(timestamp) >= $1
         AND wallet_address IS NOT NULL
       GROUP BY DATE(timestamp), symbol
@@ -236,10 +240,12 @@ async function aggregateDailyStats(): Promise<void> {
     // Aggregate total unique traders per day
     await query(`
       INSERT INTO daily_unique_traders (day, total_unique)
-      SELECT 
+      SELECT
         DATE(timestamp) as day,
-        COUNT(DISTINCT wallet_address) as total_unique
+        -- distinct across both fill sides (taker + maker)
+        COUNT(DISTINCT p.addr) as total_unique
       FROM trades
+      CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) AS p(addr)
       WHERE DATE(timestamp) >= $1
         AND wallet_address IS NOT NULL
       GROUP BY DATE(timestamp)
@@ -250,10 +256,12 @@ async function aggregateDailyStats(): Promise<void> {
     // Calculate new users (first-time traders) for recent days
     await query(`
       WITH first_trades AS (
-        SELECT wallet_address, DATE(MIN(timestamp)) as first_day
+        -- First appearance of a wallet on EITHER fill side (taker or maker).
+        SELECT p.addr AS wallet_address, DATE(MIN(timestamp)) as first_day
         FROM trades
-        WHERE wallet_address IS NOT NULL
-        GROUP BY wallet_address
+        CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) AS p(addr)
+        WHERE p.addr IS NOT NULL
+        GROUP BY p.addr
       ),
       daily_new AS (
         SELECT first_day, COUNT(*) as new_users
@@ -301,13 +309,14 @@ async function backfillDailyStats(): Promise<void> {
     // Backfill per-symbol stats
     await query(`
       INSERT INTO daily_stats (day, symbol, unique_traders, trade_count, volume)
-      SELECT 
+      SELECT
         DATE(timestamp) as day,
         symbol,
-        COUNT(DISTINCT wallet_address) as unique_traders,
-        COUNT(*) as trade_count,
-        SUM(value) as volume
+        COUNT(DISTINCT p.addr) as unique_traders,
+        COUNT(*) FILTER (WHERE p.ord = 1) as trade_count,
+        SUM(value) FILTER (WHERE p.ord = 1) as volume
       FROM trades
+      CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) WITH ORDINALITY AS p(addr, ord)
       WHERE wallet_address IS NOT NULL
       GROUP BY DATE(timestamp), symbol
       ON CONFLICT (day, symbol) DO NOTHING
@@ -316,10 +325,11 @@ async function backfillDailyStats(): Promise<void> {
     // Backfill total unique per day
     await query(`
       INSERT INTO daily_unique_traders (day, total_unique)
-      SELECT 
+      SELECT
         DATE(timestamp) as day,
-        COUNT(DISTINCT wallet_address) as total_unique
+        COUNT(DISTINCT p.addr) as total_unique
       FROM trades
+      CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) AS p(addr)
       WHERE wallet_address IS NOT NULL
       GROUP BY DATE(timestamp)
       ON CONFLICT (day) DO NOTHING
@@ -328,10 +338,11 @@ async function backfillDailyStats(): Promise<void> {
     // Calculate new users
     await query(`
       WITH first_trades AS (
-        SELECT wallet_address, DATE(MIN(timestamp)) as first_day
+        SELECT p.addr AS wallet_address, DATE(MIN(timestamp)) as first_day
         FROM trades
-        WHERE wallet_address IS NOT NULL
-        GROUP BY wallet_address
+        CROSS JOIN LATERAL unnest(ARRAY[wallet_address, counterparty]) AS p(addr)
+        WHERE p.addr IS NOT NULL
+        GROUP BY p.addr
       ),
       daily_new AS (
         SELECT first_day, COUNT(*) as new_users

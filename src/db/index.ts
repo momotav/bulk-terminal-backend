@@ -196,6 +196,11 @@ export async function initializeDatabase(): Promise<void> {
       CREATE TABLE IF NOT EXISTS trades (
         id SERIAL PRIMARY KEY,
         wallet_address VARCHAR(64),
+        -- The OTHER side of the fill (the maker when wallet_address is the
+        -- taker). Lets active-user counts include BOTH participants of every
+        -- fill, which is how BULK counts DAU officially (distinct makers +
+        -- takers), instead of the taker only.
+        counterparty VARCHAR(64),
         symbol VARCHAR(20) NOT NULL,
         side VARCHAR(10) NOT NULL,
         size DECIMAL(20, 8) NOT NULL,
@@ -203,6 +208,14 @@ export async function initializeDatabase(): Promise<void> {
         value DECIMAL(20, 2) NOT NULL,
         timestamp TIMESTAMP DEFAULT NOW()
       );
+
+      -- Self-healing migration for tables created before counterparty existed.
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name='counterparty') THEN
+          ALTER TABLE trades ADD COLUMN counterparty VARCHAR(64);
+        END IF;
+      END $$;
       
       CREATE INDEX IF NOT EXISTS idx_trades_time 
       ON trades(timestamp DESC);

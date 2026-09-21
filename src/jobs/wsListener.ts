@@ -318,19 +318,24 @@ async function processTradeBatch(): Promise<void> {
     
     if (trades.length === 0) return;
     
-    // Build batch insert query
+    // Build batch insert query. We store BOTH sides of each fill: wallet_address
+    // is the primary actor (taker), counterparty is the other side (maker), so
+    // active-user counts can include both — BULK counts DAU as distinct
+    // makers + takers, not takers only.
     const values = trades.map((t, i) => {
-      const offset = i * 7;
-      return `($${offset + 1}::varchar, $${offset + 2}::varchar, $${offset + 3}::varchar, $${offset + 4}, $${offset + 5}, $${offset + 6}, to_timestamp($${offset + 7}/1000.0))`;
+      const offset = i * 8;
+      return `($${offset + 1}::varchar, $${offset + 2}::varchar, $${offset + 3}::varchar, $${offset + 4}::varchar, $${offset + 5}, $${offset + 6}, $${offset + 7}, to_timestamp($${offset + 8}/1000.0))`;
     }).join(', ');
-    
-    const params = trades.flatMap(t => [
-      t.walletAddress, t.symbol, t.side, Math.abs(t.size), t.price, t.value, t.time
-    ]);
-    
+
+    const params = trades.flatMap(t => {
+      // The side that ISN'T wallet_address (wallet_address = taker || maker).
+      const counterparty = t.maker === t.walletAddress ? t.taker : t.maker;
+      return [t.walletAddress, counterparty, t.symbol, t.side, Math.abs(t.size), t.price, t.value, t.time];
+    });
+
     // Single batch insert for all trades
     await query(
-      `INSERT INTO trades (wallet_address, symbol, side, size, price, value, timestamp) VALUES ${values}`,
+      `INSERT INTO trades (wallet_address, counterparty, symbol, side, size, price, value, timestamp) VALUES ${values}`,
       params
     );
 
