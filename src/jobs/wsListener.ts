@@ -566,6 +566,18 @@ async function recordADL(adl: {
            last_seen = NOW()`,
         [walletAddress, value]
       );
+
+      // The ADL counterparty is a real deleveraged trader — count them as
+      // active too (activity without a fill of their own). last_seen only, no
+      // volume/trade/adl totals. Skip system/engine wallets and self-trades.
+      if (counterparty && counterparty !== walletAddress && !isSystemWallet(counterparty)) {
+        await query(
+          `INSERT INTO traders (wallet_address, last_seen)
+           VALUES ($1::varchar, NOW())
+           ON CONFLICT (wallet_address) DO UPDATE SET last_seen = NOW()`,
+          [counterparty]
+        );
+      }
       
       // Create notifications for users following this wallet (use separate params)
       await query(
