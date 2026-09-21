@@ -1188,12 +1188,24 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
     for (const row of visibleRows) {
       visibleSum += parseFloat(row.trade_count || 0);
     }
-    
+
     // Historical = total (from BULK start) - visible period
     const historicalCumulative = totalAllTime - visibleSum;
-    
+
+    // Daily trade COUNTS. transformToChartData fills the per-coin fields with
+    // `volume` (it prefers volume over trade_count), so the "Trades" KPI card
+    // can't derive counts from `data` — expose them separately here.
+    const countsByDay = new Map<string, number>();
+    for (const row of visibleRows) {
+      const dayKey = new Date(row.day).toISOString();
+      countsByDay.set(dayKey, (countsByDay.get(dayKey) || 0) + parseInt(row.trade_count || '0', 10));
+    }
+    const counts = Array.from(countsByDay.entries())
+      .sort((a, b) => new Date(a[0]).getTime() - new Date(b[0]).getTime())
+      .map(([timestamp, count]) => ({ timestamp, count }));
+
     const data = transformToChartData(visibleRows, historicalCumulative);
-    return { data };
+    return { data, counts };
     });
 
     res.json(result);
