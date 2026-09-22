@@ -1216,6 +1216,50 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
   }
 });
 
+// Recent trades for ONE market — the live tape in the coin detail modal.
+// wallet_address is the taker, counterparty the maker; the frontend derives
+// buyer/seller from `side` (the taker's side).
+router.get('/market-trades/:coin', async (req: Request, res: Response) => {
+  const { coin } = req.params;
+  const dbSymbol = coin.includes('-') ? coin.toUpperCase() : `${coin.toUpperCase()}-USD`;
+  const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+  try {
+    const rows = await query(`
+      SELECT wallet_address AS taker, counterparty AS maker, side, price, size, value,
+             (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint AS timestamp
+      FROM trades
+      WHERE symbol = $1
+      ORDER BY timestamp DESC
+      LIMIT $2
+    `, [dbSymbol, limit]);
+    res.json({ data: rows });
+  } catch (error) {
+    console.error('market-trades error:', error);
+    res.json({ data: [], error: 'No trade data available yet' });
+  }
+});
+
+// Recent liquidation events for ONE market — the liquidation feed table.
+router.get('/market-liquidations/:coin', async (req: Request, res: Response) => {
+  const { coin } = req.params;
+  const dbSymbol = coin.includes('-') ? coin.toUpperCase() : `${coin.toUpperCase()}-USD`;
+  const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+  try {
+    const rows = await query(`
+      SELECT wallet_address AS wallet, side, price, size, value,
+             (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint AS timestamp
+      FROM liquidations
+      WHERE symbol = $1
+      ORDER BY timestamp DESC
+      LIMIT $2
+    `, [dbSymbol, limit]);
+    res.json({ data: rows });
+  } catch (error) {
+    console.error('market-liquidations error:', error);
+    res.json({ data: [], error: 'No liquidation data available yet' });
+  }
+});
+
 // Get liquidations chart data from database
 // NOTE: Only shows data from BULK API launch (April 13, 2026 19:00 UTC) for chart alignment
 router.get('/liquidations-chart', async (req: Request, res: Response) => {
