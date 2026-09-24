@@ -187,6 +187,29 @@ router.get('/ticker/:symbol', async (req: Request, res: Response) => {
 // ============ EXCHANGE STATS (Dashboard header) ============
 
 // Get exchange stats - transforms BULK API data for dashboard
+// Active accounts from BULK's executor metrics. `cached_accounts` is the
+// executor's live working-set of active accounts (accounts with open positions
+// / recent state activity), and `world_accounts` is the total ever created —
+// this is the "active traders" number BULK's own tooling and other community
+// dashboards show (e.g. ~2,024). Our fill-based DB count only sees wallets that
+// executed a trade (~850), so it's much lower; this is the authoritative figure.
+// Cached 30s (single-flight) so we don't hammer the metrics endpoint.
+async function getAccountCardinality(): Promise<{ active: number | null; total: number | null }> {
+  return swrCache('bulk:metrics:cardinality', 30, async () => {
+    try {
+      const res = await bulkFetch(`${BULK_API_BASE}/metrics`);
+      if (!res.ok) return { active: null, total: null };
+      const m = await res.json() as any;
+      const p = m?.executor_cardinality?.primary ?? m?.executor_cardinality?.snapshot_replica ?? {};
+      const active = typeof p.cached_accounts === 'number' ? p.cached_accounts : null;
+      const total = typeof p.world_accounts === 'number' ? p.world_accounts : null;
+      return { active, total };
+    } catch {
+      return { active: null, total: null };
+    }
+  });
+}
+
 router.get('/exchange-stats', async (req: Request, res: Response) => {
   const cacheKey = 'analytics:exchange_stats';
   
@@ -290,29 +313,30 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       }
     }
     
-    // Get active traders from traders table (much faster than COUNT DISTINCT on trades)
+    // Active traders. Prefer BULK's executor cardinality (`cached_accounts`) —
+    // the same "active accounts" figure BULK/other dashboards show — because our
+    // fill-based DB count only sees wallets that executed a trade and misses
+    // everyone active via orders/positions without a fill. Fall back to the
+    // rolling-24h DB count (all observable actions via last_seen) if metrics are
+    // unavailable.
     let activeTraders = 0;
+    let totalAccounts: number | null = null;
     try {
-      const tradersResult = await Promise.race([
-        query(`
-          SELECT COUNT(*) as count 
-          FROM traders 
-          WHERE last_seen > NOW() - INTERVAL '24 hours'
-        `),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('DB timeout')), 2000))
-      ]) as any[];
-      activeTraders = parseInt(tradersResult[0]?.count || '0');
-      
-      // Fallback: if no recent activity, show total unique traders
-      if (activeTraders === 0) {
-        const totalResult = await query(`SELECT COUNT(*) as count FROM traders`);
-        activeTraders = parseInt(totalResult[0]?.count || '0');
+      const card = await getAccountCardinality();
+      totalAccounts = card.total;
+      if (card.active != null && card.active > 0) {
+        activeTraders = card.active;
+      } else {
+        const tradersResult = await Promise.race([
+          query(`SELECT COUNT(*) as count FROM traders WHERE last_seen > NOW() - INTERVAL '24 hours'`),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('DB timeout')), 2000)),
+        ]) as any[];
+        activeTraders = parseInt(tradersResult[0]?.count || '0');
       }
     } catch (e) {
       console.error('Failed to get active traders:', e);
-      // Fallback to total traders count
       try {
-        const totalResult = await query(`SELECT COUNT(*) as count FROM traders`);
+        const totalResult = await query(`SELECT COUNT(*) as count FROM traders WHERE last_seen > NOW() - INTERVAL '24 hours'`);
         activeTraders = parseInt(totalResult[0]?.count || '0');
       } catch (e2) {
         activeTraders = 0;
@@ -341,6 +365,7 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       volume24h: totalVolume24h,
       openInterest: totalOpenInterest * OI_SIDE_FACTOR, // two-sided (long+short)
       activeTraders,
+      totalAccounts, // all accounts ever created (BULK world_accounts)
       liquidations24h,
     };
     });
