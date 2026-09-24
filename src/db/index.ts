@@ -289,6 +289,18 @@ export async function initializeDatabase(): Promise<void> {
       );
       CREATE INDEX IF NOT EXISTS idx_account_cardinality_ts
       ON account_cardinality(timestamp DESC);
+
+      -- Performance/economics from BULK's /metrics, recorded alongside accounts.
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='account_cardinality' AND column_name='latency_median_ms') THEN
+          ALTER TABLE account_cardinality ADD COLUMN latency_median_ms REAL;
+          ALTER TABLE account_cardinality ADD COLUMN latency_p99_ms REAL;
+          ALTER TABLE account_cardinality ADD COLUMN round_height BIGINT;
+          ALTER TABLE account_cardinality ADD COLUMN submissions_total BIGINT;
+          ALTER TABLE account_cardinality ADD COLUMN reward_pool BIGINT;
+        END IF;
+      END $$;
     `);
 
     // ADL (Auto-Deleveraging) events table

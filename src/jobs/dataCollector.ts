@@ -425,14 +425,22 @@ async function collectAccountCardinality(): Promise<void> {
     const p = m?.executor_cardinality?.primary ?? m?.executor_cardinality?.snapshot_replica ?? {};
     const active = typeof p.cached_accounts === 'number' ? p.cached_accounts : null;
     const total = typeof p.world_accounts === 'number' ? p.world_accounts : null;
-    if (active == null && total == null) return;
+    const rewardPool = typeof p.reward_pool_balance === 'number' ? p.reward_pool_balance : null;
+    const cl = m?.consensus_latency_stats ?? {};
+    const latMed = typeof cl.median_ms === 'number' ? cl.median_ms : null;
+    const latP99 = typeof cl.p99_ms === 'number' ? cl.p99_ms : null;
+    const roundHeight = typeof m?.last_round === 'number' ? m.last_round : null;
+    const submissions = typeof m?.unique_submissions === 'number' ? m.unique_submissions : null;
+    if (active == null && total == null && roundHeight == null) return;
     await query(
-      `INSERT INTO account_cardinality (active_accounts, total_accounts, timestamp) VALUES ($1, $2, NOW())`,
-      [active, total]
+      `INSERT INTO account_cardinality
+         (active_accounts, total_accounts, latency_median_ms, latency_p99_ms, round_height, submissions_total, reward_pool, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+      [active, total, latMed, latP99, roundHeight, submissions, rewardPool]
     );
-    console.log(`👥 Account cardinality: active=${active} total=${total}`);
+    console.log(`👥 Metrics snapshot: active=${active} total=${total} lat=${latMed}ms round=${roundHeight} reward=${rewardPool}`);
   } catch (error) {
-    console.error('❌ Failed to collect account cardinality:', error);
+    console.error('❌ Failed to collect metrics snapshot:', error);
   }
 }
 

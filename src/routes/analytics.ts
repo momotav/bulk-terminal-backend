@@ -216,6 +216,86 @@ router.get('/active-accounts-history', async (req: Request, res: Response) => {
   }
 });
 
+// Live BULK sequencer performance from /metrics: consensus latency, round
+// height + rounds/sec, submissions/sec, active/total accounts, reward pool,
+// node health. Rates are derived from two reads ~2s apart. Cached 5s.
+router.get('/performance', async (req: Request, res: Response) => {
+  try {
+    const result = await swrCache('bulk:performance', 5, async () => {
+      const fetchMetrics = async () => {
+        const r = await bulkFetch(`${BULK_API_BASE}/metrics`);
+        if (!r.ok) throw new Error('metrics fetch failed');
+        return r.json() as Promise<any>;
+      };
+      const a = await fetchMetrics();
+      await new Promise((r) => setTimeout(r, 2000));
+      const b = await fetchMetrics();
+      const dt = Math.max(0.5, ((b.timestamp_unix_ms ?? Date.now()) - (a.timestamp_unix_ms ?? Date.now())) / 1000);
+      const pa = a?.executor_cardinality?.primary ?? {};
+      const cl = a?.consensus_latency_stats ?? {};
+      return {
+        timestamp: Date.now(),
+        latencyMedianMs: cl.median_ms ?? null,
+        latencyP99Ms: cl.p99_ms ?? null,
+        latencyMaxMs: cl.max_ms ?? null,
+        latencyMeanMs: cl.mean_ms ?? null,
+        roundHeight: b.last_round ?? a.last_round ?? null,
+        roundsPerSec: b.last_round != null && a.last_round != null ? (b.last_round - a.last_round) / dt : null,
+        submissionsTotal: b.unique_submissions ?? a.unique_submissions ?? null,
+        submissionsPerSec: b.unique_submissions != null && a.unique_submissions != null ? (b.unique_submissions - a.unique_submissions) / dt : null,
+        activeAccounts: pa.cached_accounts ?? null,
+        totalAccounts: pa.world_accounts ?? null,
+        rewardPool: pa.reward_pool_balance ?? null,
+        workerSaturation: a?.edge_verify?.bulk_edge_verify_worker_saturation ?? null,
+        queueDepth: a?.edge_verify?.bulk_edge_verify_queue_depth ?? null,
+        sigAccept: a?.edge_verify?.bulk_edge_verify_total?.accept ?? null,
+        sigRejectSig: a?.edge_verify?.bulk_edge_verify_total?.reject_sig ?? null,
+        sigRejectUnauth: a?.edge_verify?.bulk_edge_verify_total?.reject_unauth ?? null,
+      };
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('performance error:', error);
+    res.status(502).json({ error: 'metrics unavailable' });
+  }
+});
+
+// Performance history (recorded snapshots): latency, rounds, reward pool over
+// time. Averaged into ~N buckets so the payload stays small.
+router.get('/performance-history', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 168;
+  try {
+    const rows = await query<any>(`
+      SELECT
+        date_trunc('hour', timestamp) AS bucket,
+        AVG(latency_median_ms) AS latency_median_ms,
+        AVG(latency_p99_ms) AS latency_p99_ms,
+        MAX(round_height) AS round_height,
+        MAX(reward_pool) AS reward_pool,
+        MAX(active_accounts) AS active_accounts,
+        MAX(total_accounts) AS total_accounts
+      FROM account_cardinality
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+      GROUP BY date_trunc('hour', timestamp)
+      ORDER BY bucket ASC
+    `);
+    res.json({
+      data: rows.map((r) => ({
+        timestamp: new Date(r.bucket).toISOString(),
+        latencyMedianMs: r.latency_median_ms != null ? Number(r.latency_median_ms) : null,
+        latencyP99Ms: r.latency_p99_ms != null ? Number(r.latency_p99_ms) : null,
+        roundHeight: r.round_height != null ? Number(r.round_height) : null,
+        rewardPool: r.reward_pool != null ? Number(r.reward_pool) : null,
+        activeAccounts: r.active_accounts != null ? Number(r.active_accounts) : null,
+        totalAccounts: r.total_accounts != null ? Number(r.total_accounts) : null,
+      })),
+    });
+  } catch (error) {
+    console.error('performance-history error:', error);
+    res.json({ data: [] });
+  }
+});
+
 // Active accounts from BULK's executor metrics. `cached_accounts` is the
 // executor's live working-set of active accounts (accounts with open positions
 // / recent state activity), and `world_accounts` is the total ever created —
