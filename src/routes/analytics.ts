@@ -2914,9 +2914,11 @@ router.get('/orderbook/:coin', async (req: Request, res: Response) => {
       inflight = (async () => {
         try {
           const result = await loadOrderBook(coin, nlevels);
-          // 5s TTL — books move fast, but paired with single-flight this caps
-          // BULK to ~1 request per 5s per market no matter how many users poll.
-          await setCache(cacheKey, result, 5);
+          // 1s TTL — the book's depth/volume changes constantly (not just on
+          // price moves), so a short TTL makes it feel live like BULK. Paired
+          // with single-flight this still caps BULK to ~1 request/sec per market
+          // no matter how many users poll (and typically only one is open).
+          await setCache(cacheKey, result, 1);
           obLastGood.set(cacheKey, { result, at: Date.now() });
           return result;
         } finally {
