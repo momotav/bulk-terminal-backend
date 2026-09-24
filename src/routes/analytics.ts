@@ -187,6 +187,35 @@ router.get('/ticker/:symbol', async (req: Request, res: Response) => {
 // ============ EXCHANGE STATS (Dashboard header) ============
 
 // Get exchange stats - transforms BULK API data for dashboard
+// Active-account history: the daily peak of BULK's cached_accounts snapshots we
+// record every 5 min. Powers the "Active Accounts" chart (the 2,000-scale figure
+// that matches the KPI), separate from the fill-based daily-unique-traders chart.
+router.get('/active-accounts-history', async (req: Request, res: Response) => {
+  const hours = parseInt(req.query.hours as string) || 720;
+  try {
+    const rows = await query<{ day: string; active: string; total: string }>(`
+      SELECT DATE(timestamp) AS day,
+             MAX(active_accounts) AS active,
+             MAX(total_accounts) AS total
+      FROM account_cardinality
+      WHERE timestamp > NOW() - INTERVAL '${hours} hours'
+        AND active_accounts IS NOT NULL
+      GROUP BY DATE(timestamp)
+      ORDER BY day ASC
+    `);
+    res.json({
+      data: rows.map((r) => ({
+        timestamp: new Date(r.day).toISOString().split('T')[0],
+        active: parseInt(r.active || '0', 10),
+        total: parseInt(r.total || '0', 10),
+      })),
+    });
+  } catch (error) {
+    console.error('active-accounts-history error:', error);
+    res.json({ data: [] });
+  }
+});
+
 // Active accounts from BULK's executor metrics. `cached_accounts` is the
 // executor's live working-set of active accounts (accounts with open positions
 // / recent state activity), and `world_accounts` is the total ever created —

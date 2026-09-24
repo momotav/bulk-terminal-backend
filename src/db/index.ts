@@ -274,8 +274,21 @@ export async function initializeDatabase(): Promise<void> {
         created_at TIMESTAMP DEFAULT NOW()
       );
       
-      CREATE INDEX IF NOT EXISTS idx_daily_unique_day 
+      CREATE INDEX IF NOT EXISTS idx_daily_unique_day
       ON daily_unique_traders(day DESC);
+
+      -- Active-account cardinality snapshots from BULK's executor /metrics
+      -- (cached_accounts = live active accounts, world_accounts = total ever).
+      -- This is the "active traders" figure BULK/other dashboards show; we can
+      -- only see the live snapshot, so we record it over time to build history.
+      CREATE TABLE IF NOT EXISTS account_cardinality (
+        id SERIAL PRIMARY KEY,
+        timestamp TIMESTAMP DEFAULT NOW(),
+        active_accounts INTEGER,
+        total_accounts INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_account_cardinality_ts
+      ON account_cardinality(timestamp DESC);
     `);
 
     // ADL (Auto-Deleveraging) events table

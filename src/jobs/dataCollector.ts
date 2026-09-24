@@ -413,6 +413,29 @@ async function collectFeeSnapshot(): Promise<void> {
   }
 }
 
+// Snapshot BULK's executor account cardinality (active + total accounts) from
+// /metrics. cached_accounts is the live "active traders" figure BULK/other
+// dashboards show; it has no history of its own, so we record it every few
+// minutes to build an "Active Accounts" time series going forward.
+async function collectAccountCardinality(): Promise<void> {
+  try {
+    const res = await bulkFetch(`${BULK_API_BASE}/metrics`);
+    if (!res.ok) return;
+    const m = await res.json() as any;
+    const p = m?.executor_cardinality?.primary ?? m?.executor_cardinality?.snapshot_replica ?? {};
+    const active = typeof p.cached_accounts === 'number' ? p.cached_accounts : null;
+    const total = typeof p.world_accounts === 'number' ? p.world_accounts : null;
+    if (active == null && total == null) return;
+    await query(
+      `INSERT INTO account_cardinality (active_accounts, total_accounts, timestamp) VALUES ($1, $2, NOW())`,
+      [active, total]
+    );
+    console.log(`👥 Account cardinality: active=${active} total=${total}`);
+  } catch (error) {
+    console.error('❌ Failed to collect account cardinality:', error);
+  }
+}
+
 // Start all cron jobs
 export function startDataCollector(): void {
   console.log('🚀 Starting data collector...');
@@ -438,15 +461,22 @@ export function startDataCollector(): void {
   cron.schedule('*/10 * * * *', () => {
     collectFeeSnapshot();
   });
-  
+
+  // Snapshot active-account cardinality every 5 minutes (builds the
+  // "Active Accounts" history from BULK's /metrics going forward).
+  cron.schedule('*/5 * * * *', () => {
+    collectAccountCardinality();
+  });
+
   // Clean up old data daily at 3am
   cron.schedule('0 3 * * *', () => {
     cleanupOldData();
   });
-  
+
   // Run initial collection
   collectMarketStats();
   collectFeeSnapshot();
+  collectAccountCardinality();
   
   // Backfill daily stats on startup (only if empty)
   setTimeout(() => backfillDailyStats(), 5000);
