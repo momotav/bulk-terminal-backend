@@ -216,56 +216,67 @@ router.get('/active-accounts-history', async (req: Request, res: Response) => {
   }
 });
 
-// Live BULK sequencer performance from /metrics. Kept always-warm by a
-// background refresher (below) so the FIRST visitor gets it instantly instead
-// of waiting on the two 2s-apart reads used to derive rounds/sec.
-async function computePerformance() {
-  return swrCache('bulk:performance', 30, async () => {
-    const fetchMetrics = async () => {
-      const r = await bulkFetch(`${BULK_API_BASE}/metrics`);
-      if (!r.ok) throw new Error('metrics fetch failed');
-      return r.json() as Promise<any>;
-    };
-    const a = await fetchMetrics();
-    await new Promise((r) => setTimeout(r, 2000));
-    const b = await fetchMetrics();
-    const dt = Math.max(0.5, ((b.timestamp_unix_ms ?? Date.now()) - (a.timestamp_unix_ms ?? Date.now())) / 1000);
-    const pa = a?.executor_cardinality?.primary ?? {};
-    const cl = a?.consensus_latency_stats ?? {};
-    return {
+// Live BULK sequencer performance from /metrics, sampled server-side every ~5s
+// so we keep a rolling ~60s buffer. A joining user gets the current values AND
+// the previous 60s of samples instantly (no client-side "sampling…" wait).
+type PerfSample = {
+  timestamp: number;
+  latencyMedianMs: number | null; latencyP99Ms: number | null; latencyMaxMs: number | null; latencyMeanMs: number | null;
+  roundHeight: number | null; roundsPerSec: number | null;
+  submissionsTotal: number | null; submissionsPerSec: number | null;
+  activeAccounts: number | null; totalAccounts: number | null; rewardPool: number | null;
+  workerSaturation: number | null; queueDepth: number | null;
+  sigAccept: number | null; sigRejectSig: number | null; sigRejectUnauth: number | null;
+};
+let perfLatest: PerfSample | null = null;
+const perfBuffer: PerfSample[] = [];          // last ~60s (max 15 @ ~5s)
+let perfPrevRaw: { round: number | null; subs: number | null; t: number } | null = null;
+
+async function samplePerformance(): Promise<void> {
+  try {
+    const r = await bulkFetch(`${BULK_API_BASE}/metrics`);
+    if (!r.ok) return;
+    const m = await r.json() as any;
+    const now = m.timestamp_unix_ms ?? Date.now();
+    const pa = m?.executor_cardinality?.primary ?? {};
+    const cl = m?.consensus_latency_stats ?? {};
+    const round = typeof m.last_round === 'number' ? m.last_round : null;
+    const subs = typeof m.unique_submissions === 'number' ? m.unique_submissions : null;
+    // Derive rates from the previous raw sample.
+    let roundsPerSec: number | null = null;
+    let submissionsPerSec: number | null = null;
+    if (perfPrevRaw) {
+      const dt = Math.max(0.5, (now - perfPrevRaw.t) / 1000);
+      if (round != null && perfPrevRaw.round != null) roundsPerSec = (round - perfPrevRaw.round) / dt;
+      if (subs != null && perfPrevRaw.subs != null) submissionsPerSec = (subs - perfPrevRaw.subs) / dt;
+    }
+    perfPrevRaw = { round, subs, t: now };
+    const sample: PerfSample = {
       timestamp: Date.now(),
-      latencyMedianMs: cl.median_ms ?? null,
-      latencyP99Ms: cl.p99_ms ?? null,
-      latencyMaxMs: cl.max_ms ?? null,
-      latencyMeanMs: cl.mean_ms ?? null,
-      roundHeight: b.last_round ?? a.last_round ?? null,
-      roundsPerSec: b.last_round != null && a.last_round != null ? (b.last_round - a.last_round) / dt : null,
-      submissionsTotal: b.unique_submissions ?? a.unique_submissions ?? null,
-      submissionsPerSec: b.unique_submissions != null && a.unique_submissions != null ? (b.unique_submissions - a.unique_submissions) / dt : null,
-      activeAccounts: pa.cached_accounts ?? null,
-      totalAccounts: pa.world_accounts ?? null,
-      rewardPool: pa.reward_pool_balance ?? null,
-      workerSaturation: a?.edge_verify?.bulk_edge_verify_worker_saturation ?? null,
-      queueDepth: a?.edge_verify?.bulk_edge_verify_queue_depth ?? null,
-      sigAccept: a?.edge_verify?.bulk_edge_verify_total?.accept ?? null,
-      sigRejectSig: a?.edge_verify?.bulk_edge_verify_total?.reject_sig ?? null,
-      sigRejectUnauth: a?.edge_verify?.bulk_edge_verify_total?.reject_unauth ?? null,
+      latencyMedianMs: cl.median_ms ?? null, latencyP99Ms: cl.p99_ms ?? null, latencyMaxMs: cl.max_ms ?? null, latencyMeanMs: cl.mean_ms ?? null,
+      roundHeight: round, roundsPerSec,
+      submissionsTotal: subs, submissionsPerSec,
+      activeAccounts: pa.cached_accounts ?? null, totalAccounts: pa.world_accounts ?? null, rewardPool: pa.reward_pool_balance ?? null,
+      workerSaturation: m?.edge_verify?.bulk_edge_verify_worker_saturation ?? null,
+      queueDepth: m?.edge_verify?.bulk_edge_verify_queue_depth ?? null,
+      sigAccept: m?.edge_verify?.bulk_edge_verify_total?.accept ?? null,
+      sigRejectSig: m?.edge_verify?.bulk_edge_verify_total?.reject_sig ?? null,
+      sigRejectUnauth: m?.edge_verify?.bulk_edge_verify_total?.reject_unauth ?? null,
     };
-  });
+    perfLatest = sample;
+    // Only buffer once we have a rate (the very first sample has no prior).
+    if (roundsPerSec != null) { perfBuffer.push(sample); while (perfBuffer.length > 15) perfBuffer.shift(); }
+  } catch { /* transient — keep last */ }
 }
 
-// Keep the performance cache warm: refresh on boot + every 20s, so the panel is
-// populated for the first user who opens it (no cold-start wait).
-computePerformance().catch(() => {});
-setInterval(() => { computePerformance().catch(() => {}); }, 20_000);
+// Sample on boot + every 5s so the buffer is populated for the first visitor.
+samplePerformance();
+setInterval(samplePerformance, 5000);
 
 router.get('/performance', async (req: Request, res: Response) => {
-  try {
-    res.json(await computePerformance());
-  } catch (error) {
-    console.error('performance error:', error);
-    res.status(502).json({ error: 'metrics unavailable' });
-  }
+  if (!perfLatest) { try { await samplePerformance(); } catch { /* ignore */ } }
+  if (!perfLatest) return res.status(502).json({ error: 'metrics unavailable' });
+  res.json({ ...perfLatest, recent: perfBuffer });
 });
 
 // Performance history (recorded snapshots): latency, rounds, reward pool over
