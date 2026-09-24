@@ -1582,29 +1582,53 @@ router.get('/market-stats-bulk', async (req: Request, res: Response) => {
 });
 
 // All tickers from BULK API
+// Last known-good ticker per symbol, so a transient per-market fetch failure
+// never shrinks the /tickers-bulk response (which made the Markets table flash).
+const lastGoodTickers = new Map<string, BulkTicker & { symbol?: string }>();
+
 router.get('/tickers-bulk', async (req: Request, res: Response) => {
   try {
     // Use live symbol list so new markets appear automatically.
     const symbols = await getActiveSymbols();
-    const tickers = await Promise.all(
+    const fetched = await Promise.all(
       symbols.map(async (symbol) => {
         try {
           const response = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
           if (!response.ok) return null;
-          return await response.json() as BulkTicker;
+          return await response.json() as BulkTicker & { symbol?: string };
         } catch {
           return null;
         }
       })
     );
 
-    res.json({
-      tickers: tickers.filter(t => t !== null),
-      source: 'bulk-api'
+    // Per-symbol fallback to the last known-good ticker. BULK's per-market
+    // /ticker calls occasionally fail/rate-limit under load; without this the
+    // failed ones were dropped, so the Markets table would flash down to a
+    // handful of markets (or one) on refresh until the next poll recovered.
+    // We keep a cache of the last good value per symbol and serve it when the
+    // live fetch misses, so the full market set is always returned.
+    const out: (BulkTicker & { symbol?: string })[] = [];
+    symbols.forEach((symbol, i) => {
+      const live = fetched[i];
+      if (live) {
+        lastGoodTickers.set(symbol, live);
+        out.push(live);
+      } else {
+        const cached = lastGoodTickers.get(symbol);
+        if (cached) out.push(cached);
+      }
     });
+
+    res.json({ tickers: out, source: 'bulk-api' });
   } catch (error) {
     console.error('Error fetching tickers from BULK API:', error);
-    res.status(500).json({ error: 'Failed to fetch tickers' });
+    // Last resort: serve whatever full set we last had rather than 500.
+    if (lastGoodTickers.size > 0) {
+      res.json({ tickers: Array.from(lastGoodTickers.values()), source: 'cache' });
+    } else {
+      res.status(500).json({ error: 'Failed to fetch tickers' });
+    }
   }
 });
 
