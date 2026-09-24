@@ -216,44 +216,52 @@ router.get('/active-accounts-history', async (req: Request, res: Response) => {
   }
 });
 
-// Live BULK sequencer performance from /metrics: consensus latency, round
-// height + rounds/sec, submissions/sec, active/total accounts, reward pool,
-// node health. Rates are derived from two reads ~2s apart. Cached 5s.
+// Live BULK sequencer performance from /metrics. Kept always-warm by a
+// background refresher (below) so the FIRST visitor gets it instantly instead
+// of waiting on the two 2s-apart reads used to derive rounds/sec.
+async function computePerformance() {
+  return swrCache('bulk:performance', 30, async () => {
+    const fetchMetrics = async () => {
+      const r = await bulkFetch(`${BULK_API_BASE}/metrics`);
+      if (!r.ok) throw new Error('metrics fetch failed');
+      return r.json() as Promise<any>;
+    };
+    const a = await fetchMetrics();
+    await new Promise((r) => setTimeout(r, 2000));
+    const b = await fetchMetrics();
+    const dt = Math.max(0.5, ((b.timestamp_unix_ms ?? Date.now()) - (a.timestamp_unix_ms ?? Date.now())) / 1000);
+    const pa = a?.executor_cardinality?.primary ?? {};
+    const cl = a?.consensus_latency_stats ?? {};
+    return {
+      timestamp: Date.now(),
+      latencyMedianMs: cl.median_ms ?? null,
+      latencyP99Ms: cl.p99_ms ?? null,
+      latencyMaxMs: cl.max_ms ?? null,
+      latencyMeanMs: cl.mean_ms ?? null,
+      roundHeight: b.last_round ?? a.last_round ?? null,
+      roundsPerSec: b.last_round != null && a.last_round != null ? (b.last_round - a.last_round) / dt : null,
+      submissionsTotal: b.unique_submissions ?? a.unique_submissions ?? null,
+      submissionsPerSec: b.unique_submissions != null && a.unique_submissions != null ? (b.unique_submissions - a.unique_submissions) / dt : null,
+      activeAccounts: pa.cached_accounts ?? null,
+      totalAccounts: pa.world_accounts ?? null,
+      rewardPool: pa.reward_pool_balance ?? null,
+      workerSaturation: a?.edge_verify?.bulk_edge_verify_worker_saturation ?? null,
+      queueDepth: a?.edge_verify?.bulk_edge_verify_queue_depth ?? null,
+      sigAccept: a?.edge_verify?.bulk_edge_verify_total?.accept ?? null,
+      sigRejectSig: a?.edge_verify?.bulk_edge_verify_total?.reject_sig ?? null,
+      sigRejectUnauth: a?.edge_verify?.bulk_edge_verify_total?.reject_unauth ?? null,
+    };
+  });
+}
+
+// Keep the performance cache warm: refresh on boot + every 20s, so the panel is
+// populated for the first user who opens it (no cold-start wait).
+computePerformance().catch(() => {});
+setInterval(() => { computePerformance().catch(() => {}); }, 20_000);
+
 router.get('/performance', async (req: Request, res: Response) => {
   try {
-    const result = await swrCache('bulk:performance', 5, async () => {
-      const fetchMetrics = async () => {
-        const r = await bulkFetch(`${BULK_API_BASE}/metrics`);
-        if (!r.ok) throw new Error('metrics fetch failed');
-        return r.json() as Promise<any>;
-      };
-      const a = await fetchMetrics();
-      await new Promise((r) => setTimeout(r, 2000));
-      const b = await fetchMetrics();
-      const dt = Math.max(0.5, ((b.timestamp_unix_ms ?? Date.now()) - (a.timestamp_unix_ms ?? Date.now())) / 1000);
-      const pa = a?.executor_cardinality?.primary ?? {};
-      const cl = a?.consensus_latency_stats ?? {};
-      return {
-        timestamp: Date.now(),
-        latencyMedianMs: cl.median_ms ?? null,
-        latencyP99Ms: cl.p99_ms ?? null,
-        latencyMaxMs: cl.max_ms ?? null,
-        latencyMeanMs: cl.mean_ms ?? null,
-        roundHeight: b.last_round ?? a.last_round ?? null,
-        roundsPerSec: b.last_round != null && a.last_round != null ? (b.last_round - a.last_round) / dt : null,
-        submissionsTotal: b.unique_submissions ?? a.unique_submissions ?? null,
-        submissionsPerSec: b.unique_submissions != null && a.unique_submissions != null ? (b.unique_submissions - a.unique_submissions) / dt : null,
-        activeAccounts: pa.cached_accounts ?? null,
-        totalAccounts: pa.world_accounts ?? null,
-        rewardPool: pa.reward_pool_balance ?? null,
-        workerSaturation: a?.edge_verify?.bulk_edge_verify_worker_saturation ?? null,
-        queueDepth: a?.edge_verify?.bulk_edge_verify_queue_depth ?? null,
-        sigAccept: a?.edge_verify?.bulk_edge_verify_total?.accept ?? null,
-        sigRejectSig: a?.edge_verify?.bulk_edge_verify_total?.reject_sig ?? null,
-        sigRejectUnauth: a?.edge_verify?.bulk_edge_verify_total?.reject_unauth ?? null,
-      };
-    });
-    res.json(result);
+    res.json(await computePerformance());
   } catch (error) {
     console.error('performance error:', error);
     res.status(502).json({ error: 'metrics unavailable' });
