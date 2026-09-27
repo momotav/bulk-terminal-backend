@@ -2,6 +2,10 @@
 
 import { getActiveSymbols } from './markets';
 import { bulkFetch } from './bulkAuth';
+import { swrCache } from './cache';
+import { getRequestNetwork } from './networkContext';
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const BULK_API_URL = process.env.BULK_API_URL || 'https://exchange-api.bulk.trade/api/v1';
 
@@ -220,19 +224,63 @@ class BulkApiService {
   }
 
   // Fetch account data for a wallet
-  async getFullAccount(walletAddress: string): Promise<FullAccount | null> {
-    try {
-      const res = await bulkFetch(`${this.baseUrl}/account`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'fullAccount', user: walletAddress }),
-      });
-      if (!res.ok) return null;
-      const data = await res.json() as AccountResponse[];
-      if (data && data[0] && data[0].fullAccount) {
-        return data[0].fullAccount;
+  // POST /account for a given `type`, with a per-attempt timeout and a short
+  // retry-with-backoff on the transient statuses BULK returns under load —
+  // chiefly 429 (rate limit) and 5xx. Without this a single 429 made a wallet
+  // page render fully empty until a later poll happened to hit a 200, which is
+  // exactly the "no data, then everything a minute later" bug users saw.
+  //
+  // Throws on final failure so the swrCache wrappers serve a STALE copy (or the
+  // caller falls back to its own empty shape) rather than caching the failure.
+  private async postAccount(walletAddress: string, type: string, timeoutMs = 8000): Promise<unknown> {
+    const maxAttempts = 3;
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await bulkFetch(`${this.baseUrl}/account`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type, user: walletAddress }),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (res.ok) return await res.json();
+        // 429 / 5xx are transient — back off and retry within the request.
+        if ((res.status === 429 || res.status >= 500) && attempt < maxAttempts) {
+          await sleep(300 * attempt + Math.floor(Math.random() * 150));
+          continue;
+        }
+        throw new Error(`BULK /account ${type} returned ${res.status}`);
+      } catch (err) {
+        clearTimeout(timer);
+        lastErr = err;
+        if (attempt < maxAttempts) {
+          await sleep(300 * attempt + Math.floor(Math.random() * 150));
+          continue;
+        }
+        throw err;
       }
-      return null;
+    }
+    throw lastErr;
+  }
+
+  // Live account (open positions, margin, balances). Coalesced + cached briefly
+  // via swrCache so the several near-simultaneous reads one wallet page fires
+  // (this call, the closed-positions route, background polls) share ONE upstream
+  // request instead of each hitting BULK — the duplicate fan-out was what tripped
+  // BULK's rate limiter. On a transient upstream failure swrCache serves the last
+  // good copy, so the page keeps showing data instead of blanking.
+  async getFullAccount(walletAddress: string): Promise<FullAccount | null> {
+    const net = getRequestNetwork();
+    const key = `bulk:acct:full:${net}:${walletAddress}`;
+    try {
+      return await swrCache<FullAccount | null>(key, 20, async () => {
+        const data = await this.postAccount(walletAddress, 'fullAccount') as AccountResponse[];
+        if (data && data[0] && data[0].fullAccount) return data[0].fullAccount;
+        return null;
+      }, 600);
     } catch (error) {
       console.error(`Failed to fetch account for ${walletAddress}:`, error);
       return null;
@@ -431,97 +479,68 @@ class BulkApiService {
   // a habit of wrapping responses inconsistently (single-object .X vs
   // array .X vs flat).
   async getClosedPositions(walletAddress: string): Promise<unknown[]> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
+    const net = getRequestNetwork();
+    const key = `bulk:acct:closed:${net}:${walletAddress}`;
     try {
-      const res = await bulkFetch(`${this.baseUrl}/account`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'positions', user: walletAddress }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) {
-        console.warn(
-          `[bulkApi.getClosedPositions] BULK returned ${res.status} for ${walletAddress.slice(0, 8)}…`
-        );
-        return [];
-      }
-      const parsed = await res.json() as unknown;
-      // v1.0.17 paged envelope { data: [...], page } vs older bare array.
-      const data: unknown[] = Array.isArray(parsed)
-        ? parsed
-        : (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).data))
-          ? ((parsed as Record<string, unknown>).data as unknown[])
-          : [];
-      const results: unknown[] = [];
+      // Coalesced + retried (see postAccount) so the wallet page's initial
+      // render and its Recent Trades panel share one upstream call instead of
+      // racing two /account requests into BULK's rate limiter. On a transient
+      // failure swrCache serves the last good list rather than blanking.
+      return await swrCache<unknown[]>(key, 20, async () => {
+        const parsed = await this.postAccount(walletAddress, 'positions');
+        // v1.0.17 paged envelope { data: [...], page } vs older bare array.
+        const data: unknown[] = Array.isArray(parsed)
+          ? parsed
+          : (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).data))
+            ? ((parsed as Record<string, unknown>).data as unknown[])
+            : [];
+        const results: unknown[] = [];
 
-      // Envelope rows are flat positions; older shapes wrap under one of these
-      // keys ([{ position: {...} }] / [{ positions: [...] }]). Handle both.
-      const wrapperKeys = ['position', 'positions', 'closedPosition'];
-      if (Array.isArray(data)) {
-        for (const raw of data) {
-          if (!raw || typeof raw !== 'object') continue;
-          const obj = raw as Record<string, unknown>;
-          let extracted = false;
-          for (const k of wrapperKeys) {
-            if (k in obj) {
-              const v = obj[k];
-              if (Array.isArray(v)) {
-                results.push(...v);
-              } else if (v && typeof v === 'object') {
-                results.push(v);
+        // Envelope rows are flat positions; older shapes wrap under one of these
+        // keys ([{ position: {...} }] / [{ positions: [...] }]). Handle both.
+        const wrapperKeys = ['position', 'positions', 'closedPosition'];
+        if (Array.isArray(data)) {
+          for (const raw of data) {
+            if (!raw || typeof raw !== 'object') continue;
+            const obj = raw as Record<string, unknown>;
+            let extracted = false;
+            for (const k of wrapperKeys) {
+              if (k in obj) {
+                const v = obj[k];
+                if (Array.isArray(v)) {
+                  results.push(...v);
+                } else if (v && typeof v === 'object') {
+                  results.push(v);
+                }
+                extracted = true;
+                break;
               }
-              extracted = true;
-              break;
+            }
+            if (!extracted) {
+              // Flat shape — the element itself is the position
+              results.push(raw);
             }
           }
-          if (!extracted) {
-            // Flat shape — the element itself is the position
-            results.push(raw);
-          }
         }
-      }
-      if (results.length === 0) {
-        try {
-          const preview = JSON.stringify(data).slice(0, 500);
-          console.warn(
-            `[bulkApi.getClosedPositions] EMPTY for ${walletAddress.slice(0, 8)}… — ` +
-              `data type: ${Array.isArray(data) ? `array(${data.length})` : typeof data}, ` +
-              `raw preview: ${preview}`
-          );
-        } catch { /* ignore */ }
-      }
-      const sample = results[0] as { symbol?: string } | undefined;
-      console.log(
-        `[bulkApi.getClosedPositions] ${walletAddress.slice(0, 8)}… → ${results.length} positions` +
-          (sample?.symbol ? ` (sample symbol: "${sample.symbol}")` : '')
-      );
-      // One-time dump of the first raw position's full shape so we can see
-      // which field names BULK actually uses for entry/close/size. Only
-      // logged when results > 0 (no point dumping when EMPTY already
-      // dumped). We log keys + the full JSON of the first item, capped to
-      // 800 chars so Railway logs stay readable.
-      if (results.length > 0) {
-        try {
-          const first = results[0] as Record<string, unknown>;
-          const keys = Object.keys(first).join(', ');
-          const preview = JSON.stringify(first).slice(0, 800);
-          console.log(
-            `[bulkApi.getClosedPositions] sample keys: [${keys}]\n` +
-              `  full sample: ${preview}`
-          );
-        } catch {
-          /* serialization failure shouldn't crash the route */
+        if (results.length === 0) {
+          try {
+            const preview = JSON.stringify(data).slice(0, 500);
+            console.warn(
+              `[bulkApi.getClosedPositions] EMPTY for ${walletAddress.slice(0, 8)}… — ` +
+                `data type: ${Array.isArray(data) ? `array(${data.length})` : typeof data}, ` +
+                `raw preview: ${preview}`
+            );
+          } catch { /* ignore */ }
         }
-      }
-      return results;
+        const sample = results[0] as { symbol?: string } | undefined;
+        console.log(
+          `[bulkApi.getClosedPositions] ${walletAddress.slice(0, 8)}… → ${results.length} positions` +
+            (sample?.symbol ? ` (sample symbol: "${sample.symbol}")` : '')
+        );
+        return results;
+      }, 600);
     } catch (error: any) {
-      clearTimeout(timer);
-      const reason =
-        error?.name === 'AbortError'
-          ? 'timed out after 8s'
-          : error?.message || 'unknown error';
+      const reason = error?.message || 'unknown error';
       console.error(
         `[bulkApi.getClosedPositions] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
       );
