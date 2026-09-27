@@ -14,10 +14,12 @@ const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
 // BULK's executor stores ONE-SIDED open interest: ΔOI = (Δ|buyer| + Δ|seller|)/2,
 // so /stats and ticker `openInterest` report a single side. The industry /
-// DefiLlama convention is total OI = long + short = 2× the one-sided value
-// (long OI = short OI = BULK OI). We surface the two-sided total everywhere OI
-// is displayed, so multiply BULK's OI by this at each output.
-const OI_SIDE_FACTOR = 2;
+// OI display factor at each output. We used to surface a two-sided total
+// (long + short = 2× BULK's one-sided value, per the DefiLlama convention).
+// As of 2026-09-27 the BULK dev confirmed BULK now reports the full OI
+// directly, so we display it as-is — factor is 1. (Kept as a named constant so
+// the convention is documented and reversible in one place.)
+const OI_SIDE_FACTOR = 1;
 
 // NOTE: the old `const MARKETS = ['BTC-USD', ...]` constant was removed.
 // Every caller now resolves the live market list via `getActiveSymbols()`
