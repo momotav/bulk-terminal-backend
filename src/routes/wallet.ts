@@ -295,6 +295,15 @@ router.get('/:address', async (req: Request, res: Response) => {
       history: deriveHistoryFromClosedPositions(closedPositions || [], account),
     };
 
+    // Closed positions are the ONLY source of the PnL history curve. If the
+    // account has booked realized PnL (which can only come from closed
+    // positions) but we got zero of them back, the fetch was rate-limited /
+    // degraded and the derived history collapsed to a single "now" point — the
+    // "empty PnL chart, then full after ~30s" the wallet page showed. Detect
+    // that so we DON'T lock the degraded curve into the 30s/5min caches.
+    const netRealized = (netted?.margin as { realizedPnl?: number } | undefined)?.realizedPnl ?? 0;
+    const historyDegraded = (closedPositions?.length ?? 0) === 0 && Math.abs(netRealized) > 1e-4;
+
     // Fire-and-forget: maintain the traders DB row (last_seen + total_pnl
     // fallback). We pass the ORIGINAL gross account because the helper
     // does its own netting from margin.* before writing. Previously this
@@ -305,9 +314,14 @@ router.get('/:address', async (req: Request, res: Response) => {
 
     // Cache for both fresh (30s) and stale (5min) keys. The stale key is
     // only consulted when BULK fails on a future request.
+    //
+    // When the history is degraded, cache it only briefly (5s) so the wallet
+    // page's 10s poll recovers the full curve within one cycle instead of being
+    // stuck on the single-point chart for 30s — and never overwrite the
+    // long-lived stale copy with the degraded result.
     await Promise.all([
-      setCache(freshKey, result, 30),
-      setCache(staleKey, result, 300),
+      setCache(freshKey, result, historyDegraded ? 5 : 30),
+      ...(historyDegraded ? [] : [setCache(staleKey, result, 300)]),
     ]);
 
     res.json(result);
