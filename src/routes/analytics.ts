@@ -12,6 +12,41 @@ const router = Router();
 // BULK API base URL
 const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// The fetch Response type (distinct from Express's `Response` imported above).
+type FetchResponse = Awaited<ReturnType<typeof bulkFetch>>;
+
+// GET a BULK endpoint with a per-attempt timeout and a short retry on the
+// transient statuses BULK returns under load (429 rate-limit, 5xx). Used by the
+// per-symbol fan-outs (klines/tickers) where a single dropped symbol silently
+// undercounts an aggregate (e.g. 24h volume) — a retry recovers most of those.
+// Returns null on final failure so callers can decide how to degrade.
+async function bulkGetRetry(url: string, timeoutMs = 5000, attempts = 3): Promise<FetchResponse | null> {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const r = await bulkFetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+      if (r.ok) return r;
+      if ((r.status === 429 || r.status >= 500) && attempt < attempts) {
+        await sleep(250 * attempt + Math.floor(Math.random() * 150));
+        continue;
+      }
+      return null;
+    } catch {
+      clearTimeout(timer);
+      if (attempt < attempts) {
+        await sleep(250 * attempt + Math.floor(Math.random() * 150));
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
 // BULK's executor stores ONE-SIDED open interest: ΔOI = (Δ|buyer| + Δ|seller|)/2,
 // so /stats and ticker `openInterest` report a single side. The industry /
 // OI display factor at each output. We used to surface a two-sided total
@@ -136,8 +171,8 @@ async function fetchTickersForStats(): Promise<{ volume24h: number; openInterest
 
   const symbols = await getActiveSymbols();
   const tickerPromises = symbols.map(symbol =>
-    bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`)
-      .then(r => r.ok ? r.json() as Promise<BulkTicker> : null)
+    bulkGetRetry(`${BULK_API_BASE}/ticker/${symbol}`)
+      .then(r => r ? r.json() as Promise<BulkTicker> : null)
       .catch(() => null)
   );
 
@@ -367,28 +402,30 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     // Note: BULK's klines endpoint ignores the `limit` query param and
     // returns ~95-100 hourly candles (their full retention). We slice
     // to the last 24 entries client-side to get a real 24h window.
+    // Track how many symbols' klines we actually got. A single dropped symbol
+    // (429/timeout) silently removes its whole 24h volume from the total, so a
+    // partial fan-out reads "less than real" and a total failure reads 0 — the
+    // exact "volume shows less or 0" bug. We count successes so we can tell a
+    // real zero from a degraded fetch and fall back accordingly.
+    let symbolCount = 0;
+    let klineOkCount = 0;
     try {
       const symbols = await getActiveSymbols();
+      symbolCount = symbols.length;
 
       const klineResults = await Promise.allSettled(
         symbols.map(async (symbol) => {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 5000);
-          try {
-            const r = await bulkFetch(
-              `${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=24`,
-              { signal: controller.signal }
-            );
-            if (!r.ok) return [];
-            return (await r.json()) as Array<{ v?: number; c?: number; t?: number }>;
-          } finally {
-            clearTimeout(timer);
-          }
+          const r = await bulkGetRetry(
+            `${BULK_API_BASE}/klines?symbol=${symbol}&interval=1h&limit=24`
+          );
+          if (!r) return null;
+          return (await r.json()) as Array<{ v?: number; c?: number; t?: number }>;
         })
       );
 
       for (const res of klineResults) {
-        if (res.status !== 'fulfilled') continue;
+        if (res.status !== 'fulfilled' || res.value == null) continue;
+        klineOkCount++;
         const klines = res.value;
         // Take the last 24 entries (newest). BULK returns chronological
         // ascending, so .slice(-24) gives us the trailing 24h window.
@@ -402,6 +439,11 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     } catch (e) {
       console.error('Failed to compute rolling 24h volume from klines:', e);
     }
+    // Volume is untrustworthy if it's empty or if a big chunk of the per-symbol
+    // klines fetches dropped out — treat that as "needs a fallback", separate
+    // from OI (below).
+    const volumeDegraded =
+      totalVolume24h === 0 || (symbolCount > 0 && klineOkCount < symbolCount * 0.7);
 
     // Open interest stays from BULK's /stats — OI is a live point-in-time
     // value, not a windowed sum, so /stats's OI is correct as-is.
@@ -430,17 +472,35 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       console.error('Failed to fetch BULK OI from /stats:', e);
     }
 
-    // FALLBACK: if everything failed, use the per-ticker helper
-    if (totalVolume24h === 0 && totalOpenInterest === 0) {
-      console.log('⚠️ Rolling 24h + /stats both empty, falling back to individual tickers...');
+    // FALLBACK — decoupled per-metric. The old code only fell back when BOTH
+    // volume and OI were zero, so a degraded/0 volume with a healthy OI got
+    // returned as 0. Now volume recovers from tickers whenever it's degraded,
+    // independently of OI.
+    if (volumeDegraded || totalOpenInterest === 0) {
+      console.log(
+        `⚠️ exchange-stats fallback to tickers (volumeDegraded=${volumeDegraded}, klines ${klineOkCount}/${symbolCount}, OI=${totalOpenInterest})`
+      );
       try {
         const tickerStats = await fetchTickersForStats();
-        totalVolume24h = tickerStats.volume24h;
-        totalOpenInterest = tickerStats.openInterest;
-        timestamp = tickerStats.timestamp;
+        // Only replace volume with the ticker sum when it's a MORE complete
+        // number (bigger) than the possibly-undercounted klines total.
+        if (volumeDegraded && tickerStats.volume24h > totalVolume24h) {
+          totalVolume24h = tickerStats.volume24h;
+        }
+        if (totalOpenInterest === 0 && tickerStats.openInterest > 0) {
+          totalOpenInterest = tickerStats.openInterest;
+        }
+        if (tickerStats.timestamp) timestamp = tickerStats.timestamp;
       } catch (e) {
         console.error('Failed to fetch tickers fallback:', e);
       }
+    }
+
+    // If BOTH sources came back empty for volume, don't cache a 0 — throw so
+    // swrCache serves the last good value (or the caller surfaces a 500 and the
+    // frontend does its own BULK fallback) instead of the dashboard flashing $0.
+    if (totalVolume24h === 0) {
+      throw new Error('exchange-stats: 24h volume unavailable from klines and tickers');
     }
     
     // Active traders. Prefer BULK's executor cardinality (`cached_accounts`) —
