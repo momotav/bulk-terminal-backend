@@ -10,18 +10,18 @@
     "db:migrate": "tsx src/db/migrate.ts"
   },
   "dependencies": {
-    "@privy-io/server-auth": "^1.14.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.18.3",
-    "express-rate-limit": "^8.7.0",
-    "helmet": "^8.3.0",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^8.0.0",
     "ioredis": "^5.3.2",
     "jsonwebtoken": "^9.0.2",
     "node-cron": "^3.0.3",
     "pg": "^8.11.3",
     "ws": "^8.16.0",
+    "@privy-io/server-auth": "^1.14.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
