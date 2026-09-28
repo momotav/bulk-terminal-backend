@@ -1,5 +1,7 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 
 // Load environment variables
@@ -33,6 +35,35 @@ import { requestNetworkMiddleware } from './services/networkContext';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// We sit behind Caddy (reverse_proxy → app:3001), which sets X-Forwarded-For.
+// Trust exactly one proxy hop so req.ip is the REAL client IP — critical for
+// per-IP rate limiting (without this every request looks like Caddy's IP and
+// all users would share one bucket).
+app.set('trust proxy', 1);
+
+// Security headers. This is a JSON API, not an HTML app, so CSP is unnecessary,
+// and the frontend fetches cross-origin — so relax CORP/COEP accordingly.
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  crossOriginEmbedderPolicy: false,
+}));
+
+// Per-IP rate limit. Deliberately generous (600/min ≈ 10 req/s) so legitimate
+// polling — even several users behind one NAT — is never touched, while a
+// single abusive script hammering the API (which previously fanned out to BULK
+// and got our box IP blocked) hits the wall. SSE streams are long-lived and the
+// health check must always answer, so both are skipped.
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/health' || req.path.startsWith('/api/stream'),
+  message: { error: 'Too many requests — please slow down.' },
+});
+app.use(apiLimiter);
 
 // Allowed origins
 const allowedOrigins = [
@@ -76,11 +107,23 @@ app.use(requestNetworkMiddleware);
 // Health check
 app.get('/health', (req, res) => {
   const wsStats = getWebSocketStats();
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     timestamp: new Date().toISOString(),
     websocket: wsStats,
   });
+});
+
+// Gate every /debug/* endpoint behind a secret. These expose raw DB rows and an
+// arbitrary SELECT runner (/debug/sql), so they must never be world-readable.
+// Locked by DEFAULT: with no DEBUG_KEY set they all return 404 (which also
+// hides their existence). Set DEBUG_KEY in the box .env, then call with
+// `?key=<secret>` or an `x-debug-key` header to use them.
+const DEBUG_KEY = process.env.DEBUG_KEY;
+app.use('/debug', (req, res, next) => {
+  const provided = req.get('x-debug-key') || (req.query.key as string | undefined);
+  if (DEBUG_KEY && provided === DEBUG_KEY) return next();
+  return res.status(404).json({ error: 'Not found' });
 });
 
 // Debug endpoint to check actual database values
