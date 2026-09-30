@@ -1439,6 +1439,43 @@ router.get('/market-liquidations/:coin', async (req: Request, res: Response) => 
   }
 });
 
+// Liquidation MAP — raw liquidation events for a coin over a window, plus the
+// live price. The frontend buckets these into a price-profile (long/short +
+// cumulative) or a time×price heatmap, with Fine/Medium/Coarse granularity and
+// Coin/USD denomination — all client-side from this one payload.
+//
+// Note: this is our recorded liquidation EVENTS (what actually happened), not a
+// projected liquidation map — BULK doesn't expose aggregate open positions, so a
+// forward-looking "liquidation levels" map isn't possible. This shows the real
+// liquidation landscape and fills in as more events are recorded.
+router.get('/liquidations/map/:coin', async (req: Request, res: Response) => {
+  const { coin } = req.params;
+  const dbSymbol = coin.includes('-') ? coin.toUpperCase() : `${coin.toUpperCase()}-USD`;
+  const hours = Math.min(parseInt(req.query.hours as string) || 720, 8760 * 2);
+  try {
+    const events = await query<{ side: string; price: number; size: number; value: number; timestamp: string }>(`
+      SELECT side, price::float AS price, size::float AS size, value::float AS value,
+             (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint AS timestamp
+      FROM liquidations
+      WHERE symbol = $1 AND timestamp > NOW() - INTERVAL '${hours} hours'
+      ORDER BY timestamp ASC
+      LIMIT 20000
+    `, [dbSymbol]).catch(() => []);
+
+    // Live price from BULK's official ticker (retry through the 429 storm).
+    let currentPrice = 0;
+    try {
+      const r = await bulkGetRetry(`${BULK_API_BASE}/ticker/${dbSymbol}`);
+      if (r) { const t = await r.json() as any; currentPrice = Number(t.markPrice || t.lastPrice) || 0; }
+    } catch { /* price optional */ }
+
+    res.json({ symbol: dbSymbol, currentPrice, events });
+  } catch (error) {
+    console.error('liquidations/map error:', error);
+    res.json({ symbol: dbSymbol, currentPrice: 0, events: [] });
+  }
+});
+
 // Get liquidations chart data from database
 // NOTE: Only shows data from BULK API launch (April 13, 2026 19:00 UTC) for chart alignment
 router.get('/liquidations-chart', async (req: Request, res: Response) => {
