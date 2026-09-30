@@ -752,40 +752,25 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
   const isAllTime = hours >= 8760;
 
   try {
-    // Hybrid source, best of both:
-    //  • Longer views (W/M/Q/Y/ALL) use BULK klines — they hold the full ~25
-    //    days of mainnet history, which our `trades` table can't (it's pruned to
-    //    2 days). Klines now retry on 429 so the background /account storm no
-    //    longer empties them.
-    //  • The 1D view uses our own fills DB — hourly, always available, immune to
-    //    BULK rate limits.
-    // The cumulative line is anchored to the klines ALL-TIME total in BOTH cases,
-    // so it carries over from real history (never restarts at 0) and reads the
-    // same end value across every timeframe.
+    // BULK official data first (per the data-source rule): BULK klines are the
+    // authoritative source and hold the full ~30 days of mainnet history. Klines
+    // retry on 429 so the background /account storm no longer empties them. Our
+    // own fills DB is used ONLY as a fallback, and only for the recent window,
+    // if klines still comes back empty (e.g. a sustained rate-limit).
     const snap = await getVolumeKlinesSnapshot();
     const klinesAllTime = snap.allTimeTotal;
     const sumCoins = (d: Record<string, number>) => Object.values(d).reduce((s, v) => s + (typeof v === 'number' ? v : 0), 0);
+    const hourlyMap = new Map<number, Record<string, number>>(snap.hourly);
 
-    // Build the window's { bucketMs → { coin → vol } } map.
+    // Build the window's { bucketMs → { coin → vol } } map from klines.
+    const now = Date.now();
+    const startTime = isAllTime ? 0 : now - hours * 60 * 60 * 1000;
     const outputMap = new Map<number, Record<string, number>>();
     if (hours <= 24) {
-      const rows = await query<{ bucket: string; symbol: string; vol: string }>(
-        `SELECT date_trunc('hour', timestamp) AS bucket, symbol, SUM(value) AS vol
-         FROM trades
-         WHERE network = $1 AND timestamp > NOW() - INTERVAL '24 hours'
-         GROUP BY date_trunc('hour', timestamp), symbol
-         ORDER BY date_trunc('hour', timestamp) ASC`, [net]
-      ).catch(() => []);
-      for (const r of rows) {
-        const ts = new Date(r.bucket).getTime();
-        if (!outputMap.has(ts)) outputMap.set(ts, {});
-        const coin = coinFromSymbol(r.symbol);
-        const dict = outputMap.get(ts)!;
-        dict[coin] = (dict[coin] || 0) + parseFloat(r.vol || '0');
-      }
+      // Hourly, straight from the klines snapshot.
+      for (const [ts, vol] of hourlyMap) if (ts >= startTime) outputMap.set(ts, vol);
     } else {
       // Roll the klines hourly snapshot up to daily buckets.
-      const hourlyMap = new Map<number, Record<string, number>>(snap.hourly);
       const dailyMap = new Map<number, Record<string, number>>();
       for (const [ts, vol] of hourlyMap) {
         const d = new Date(ts);
@@ -794,12 +779,32 @@ router.get('/volume-chart-api', async (req: Request, res: Response) => {
         const day = dailyMap.get(dayStart)!;
         for (const [c, v] of Object.entries(vol)) day[c] = (day[c] || 0) + v;
       }
-      const now = Date.now();
-      const startTime = isAllTime ? 0 : now - hours * 60 * 60 * 1000;
       for (const [ts, vol] of dailyMap) if (isAllTime || ts >= startTime) outputMap.set(ts, vol);
     }
 
-    const windowTotal = Array.from(outputMap.values()).reduce((s, v) => s + sumCoins(v), 0);
+    let windowTotal = Array.from(outputMap.values()).reduce((s, v) => s + sumCoins(v), 0);
+
+    // FALLBACK ONLY: if klines gave us nothing for the window (sustained 429),
+    // fill the recent window from our own fills DB so the chart still renders.
+    if (windowTotal === 0) {
+      const bucket = hours <= 24 ? 'hour' : 'day';
+      const rows = await query<{ bucket: string; symbol: string; vol: string }>(
+        `SELECT date_trunc('${bucket}', timestamp) AS bucket, symbol, SUM(value) AS vol
+         FROM trades
+         WHERE network = $1 AND timestamp > NOW() - INTERVAL '${hours} hours'
+         GROUP BY date_trunc('${bucket}', timestamp), symbol
+         ORDER BY date_trunc('${bucket}', timestamp) ASC`, [net]
+      ).catch(() => []);
+      for (const r of rows) {
+        const ts = new Date(r.bucket).getTime();
+        if (!outputMap.has(ts)) outputMap.set(ts, {});
+        const coin = coinFromSymbol(r.symbol);
+        const dict = outputMap.get(ts)!;
+        dict[coin] = (dict[coin] || 0) + parseFloat(r.vol || '0');
+      }
+      windowTotal = Array.from(outputMap.values()).reduce((s, v) => s + sumCoins(v), 0);
+    }
+
     // Anchor to the fuller klines all-time; fall back to the window if klines
     // is unavailable so the line still renders.
     const anchor = klinesAllTime > 0 ? klinesAllTime : windowTotal;
