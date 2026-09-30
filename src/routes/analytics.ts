@@ -745,55 +745,58 @@ async function getVolumeKlinesSnapshot(): Promise<{ hourly: Array<[number, Recor
 
 router.get('/volume-chart-api', async (req: Request, res: Response) => {
   const hours = parseInt(req.query.hours as string) || 24;
-  const isAllTime = hours >= 8760; // 1 year or more = ALL time
+  const net = getRequestNetwork();
+  // Hourly bars for the 1D view; daily beyond. Both from our OWN fills table.
+  const bucket = hours <= 24 ? 'hour' : 'day';
 
   try {
-    // One shared klines snapshot for all timeframes (see helper above).
-    const snap = await getVolumeKlinesSnapshot();
-    const symbols = snap.symbols;
-    const hourlyMap = new Map<number, Record<string, number>>(snap.hourly);
-    const allTimeTotal = snap.allTimeTotal;
+    // Sourced from our indexed `trades` (not BULK klines): BULK rate-limits our
+    // klines fan-out under load (the volume chart went empty when a background
+    // job saturated /account with 429s), and our fills DB is the reliable,
+    // always-available source — the same one the KPI volume + sparklines use, so
+    // the chart agrees with the headline. Coalesced + cached 60s.
+    const data = await swrCache(`analytics:vol_chart_db:${net}:${bucket}:${hours}`, 60, async () => {
+      const [rows, allRows] = await Promise.all([
+        query<{ bucket: string; symbol: string; vol: string }>(
+          `SELECT date_trunc('${bucket}', timestamp) AS bucket, symbol, SUM(value) AS vol
+           FROM trades
+           WHERE network = $1 AND timestamp > NOW() - INTERVAL '${hours} hours'
+           GROUP BY date_trunc('${bucket}', timestamp), symbol
+           ORDER BY date_trunc('${bucket}', timestamp) ASC`, [net]
+        ).catch(() => []),
+        // All-time total for the cumulative anchor, so the line carries over
+        // from prior history instead of restarting at 0 per timeframe.
+        query<{ v: string }>(
+          `SELECT COALESCE(SUM(value), 0) AS v FROM trades WHERE network = $1`, [net]
+        ).catch(() => [{ v: '0' }]),
+      ]);
 
-    const sumOfCoins = (dict: Record<string, number>): number =>
-      Object.values(dict).reduce((s, v) => s + (typeof v === 'number' ? v : 0), 0);
+      const allTimeTotal = parseFloat(allRows[0]?.v || '0');
 
-    const now = Date.now();
-    const startTime = isAllTime ? 0 : now - hours * 60 * 60 * 1000;
-
-    // Window bars: hourly for the 1D view, rolled up to daily for W/M/ALL. Both
-    // are slices of the SAME shared snapshot, so they compose consistently.
-    const outputMap = new Map<number, Record<string, number>>();
-    if (hours <= 24) {
-      for (const [ts, vol] of hourlyMap) if (ts >= startTime) outputMap.set(ts, vol);
-    } else {
-      const dailyMap = new Map<number, Record<string, number>>();
-      for (const [ts, vol] of hourlyMap) {
-        const d = new Date(ts);
-        const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
-        if (!dailyMap.has(dayStart)) dailyMap.set(dayStart, zeroCoinDict(symbols));
-        const day = dailyMap.get(dayStart)!;
-        for (const [c, v] of Object.entries(vol)) day[c] = (day[c] || 0) + v;
+      // Group into { bucketTs → { coin → volume } }.
+      const byBucket = new Map<string, Record<string, number>>();
+      for (const r of rows) {
+        const ts = new Date(r.bucket).toISOString();
+        if (!byBucket.has(ts)) byBucket.set(ts, {});
+        const coin = coinFromSymbol(r.symbol);
+        const dict = byBucket.get(ts)!;
+        dict[coin] = (dict[coin] || 0) + parseFloat(r.vol || '0');
       }
-      for (const [ts, vol] of dailyMap) if (isAllTime || ts >= startTime) outputMap.set(ts, vol);
-    }
 
-    // Anchor the cumulative to the shared all-time total so its END value is the
-    // SAME for every timeframe — klines holds one fixed window, so "total volume"
-    // is a single number every view should agree on.
-    const windowTotal = Array.from(outputMap.values()).reduce((s, v) => s + sumOfCoins(v), 0);
-    let cumulative = Math.max(0, allTimeTotal - windowTotal);
-
-    const data = Array.from(outputMap.entries())
-      .sort((a, b) => a[0] - b[0])
-      .map(([ts, vol]) => {
-        const total = sumOfCoins(vol);
+      const sorted = Array.from(byBucket.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+      const sumDict = (d: Record<string, number>) => Object.values(d).reduce((s, v) => s + v, 0);
+      const windowTotal = sorted.reduce((s, [, d]) => s + sumDict(d), 0);
+      let cumulative = Math.max(0, allTimeTotal - windowTotal);
+      return sorted.map(([ts, dict]) => {
+        const total = sumDict(dict);
         cumulative += total;
-        return buildAdditiveRow(new Date(ts).toISOString(), vol, { total, Cumulative: cumulative });
+        return buildAdditiveRow(ts, dict, { total, Cumulative: cumulative });
       });
+    });
 
     res.json({ data });
   } catch (error) {
-    console.error('Error fetching volume chart from API:', error);
+    console.error('Error fetching volume chart (db):', error);
     res.status(500).json({ error: 'Failed to fetch volume chart' });
   }
 });
