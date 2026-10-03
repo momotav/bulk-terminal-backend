@@ -20,8 +20,14 @@ import { bulkApi } from '../services/bulkApi';
 import { isSystemWallet } from '../services/systemWallets';
 
 const REFRESH_MS = 5 * 60_000; // re-rank every 5 minutes
-const TOP_N = 300;             // enrich the top-N traders by collected volume
-const SPACING_MS = 150;        // gap between BULK account calls (throttle)
+const TOP_N = 250;             // enrich the top-N traders by collected volume
+// Gap between BULK /account calls. At 150ms this fired a ~45s burst of ~6-7
+// req/s every cycle, which starved user-facing /account reads and 429'd them
+// (wallet pages showed volume but "no trades / no fills"). 500ms spreads the
+// 250 calls over ~2 min as a gentle ~2 req/s trickle, leaving BULK headroom for
+// live page traffic. Still well inside the 5-min cycle.
+const SPACING_MS = 500;
+const JITTER_MS = 200;             // ± randomization so calls don't align to a beat
 const FIRST_RUN_DELAY_MS = 30_000; // let the server settle after boot
 
 let running = false;
@@ -69,7 +75,7 @@ async function enrichOnce(): Promise<void> {
       } catch {
         // One bad/absent account must not abort the sweep.
       }
-      await new Promise((r) => setTimeout(r, SPACING_MS));
+      await new Promise((r) => setTimeout(r, SPACING_MS + Math.floor((Math.random() - 0.5) * 2 * JITTER_MS)));
     }
 
     // Bound the snapshot table: the whales query only looks back 24h.

@@ -367,23 +367,16 @@ class BulkApiService {
   // failures, but we log loudly so Railway logs show the actual reason
   // when fills appear missing on the frontend.
   async getFills(walletAddress: string): Promise<unknown[]> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
+    const net = getRequestNetwork();
+    const key = `bulk:acct:fills:${net}:${walletAddress}`;
     try {
-      const res = await bulkFetch(`${this.baseUrl}/account`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'fills', user: walletAddress }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) {
-        console.warn(
-          `[bulkApi.getFills] BULK returned ${res.status} for ${walletAddress.slice(0, 8)}…`
-        );
-        return [];
-      }
-      const parsed = await res.json() as unknown;
+      // Coalesced + retried, same as getFullAccount/getClosedPositions. Before
+      // this, fills went straight to bulkFetch with ONE attempt and returned []
+      // on a 429 — so under load (e.g. the enrichment sweep) the wallet page
+      // showed its live snapshot but "no trades / no fills". postAccount retries
+      // 429/5xx, and swrCache serves the last good list on a hard failure.
+      return await swrCache<unknown[]>(key, 20, async () => {
+      const parsed = await this.postAccount(walletAddress, 'fills');
       // BULK v1.0.17 wraps history in a paged envelope { data: [...], page: {...} };
       // older builds returned a bare array. Normalize both to a row array — without
       // this the envelope object failed the Array.isArray check below and EVERY
@@ -453,11 +446,11 @@ class BulkApiService {
           (sample?.symbol ? ` (sample symbol: "${sample.symbol}")` : '')
       );
       return results;
+      }, 600);
     } catch (error: any) {
-      clearTimeout(timer);
       const reason =
         error?.name === 'AbortError'
-          ? 'timed out after 8s'
+          ? 'timed out'
           : error?.message || 'unknown error';
       console.error(
         `[bulkApi.getFills] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
@@ -573,23 +566,14 @@ class BulkApiService {
   // Same defensive shape-detection as getFills / getClosedPositions so a
   // future BULK rewrap doesn't silently break the panel.
   async getRiskHistory(walletAddress: string): Promise<RawRiskEvent[]> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
+    const net = getRequestNetwork();
+    const key = `bulk:acct:risk:${net}:${walletAddress}`;
     try {
-      const res = await bulkFetch(`${this.baseUrl}/account`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'riskHistory', user: walletAddress }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) {
-        console.warn(
-          `[bulkApi.getRiskHistory] BULK returned ${res.status} for ${walletAddress.slice(0, 8)}…`
-        );
-        return [];
-      }
-      const parsed = await res.json() as unknown;
+      // Coalesced + retried (postAccount) + stale-on-failure, same as fills /
+      // closed positions — so a 429 during a load spike doesn't blank the
+      // wallet's liquidations panel on a single miss.
+      return await swrCache<RawRiskEvent[]>(key, 20, async () => {
+      const parsed = await this.postAccount(walletAddress, 'riskHistory');
       const results: RawRiskEvent[] = [];
 
       // BULK v1.0.17 wraps history in a paged envelope { data: [...], page: {...} };
@@ -641,11 +625,11 @@ class BulkApiService {
         `[bulkApi.getRiskHistory] ${walletAddress.slice(0, 8)}… → ${results.length} events`
       );
       return results;
+      }, 600);
     } catch (error: any) {
-      clearTimeout(timer);
       const reason =
         error?.name === 'AbortError'
-          ? 'timed out after 8s'
+          ? 'timed out'
           : error?.message || 'unknown error';
       console.error(
         `[bulkApi.getRiskHistory] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
