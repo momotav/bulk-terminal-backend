@@ -9,6 +9,33 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const BULK_API_URL = process.env.BULK_API_URL || 'https://exchange-api.bulk.trade/api/v1';
 
+// --- BULK /account concurrency limiter -------------------------------------
+// BULK rate-limits concurrent POST /account calls HARD: a single call in
+// isolation returns fine, but the burst a wallet page fires (fullAccount +
+// positions + fills + per-position fills) gets most of them 429'd to empty,
+// and concurrent retries just collide and fail again. So we funnel EVERY
+// /account request through a small semaphore — at most ACCOUNT_CONCURRENCY in
+// flight at once, the rest queued — so BULK sees a steady trickle instead of a
+// spike. This is the real fix for "wallet page shows $0 / no trades on first
+// load, fills in after a refresh". Serializing adds a little latency; correct
+// data beats fast-but-empty.
+const ACCOUNT_CONCURRENCY = 2;
+let accountInFlight = 0;
+const accountQueue: (() => void)[] = [];
+async function withAccountSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (accountInFlight >= ACCOUNT_CONCURRENCY) {
+    await new Promise<void>((resolve) => accountQueue.push(resolve));
+  }
+  accountInFlight++;
+  try {
+    return await fn();
+  } finally {
+    accountInFlight--;
+    const next = accountQueue.shift();
+    if (next) next();
+  }
+}
+
 export interface Ticker {
   symbol: string;
   lastPrice: number;
@@ -239,12 +266,14 @@ class BulkApiService {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const res = await bulkFetch(`${this.baseUrl}/account`, {
+        // Acquire a /account slot only around the network call — the backoff
+        // sleep below happens OUTSIDE the slot so queued calls proceed meanwhile.
+        const res = await withAccountSlot(() => bulkFetch(`${this.baseUrl}/account`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ type, user: walletAddress }),
           signal: controller.signal,
-        });
+        }));
         clearTimeout(timer);
         if (res.ok) return await res.json();
         // 429 / 5xx are transient — back off and retry within the request.
@@ -297,11 +326,11 @@ class BulkApiService {
   // back what came down the wire.
   async getActivityHistory(walletAddress: string): Promise<ActivityEvent[]> {
     try {
-      const res = await bulkFetch(`${this.baseUrl}/account`, {
+      const res = await withAccountSlot(() => bulkFetch(`${this.baseUrl}/account`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'activityHistory', user: walletAddress }),
-      });
+      }));
       if (!res.ok) return [];
       const parsed = await res.json() as unknown;
       // v1.0.17 paged envelope { data: [...], page } vs older bare array.
@@ -336,11 +365,11 @@ class BulkApiService {
   // Fetch order history for a wallet
   async getOrderHistory(walletAddress: string): Promise<unknown[]> {
     try {
-      const res = await bulkFetch(`${this.baseUrl}/account`, {
+      const res = await withAccountSlot(() => bulkFetch(`${this.baseUrl}/account`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'orderHistory', user: walletAddress }),
-      });
+      }));
       if (!res.ok) return [];
       const data = await res.json() as AccountResponse[];
       const results: unknown[] = [];
