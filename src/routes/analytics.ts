@@ -3296,9 +3296,22 @@ router.get('/risk-surfaces/:coin', async (req: Request, res: Response) => {
     // and bloats the payload. 6 decimals == 1e-6 precision == ~100x finer
     // than any MM value the frontend will render.
     const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
+    // v1.0.18: top-level max-leverage decay curve {min,max,margin_0,margin_half}.
+    // margin_0 = notional where max leverage starts decaying; margin_half = the
+    // notional where leverage is halfway between max and min; it asymptotes to
+    // min as notional grows. Forward it so the UI can show the leverage cap.
+    const lev = raw.leverage && typeof raw.leverage === 'object'
+      ? {
+          min: Number(raw.leverage.min),
+          max: Number(raw.leverage.max),
+          margin_0: Number(raw.leverage.margin_0),
+          margin_half: Number(raw.leverage.margin_half),
+        }
+      : null;
     const trimmed = {
       symbol: String(raw.symbol ?? coin),
       liveRegime: Number(raw.liveRegime ?? 0),
+      leverage: lev,
       surfaces: raw.surfaces.map((s: any) => ({
         regime: Number(s.regime),
         leverage: (s.leverage ?? []).map(Number),
