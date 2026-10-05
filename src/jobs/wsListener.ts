@@ -5,6 +5,7 @@ import { getActiveSymbols } from '../services/markets';
 import { bulkFetch } from '../services/bulkAuth';
 import { publishMarketUpdate } from '../services/marketStream';
 import { isSystemWallet } from '../services/systemWallets';
+import { setCache } from '../services/cache';
 
 // Mainnet is the live network (v1.0.19). The box's .env may still override this
 // via BULK_WS_URL — keep that in sync with the network the indexer should track.
@@ -1039,6 +1040,30 @@ function processMessage(data: WebSocket.Data): void {
       return;
     }
 
+    // v1.0.18 size-impact curve (WS only — REST GET /impact is 404 on mainnet).
+    // Shape: { type:'impact', data:{ symbol, timestamp(ns), full:{buy,sell}, book:{buy,sell} } }
+    // where each side = { logMin, logRange, bps:[250] }. `full` is the all-in
+    // impact (incl. liquidation-cascade reserve), `book` is the raw order-book
+    // walk. We cache the latest per symbol for /api/analytics/impact/:coin.
+    if (message.type === 'impact' && message.data?.symbol && message.data?.full) {
+      const d = message.data;
+      const side = (c: any) => (c && Array.isArray(c.bps))
+        ? { logMin: Number(c.logMin), logRange: Number(c.logRange), bps: c.bps.map((n: any) => Math.round(Number(n) * 1e4) / 1e4) }
+        : null;
+      const curve = {
+        symbol: String(d.symbol),
+        timestamp: Math.round(Number(d.timestamp) / 1e6), // ns → ms
+        full: { buy: side(d.full?.buy), sell: side(d.full?.sell) },
+        book: d.book ? { buy: side(d.book?.buy), sell: side(d.book?.sell) } : null,
+        source: 'ws',
+      };
+      if (curve.full.buy && curve.full.sell) {
+        setCache(`analytics:impact:${curve.symbol}`, curve, 120).catch(() => {});
+        setCache(`analytics:impact_stale:${curve.symbol}`, curve, 7 * 86400).catch(() => {});
+      }
+      return;
+    }
+
     // Handle subscription confirmations
     // BULK API v1.0.12: returns { type: "subscriptionResponse", topics: ["ticker.BTC-USD", ...] }
     if (message.type === 'subscriptionResponse' || message.channel === 'subscriptionResponse') {
@@ -1215,10 +1240,14 @@ function connect(): void {
         for (const symbol of symbols) {
           subs.push({ type: 'trades', symbol });
           subs.push({ type: 'ticker', symbol });
+          // v1.0.18 size-impact curve. BULK's REST GET /impact is 404 on
+          // mainnet (curve lives only on the WS stream), so we consume it here
+          // and cache it for /api/analytics/impact/:coin.
+          subs.push({ type: 'impact', symbol });
         }
 
-        // BULK has a 100-subscription per-connection cap. If we ever grow
-        // past that, split into chunks; for now a single batch is fine.
+        // BULK has a 100-subscription per-connection cap (3/market now). If we
+        // ever grow past that, split into chunks; ~22 coins → 66 is fine.
         ws?.send(JSON.stringify({ method: 'subscribe', subscription: subs }));
         console.log(`📡 Sent subscription batch (${subs.length} topics)`);
       } catch (e) {

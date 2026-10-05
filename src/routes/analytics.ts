@@ -3356,49 +3356,17 @@ router.get('/impact/:coin', async (req: Request, res: Response) => {
     return res.status(400).json({ error: `Unsupported market: ${coinParam}` });
   }
 
+  // The curve is published ONLY on BULK's WS `impact` stream (REST GET /impact
+  // 404s on mainnet). Our wsListener subscribes to impact.<symbol> and caches
+  // the latest curve here — so this route just serves that cache, with a 7-day
+  // stale fallback. 404 means the WS hasn't delivered a curve for this market
+  // yet (it publishes ~every 10s once connected).
   const cacheKey = `analytics:impact:${coin}`;
   const cached = await getCache<unknown>(cacheKey);
   if (cached) return res.json(cached);
-
-  const staleKey = `analytics:impact_stale:${coin}`;
-  const serveStale = async (reason: string) => {
-    const stale = await getCache<Record<string, unknown>>(staleKey);
-    if (stale) {
-      console.warn(`Serving stale impact curve for ${coin} (${reason})`);
-      return res.json({ ...stale, stale: true });
-    }
-    return res.status(502).json({ error: 'Upstream impact curve unavailable' });
-  };
-
-  try {
-    const url = `${BULK_API_BASE}/impact?market=${encodeURIComponent(coin)}`;
-    const upstream = await bulkFetch(url);
-    if (upstream.status === 404) {
-      // No curve published yet for this market — distinct from an error.
-      return res.status(404).json({ error: 'No impact curve available for this market yet' });
-    }
-    if (!upstream.ok) return serveStale(`HTTP ${upstream.status}`);
-    const raw: any = await upstream.json();
-    const side = (s: any) => s && Array.isArray(s.bps)
-      ? { logMin: Number(s.logMin), logRange: Number(s.logRange), bps: s.bps.map((n: any) => Math.round(Number(n) * 1e4) / 1e4) }
-      : null;
-    const buyBps = side(raw?.buyBps);
-    const sellBps = side(raw?.sellBps);
-    if (!buyBps || !sellBps) return serveStale('malformed upstream response');
-    const trimmed = {
-      symbol: String(raw.symbol ?? coin),
-      timestamp: Number(raw.timestamp ?? Date.now()),
-      minSize: Number(raw.minSize ?? 0),
-      buyBps,
-      sellBps,
-    };
-    await setCache(cacheKey, trimmed, 30);         // curve refreshes often
-    await setCache(staleKey, trimmed, 7 * 86400);  // stale-if-error fallback
-    return res.json(trimmed);
-  } catch (err) {
-    console.error(`Failed to fetch /impact for ${coin}:`, err);
-    return serveStale('fetch failed');
-  }
+  const stale = await getCache<Record<string, unknown>>(`analytics:impact_stale:${coin}`);
+  if (stale) return res.json({ ...stale, stale: true });
+  return res.status(404).json({ error: 'No impact curve available for this market yet' });
 });
 
 // ============ EXCHANGE INFO (list of all markets from BULK) ============
