@@ -3322,6 +3322,72 @@ router.get('/risk-surfaces/:coin', async (req: Request, res: Response) => {
   }
 });
 
+// ============ SIZE-IMPACT CURVE (BULK v1.0.18 GET /impact) ============
+//
+// BULK's executor-published liquidation-size impact curve for one market: how
+// many bps a market order / liquidation of a given size moves the price, on
+// each side. This is the AUTHORITATIVE impact data (250 log-uniform size knots,
+// deep into the book) — far better than estimating impact from the 20-level
+// l2book. It's the "liquidation impact" input to BULK's new margin reserve
+// (M_p += Σ Nᵢ·(I_all-in − I_cascade)·1e-4); we surface the curve itself rather
+// than recompute the reserve, whose r/R factors are market-internal.
+//
+// Shape (per side): { logMin, logRange, bps:[250] }. Convert a size to bps via
+//   i = (ln(size) − logMin) / logRange × 249, then linear-interp bps[floor..ceil].
+// BULK returns 404 until the first curve is published for that market.
+router.get('/impact/:coin', async (req: Request, res: Response) => {
+  const coinParam = String(req.params.coin || '').toUpperCase();
+  const coin = coinParam.endsWith('-USD') ? coinParam : `${coinParam}-USD`;
+  const allowed = await getActiveSymbols();
+  if (!allowed.includes(coin)) {
+    return res.status(400).json({ error: `Unsupported market: ${coinParam}` });
+  }
+
+  const cacheKey = `analytics:impact:${coin}`;
+  const cached = await getCache<unknown>(cacheKey);
+  if (cached) return res.json(cached);
+
+  const staleKey = `analytics:impact_stale:${coin}`;
+  const serveStale = async (reason: string) => {
+    const stale = await getCache<Record<string, unknown>>(staleKey);
+    if (stale) {
+      console.warn(`Serving stale impact curve for ${coin} (${reason})`);
+      return res.json({ ...stale, stale: true });
+    }
+    return res.status(502).json({ error: 'Upstream impact curve unavailable' });
+  };
+
+  try {
+    const url = `${BULK_API_BASE}/impact?market=${encodeURIComponent(coin)}`;
+    const upstream = await bulkFetch(url);
+    if (upstream.status === 404) {
+      // No curve published yet for this market — distinct from an error.
+      return res.status(404).json({ error: 'No impact curve available for this market yet' });
+    }
+    if (!upstream.ok) return serveStale(`HTTP ${upstream.status}`);
+    const raw: any = await upstream.json();
+    const side = (s: any) => s && Array.isArray(s.bps)
+      ? { logMin: Number(s.logMin), logRange: Number(s.logRange), bps: s.bps.map((n: any) => Math.round(Number(n) * 1e4) / 1e4) }
+      : null;
+    const buyBps = side(raw?.buyBps);
+    const sellBps = side(raw?.sellBps);
+    if (!buyBps || !sellBps) return serveStale('malformed upstream response');
+    const trimmed = {
+      symbol: String(raw.symbol ?? coin),
+      timestamp: Number(raw.timestamp ?? Date.now()),
+      minSize: Number(raw.minSize ?? 0),
+      buyBps,
+      sellBps,
+    };
+    await setCache(cacheKey, trimmed, 30);         // curve refreshes often
+    await setCache(staleKey, trimmed, 7 * 86400);  // stale-if-error fallback
+    return res.json(trimmed);
+  } catch (err) {
+    console.error(`Failed to fetch /impact for ${coin}:`, err);
+    return serveStale('fetch failed');
+  }
+});
+
 // ============ EXCHANGE INFO (list of all markets from BULK) ============
 
 // Proxy BULK's /exchangeInfo so the frontend doesn't have to hit the external
