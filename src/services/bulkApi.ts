@@ -36,6 +36,27 @@ async function withAccountSlot<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// Per-wallet serialization. A single wallet page fires fullAccount + positions +
+// fills (+ rank) at once; BULK 429s the CONCURRENT burst even for one wallet —
+// which is why a COLD (not-yet-cached, non-leaderboard) wallet showed up empty on
+// first load. This chains a wallet's /account calls so they run ONE AT A TIME
+// (different wallets still overlap, bounded by withAccountSlot), eliminating the
+// self-burst so the first fetch succeeds without needing a retry.
+const walletLocks = new Map<string, Promise<void>>();
+async function withWalletLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = walletLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const barrier = new Promise<void>((res) => { release = res; });
+  walletLocks.set(key, barrier);
+  try { await prev; } catch { /* ignore prior failure */ }
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (walletLocks.get(key) === barrier) walletLocks.delete(key);
+  }
+}
+
 export interface Ticker {
   symbol: string;
   lastPrice: number;
@@ -266,14 +287,17 @@ class BulkApiService {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        // Acquire a /account slot only around the network call — the backoff
-        // sleep below happens OUTSIDE the slot so queued calls proceed meanwhile.
-        const res = await withAccountSlot(() => bulkFetch(`${this.baseUrl}/account`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type, user: walletAddress }),
-          signal: controller.signal,
-        }));
+        // Serialize this wallet's /account calls (fullAccount/positions/fills
+        // won't burst BULK concurrently → no self-429 on a cold first load), then
+        // acquire a global /account slot only around the network call — the
+        // backoff sleep below happens OUTSIDE both so queued calls proceed meanwhile.
+        const res = await withWalletLock(walletAddress, () =>
+          withAccountSlot(() => bulkFetch(`${this.baseUrl}/account`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type, user: walletAddress }),
+            signal: controller.signal,
+          })));
         clearTimeout(timer);
         if (res.ok) return await res.json();
         // 429 / 5xx are transient — back off and retry within the request.
