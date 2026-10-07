@@ -47,14 +47,16 @@ async function bulkGetRetry(url: string, timeoutMs = 5000, attempts = 3): Promis
   return null;
 }
 
-// BULK's executor stores ONE-SIDED open interest: ΔOI = (Δ|buyer| + Δ|seller|)/2,
-// so /stats and ticker `openInterest` report a single side. The industry /
-// OI display factor at each output. We used to surface a two-sided total
-// (long + short = 2× BULK's one-sided value, per the DefiLlama convention).
-// As of 2026-09-27 the BULK dev confirmed BULK now reports the full OI
-// directly, so we display it as-is — factor is 1. (Kept as a named constant so
-// the convention is documented and reversible in one place.)
-const OI_SIDE_FACTOR = 1;
+// OI two-sided factor. BULK's PER-TICKER / per-market `openInterest` and the
+// stored `ticker_snapshots.open_interest_usd` are ONE-SIDED, so multiplying any
+// of them by this gives the full two-sided figure (long+short) that BULK's own
+// UI shows. Verified 2026-10-08: the per-ticker sum ($5.15M) was exactly half of
+// BULK's /stats `openInterest.totalUsd` ($10.32M), ratio 2.01.
+//   IMPORTANT: /stats `openInterest.totalUsd` is ALREADY the full total — do NOT
+//   multiply it by this factor (those sites below pass it through directly). The
+//   factor was briefly set to 1 after 2026-09-27 believing per-ticker had gone
+//   full too; it hadn't, which left every per-ticker/DB OI reading at half.
+const OI_SIDE_FACTOR = 2;
 
 // NOTE: the old `const MARKETS = ['BTC-USD', ...]` constant was removed.
 // Every caller now resolves the live market list via `getActiveSymbols()`
@@ -181,7 +183,9 @@ async function fetchTickersForStats(): Promise<{ volume24h: number; openInterest
   for (const ticker of tickers) {
     if (ticker) {
       totalVolume += ticker.quoteVolume || 0;
-      totalOI += (ticker.openInterest || 0) * (ticker.markPrice || 0);
+      // Per-ticker OI is ONE-SIDED — ×OI_SIDE_FACTOR for the full two-sided total
+      // so this fallback matches BULK's /stats openInterest.totalUsd (already full).
+      totalOI += (ticker.openInterest || 0) * (ticker.markPrice || 0) * OI_SIDE_FACTOR;
       if (ticker.timestamp) {
         timestamp = Math.max(timestamp, ticker.timestamp / 1000000); // Convert from nanoseconds
       }
@@ -411,7 +415,7 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
         if (bulkStats?.openInterest?.totalUsd && bulkStats.openInterest.totalUsd > 0) {
           totalOpenInterest = bulkStats.openInterest.totalUsd;
         } else if (bulkStats?.markets) {
-          for (const m of bulkStats.markets) totalOpenInterest += (m.openInterest || 0) * (m.markPrice || 0);
+          for (const m of bulkStats.markets) totalOpenInterest += (m.openInterest || 0) * (m.markPrice || 0) * OI_SIDE_FACTOR;
         }
       }
     } catch (e) {
@@ -490,7 +494,7 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     return {
       timestamp,
       volume24h: totalVolume24h,
-      openInterest: totalOpenInterest * OI_SIDE_FACTOR, // two-sided (long+short)
+      openInterest: totalOpenInterest, // already full two-sided (from /stats totalUsd or ×2'd ticker fallback)
       activeTraders,
       totalAccounts, // all accounts ever created (BULK world_accounts)
       liquidations24h,
@@ -592,7 +596,7 @@ router.get('/exchange-health', async (req: Request, res: Response) => {
         if (bulkStats?.markets && bulkStats.markets.length > 0) {
           for (const market of bulkStats.markets) {
             totalVolume24h += market.quoteVolume || 0;
-            totalOI += (market.openInterest || 0) * (market.markPrice || 0);
+            totalOI += (market.openInterest || 0) * (market.markPrice || 0) * OI_SIDE_FACTOR;
           }
         }
         
@@ -624,7 +628,7 @@ router.get('/exchange-health', async (req: Request, res: Response) => {
     
     res.json({
       total_volume_24h: totalVolume24h,
-      total_open_interest: totalOI * OI_SIDE_FACTOR, // two-sided (long+short)
+      total_open_interest: totalOI, // already full two-sided (from /stats totalUsd or ×2'd ticker fallback)
       total_traders: parseInt(tradersResult[0]?.count || '0'),
       total_liquidations_24h: parseInt(liqResult[0]?.count || '0'),
       liquidation_value_24h: parseFloat(liqResult[0]?.volume || '0')
@@ -1787,7 +1791,7 @@ router.get('/market-stats-bulk', async (req: Request, res: Response) => {
     res.json({
       timestamp: stats.timestamp,
       totalVolume24h: stats.volume?.totalUsd || 0,
-      totalOpenInterest: (stats.openInterest?.totalUsd || 0) * OI_SIDE_FACTOR, // two-sided
+      totalOpenInterest: (stats.openInterest?.totalUsd || 0), // already full two-sided (from /stats totalUsd)
       markets,
       source: 'bulk-api'
     });
