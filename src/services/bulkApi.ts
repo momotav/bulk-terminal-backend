@@ -260,7 +260,7 @@ class BulkApiService {
   // Throws on final failure so the swrCache wrappers serve a STALE copy (or the
   // caller falls back to its own empty shape) rather than caching the failure.
   private async postAccount(walletAddress: string, type: string, timeoutMs = 8000): Promise<unknown> {
-    const maxAttempts = 3;
+    const maxAttempts = 4;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const controller = new AbortController();
@@ -395,7 +395,7 @@ class BulkApiService {
   // On any error we still return [] so callers don't have to special-case
   // failures, but we log loudly so Railway logs show the actual reason
   // when fills appear missing on the frontend.
-  async getFills(walletAddress: string): Promise<unknown[]> {
+  async getFills(walletAddress: string): Promise<unknown[] | null> {
     const net = getRequestNetwork();
     const key = `bulk:acct:fills:${net}:${walletAddress}`;
     try {
@@ -404,7 +404,7 @@ class BulkApiService {
       // on a 429 — so under load (e.g. the enrichment sweep) the wallet page
       // showed its live snapshot but "no trades / no fills". postAccount retries
       // 429/5xx, and swrCache serves the last good list on a hard failure.
-      return await swrCache<unknown[]>(key, 20, async () => {
+      return await swrCache<unknown[]>(key, 45, async () => {
       const parsed = await this.postAccount(walletAddress, 'fills');
       // BULK v1.0.17 wraps history in a paged envelope { data: [...], page: {...} };
       // older builds returned a bare array. Normalize both to a row array — without
@@ -484,7 +484,11 @@ class BulkApiService {
       console.error(
         `[bulkApi.getFills] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
       );
-      return [];
+      // null (not []) signals a real UPSTREAM FAILURE vs a genuinely-empty
+      // wallet. The dedicated /fills route turns null into a 503 so the client
+      // RETRIES instead of showing "0 volume / no trades"; getWallet treats it
+      // as empty so live data still renders.
+      return null;
     }
   }
 
@@ -500,7 +504,7 @@ class BulkApiService {
   // Same shape-tolerance and logging strategy as getFills since BULK has
   // a habit of wrapping responses inconsistently (single-object .X vs
   // array .X vs flat).
-  async getClosedPositions(walletAddress: string): Promise<unknown[]> {
+  async getClosedPositions(walletAddress: string): Promise<unknown[] | null> {
     const net = getRequestNetwork();
     const key = `bulk:acct:closed:${net}:${walletAddress}`;
     try {
@@ -508,7 +512,7 @@ class BulkApiService {
       // render and its Recent Trades panel share one upstream call instead of
       // racing two /account requests into BULK's rate limiter. On a transient
       // failure swrCache serves the last good list rather than blanking.
-      return await swrCache<unknown[]>(key, 20, async () => {
+      return await swrCache<unknown[]>(key, 60, async () => {
         const parsed = await this.postAccount(walletAddress, 'positions');
         // v1.0.17 paged envelope { data: [...], page } vs older bare array.
         const data: unknown[] = Array.isArray(parsed)
@@ -566,7 +570,9 @@ class BulkApiService {
       console.error(
         `[bulkApi.getClosedPositions] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
       );
-      return [];
+      // null = upstream failure (the /closed-positions route 503s so the client
+      // retries); [] is reserved for a genuinely-empty wallet.
+      return null;
     }
   }
 

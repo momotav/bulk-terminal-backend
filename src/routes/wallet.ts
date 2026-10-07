@@ -420,6 +420,11 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
     // is sorted newest-first by BULK; we keep that ordering so the chart
     // sees the most recent fills if it has to truncate.
     const allFills = await bulkApi.getFills(address);
+    // null = the BULK fetch failed (rate-limited / down), NOT an empty wallet.
+    // 503 so the client RETRIES instead of rendering "0 volume / no trades".
+    if (allFills === null) {
+      return res.status(503).json({ error: 'Fill history temporarily unavailable, please retry', retriable: true });
+    }
 
     // Each fill has the shape described in the JSDoc above. Type loosely
     // here because the BULK SDK returns `unknown[]` and we don't want to
@@ -563,6 +568,10 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
     }
 
     const allPositions = await bulkApi.getClosedPositions(address);
+    // null = upstream failure, not an empty wallet → 503 so the client retries.
+    if (allPositions === null) {
+      return res.status(503).json({ error: 'Trade history temporarily unavailable, please retry', retriable: true });
+    }
 
     // Normalize each position to a stable shape. Same defensive approach as
     // the /fills route: we don't know exactly what fields BULK uses, so we
