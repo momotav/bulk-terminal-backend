@@ -724,6 +724,14 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
 // data. Caching a single snapshot under ONE key makes every `hours` request a
 // consistent slice of the same data, so the cumulative agrees everywhere.
 // Cached as a serializable array (a Map wouldn't survive JSON) and rebuilt.
+// Last ALL-TIME volume total from a CLEAN (every-symbol) klines fetch. Survives
+// cache rebuilds. Guards the headline all-time figure against partial fetches:
+// when BULK rate-limits some symbols' klines they return [] and contribute 0, so
+// the all-time total collapses (observed ~$1B → $735M). All-time volume only
+// grows, so a partial fetch that lands BELOW this baseline is an undercount — we
+// keep the baseline instead of publishing the wrong lower number.
+let lastGoodAllTimeVolume = 0;
+
 async function getVolumeKlinesSnapshot(): Promise<{ hourly: Array<[number, Record<string, number>]>; allTimeTotal: number; symbols: string[] }> {
   return swrCache('analytics:volume_klines_snapshot', 60, async () => {
     const symbols = await getActiveSymbols();
@@ -739,9 +747,12 @@ async function getVolumeKlinesSnapshot(): Promise<{ hourly: Array<[number, Recor
     );
     const map = new Map<number, Record<string, number>>();
     let allTimeTotal = 0;
+    let emptyCount = 0;
     symbols.forEach((symbol, i) => {
+      const rows = klinesResults[i] as any[];
+      if (!Array.isArray(rows) || rows.length === 0) { emptyCount++; return; }
       const coin = coinFromSymbol(symbol);
-      for (const k of (klinesResults[i] as any[])) {
+      for (const k of rows) {
         const ts = k.t;
         if (!map.has(ts)) map.set(ts, zeroCoinDict(symbols));
         const v = (k.v || 0) * (k.c || 0); // hourly notional USD = base vol × close
@@ -749,6 +760,13 @@ async function getVolumeKlinesSnapshot(): Promise<{ hourly: Array<[number, Recor
         allTimeTotal += v;
       }
     });
+    // A clean full fetch updates the baseline; a partial fetch that came back
+    // lower than the baseline is a rate-limit undercount, so keep the baseline.
+    if (emptyCount === 0 && allTimeTotal > 0) {
+      lastGoodAllTimeVolume = allTimeTotal;
+    } else if (lastGoodAllTimeVolume > allTimeTotal) {
+      allTimeTotal = lastGoodAllTimeVolume;
+    }
     return { hourly: Array.from(map.entries()), allTimeTotal, symbols };
   });
 }
