@@ -724,23 +724,28 @@ router.get('/recent-activity', async (req: Request, res: Response) => {
 // data. Caching a single snapshot under ONE key makes every `hours` request a
 // consistent slice of the same data, so the cumulative agrees everywhere.
 // Cached as a serializable array (a Map wouldn't survive JSON) and rebuilt.
-// Last ALL-TIME volume total from a CLEAN (every-symbol) klines fetch. Survives
-// cache rebuilds. Guards the headline all-time figure against partial fetches:
-// when BULK rate-limits some symbols' klines they return [] and contribute 0, so
-// the all-time total collapses (observed ~$1B → $735M). All-time volume only
-// grows, so a partial fetch that lands BELOW this baseline is an undercount — we
-// keep the baseline instead of publishing the wrong lower number.
-let lastGoodAllTimeVolume = 0;
-const VOLUME_BASELINE_KEY = 'analytics:volume_alltime_baseline';
+// The last COMPLETE volume snapshot (per-coin hourly bars + all-time total).
+// The frontend re-sums the all-time BARS (to honor coin toggles), so guarding
+// only the scalar total isn't enough — a partial fetch (a symbol 429'd / fewer
+// candles) makes BOTH the bars and the total undercount, and on a fast reload
+// that caught a partial rebuild the all-time KPI dropped (~$1B → $735M). Since
+// all-time volume ONLY GROWS, a fetch that totals LESS than the fullest we've
+// seen is partial — we reject it and keep serving the last complete snapshot
+// (bars included). Same spirit as the wallet page: only surface the COMPLETE
+// value, never a partial. Persisted so a restart recovers it immediately.
+type VolumeSnapshot = { hourly: Array<[number, Record<string, number>]>; allTimeTotal: number; symbols: string[] };
+let lastGoodSnapshot: VolumeSnapshot | null = null;
+const VOLUME_SNAPSHOT_KEY = 'analytics:volume_snapshot_complete';
 
-async function getVolumeKlinesSnapshot(): Promise<{ hourly: Array<[number, Record<string, number>]>; allTimeTotal: number; symbols: string[] }> {
+async function getVolumeKlinesSnapshot(): Promise<VolumeSnapshot> {
   return swrCache('analytics:volume_klines_snapshot', 60, async () => {
     const symbols = await getActiveSymbols();
     // Fetch klines with LIMITED concurrency, not a 22-wide Promise.all burst.
     // The box's IP is rate-limited by BULK (the /account storm shares it), and a
     // simultaneous 22-request burst got some symbols 429'd even with retries —
-    // dropping e.g. SOL (~$160M) and collapsing the all-time total. A small pool
-    // lets every symbol land, so clean full snapshots are the norm.
+    // dropping e.g. SOL (~$160M). A small pool lets every symbol land, so
+    // complete snapshots are the norm (and the reject-partial guard below is a
+    // safety net for the rare one that still comes back short).
     const KLINES_CONCURRENCY = 4;
     const klinesResults: any[] = new Array(symbols.length);
     let cursor = 0;
@@ -756,10 +761,9 @@ async function getVolumeKlinesSnapshot(): Promise<{ hourly: Array<[number, Recor
 
     const map = new Map<number, Record<string, number>>();
     let allTimeTotal = 0;
-    let emptyCount = 0;
     symbols.forEach((symbol, i) => {
       const rows = klinesResults[i] as any[];
-      if (!Array.isArray(rows) || rows.length === 0) { emptyCount++; return; }
+      if (!Array.isArray(rows) || rows.length === 0) return;
       const coin = coinFromSymbol(symbol);
       for (const k of rows) {
         const ts = k.t;
@@ -769,22 +773,27 @@ async function getVolumeKlinesSnapshot(): Promise<{ hourly: Array<[number, Recor
         allTimeTotal += v;
       }
     });
-    // Seed the in-memory baseline from the persisted one after a restart, so the
-    // first partial fetch doesn't publish an undercount before a clean fetch runs.
-    if (lastGoodAllTimeVolume === 0) {
-      const persisted = await getCache<number>(VOLUME_BASELINE_KEY).catch(() => null);
-      if (typeof persisted === 'number' && persisted > 0) lastGoodAllTimeVolume = persisted;
+    const snap: VolumeSnapshot = { hourly: Array.from(map.entries()), allTimeTotal, symbols };
+
+    // Cold start: recover the last complete snapshot so we never serve a partial
+    // before THIS process has itself seen a complete fetch.
+    if (!lastGoodSnapshot) {
+      const persisted = await getCache<VolumeSnapshot>(VOLUME_SNAPSHOT_KEY).catch(() => null);
+      if (persisted && typeof persisted.allTimeTotal === 'number' && persisted.allTimeTotal > 0) {
+        lastGoodSnapshot = persisted;
+      }
     }
-    // A clean full fetch updates (and persists) the baseline; a partial fetch
-    // that came back lower than the baseline is a rate-limit undercount, so keep
-    // the baseline instead of publishing the wrong lower number.
-    if (emptyCount === 0 && allTimeTotal > 0) {
-      lastGoodAllTimeVolume = allTimeTotal;
-      void setCache(VOLUME_BASELINE_KEY, allTimeTotal, 7 * 24 * 3600).catch(() => {});
-    } else if (lastGoodAllTimeVolume > allTimeTotal) {
-      allTimeTotal = lastGoodAllTimeVolume;
+
+    // Accept this fetch as the new best ONLY if it's at least as full as the best
+    // we've seen (all-time volume only grows; ties refresh so recent bars stay
+    // current). Otherwise it's partial/truncated → serve the last complete
+    // snapshot, bars and total together, so the number can never read "less".
+    if (!lastGoodSnapshot || snap.allTimeTotal >= lastGoodSnapshot.allTimeTotal) {
+      lastGoodSnapshot = snap;
+      void setCache(VOLUME_SNAPSHOT_KEY, snap, 7 * 24 * 3600).catch(() => {});
+      return snap;
     }
-    return { hourly: Array.from(map.entries()), allTimeTotal, symbols };
+    return lastGoodSnapshot;
   });
 }
 
