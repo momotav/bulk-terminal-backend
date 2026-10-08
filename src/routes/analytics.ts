@@ -387,7 +387,10 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
     // kline series per active symbol (~10+ BULK calls) plus /stats and DB queries;
     // deduping concurrent misses into ONE rebuild keeps the heavy (and fragile)
     // klines fan-out from stampeding, no matter how many users load the dashboard.
-    const result = await swrCache(cacheKey, 60, async () => {
+    // 15s TTL: the primary path is one cheap /stats call + DB, so a short TTL keeps
+    // the Volume / OI / active-trader KPIs near-live without hammering BULK (every
+    // concurrent viewer still shares ONE rebuild via single-flight).
+    const result = await swrCache(cacheKey, 15, async () => {
     let totalVolume24h = 0;
     let totalOpenInterest = 0;
     let timestamp = Date.now();
@@ -1653,9 +1656,10 @@ router.get('/stats', async (req: Request, res: Response) => {
       uniqueTraders: parseInt(tradersResult[0]?.count || '0')
     };
     
-    // Cache for 60 seconds
-    await setCache(cacheKey, result, 60);
-    
+    // 20s: feeds the analytics 24h Volume / Trades KPIs — keep it fresh. DB
+    // aggregation over a 24h window (indexed on timestamp), cheap enough at 20s.
+    await setCache(cacheKey, result, 20);
+
     res.json(result);
   } catch (error) {
     console.error('Error fetching stats:', error);
