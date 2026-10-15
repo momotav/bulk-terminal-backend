@@ -1446,23 +1446,39 @@ router.get('/trades-chart', async (req: Request, res: Response) => {
   }
 });
 
-// Recent trades for ONE market — the live tape in the coin detail modal.
-// wallet_address is the taker, counterparty the maker; the frontend derives
-// buyer/seller from `side` (the taker's side).
+// Recent trades for ONE market — the live tape in the coin detail modal, and the
+// historical backfill feed. wallet_address is the taker, counterparty the maker;
+// the frontend derives buyer/seller from `side` (the taker's side).
+//
+// Time-cursor pagination (ms epoch), for backfilling full history:
+//   ?before=<ms>  → only trades strictly OLDER than this (page BACKWARDS)
+//   ?after=<ms>   → only trades strictly NEWER than this
+//   ?limit=N      → up to 1000 (default 50)
+// The response includes `nextBefore` (the oldest timestamp in the page) — feed it
+// back as ?before= to get the previous page; stop when `data` is empty.
+// Backward-compatible: no params = unchanged (newest trades).
 router.get('/market-trades/:coin', async (req: Request, res: Response) => {
   const { coin } = req.params;
   const dbSymbol = coin.includes('-') ? coin.toUpperCase() : `${coin.toUpperCase()}-USD`;
-  const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+  const limit = Math.min(parseInt(req.query.limit as string) || 50, 1000);
+  const before = req.query.before !== undefined ? parseInt(req.query.before as string, 10) : null;
+  const after = req.query.after !== undefined ? parseInt(req.query.after as string, 10) : null;
+  if ((before !== null && Number.isNaN(before)) || (after !== null && Number.isNaN(after))) {
+    return res.status(400).json({ error: 'before/after must be integer millisecond timestamps' });
+  }
   try {
-    const rows = await query(`
+    const rows = await query<any>(`
       SELECT wallet_address AS taker, counterparty AS maker, side, price, size, value,
              (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint AS timestamp
       FROM trades
       WHERE symbol = $1
+        AND ($2::bigint IS NULL OR (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint < $2)
+        AND ($3::bigint IS NULL OR (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint > $3)
       ORDER BY timestamp DESC
-      LIMIT $2
-    `, [dbSymbol, limit]);
-    res.json({ data: rows });
+      LIMIT $4
+    `, [dbSymbol, before, after, limit]);
+    const nextBefore = rows.length ? String(rows[rows.length - 1].timestamp) : null;
+    res.json({ data: rows, nextBefore });
   } catch (error) {
     console.error('market-trades error:', error);
     res.json({ data: [], error: 'No trade data available yet' });
