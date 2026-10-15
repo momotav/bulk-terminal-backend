@@ -1485,24 +1485,67 @@ router.get('/market-trades/:coin', async (req: Request, res: Response) => {
   }
 });
 
-// Recent liquidation events for ONE market — the liquidation feed table.
+// Liquidation events for ONE market — the liquidation feed table, with time-cursor
+// pagination for backfill (liquidations are NOT pruned, so history goes back weeks).
+//   ?before=<ms> / ?after=<ms> (ms epoch) · ?limit up to 1000 (default 50)
+// Response includes `nextBefore` to drive the backfill loop (stop when data empty).
 router.get('/market-liquidations/:coin', async (req: Request, res: Response) => {
   const { coin } = req.params;
   const dbSymbol = coin.includes('-') ? coin.toUpperCase() : `${coin.toUpperCase()}-USD`;
-  const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+  const limit = Math.min(parseInt(req.query.limit as string) || 50, 1000);
+  const before = req.query.before !== undefined ? parseInt(req.query.before as string, 10) : null;
+  const after = req.query.after !== undefined ? parseInt(req.query.after as string, 10) : null;
+  if ((before !== null && Number.isNaN(before)) || (after !== null && Number.isNaN(after))) {
+    return res.status(400).json({ error: 'before/after must be integer millisecond timestamps' });
+  }
   try {
-    const rows = await query(`
+    const rows = await query<any>(`
       SELECT wallet_address AS wallet, side, price, size, value,
              (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint AS timestamp
       FROM liquidations
       WHERE symbol = $1
+        AND ($2::bigint IS NULL OR (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint < $2)
+        AND ($3::bigint IS NULL OR (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint > $3)
       ORDER BY timestamp DESC
-      LIMIT $2
-    `, [dbSymbol, limit]);
-    res.json({ data: rows });
+      LIMIT $4
+    `, [dbSymbol, before, after, limit]);
+    const nextBefore = rows.length ? String(rows[rows.length - 1].timestamp) : null;
+    res.json({ data: rows, nextBefore });
   } catch (error) {
     console.error('market-liquidations error:', error);
     res.json({ data: [], error: 'No liquidation data available yet' });
+  }
+});
+
+// ADL (auto-deleveraging) events for ONE market — same time-cursor pagination.
+// NOTE: ADL effectively stopped on BULK mainnet ~Sep 8, so this is typically empty
+// on mainnet; the endpoint exists for completeness / if ADL resumes.
+//   ?before=<ms> / ?after=<ms> · ?limit up to 1000 (default 50) · returns nextBefore
+router.get('/market-adl/:coin', async (req: Request, res: Response) => {
+  const { coin } = req.params;
+  const dbSymbol = coin.includes('-') ? coin.toUpperCase() : `${coin.toUpperCase()}-USD`;
+  const limit = Math.min(parseInt(req.query.limit as string) || 50, 1000);
+  const before = req.query.before !== undefined ? parseInt(req.query.before as string, 10) : null;
+  const after = req.query.after !== undefined ? parseInt(req.query.after as string, 10) : null;
+  if ((before !== null && Number.isNaN(before)) || (after !== null && Number.isNaN(after))) {
+    return res.status(400).json({ error: 'before/after must be integer millisecond timestamps' });
+  }
+  try {
+    const rows = await query<any>(`
+      SELECT wallet_address AS wallet, counterparty, side, price, size, value,
+             (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint AS timestamp
+      FROM adl_events
+      WHERE symbol = $1
+        AND ($2::bigint IS NULL OR (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint < $2)
+        AND ($3::bigint IS NULL OR (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint > $3)
+      ORDER BY timestamp DESC
+      LIMIT $4
+    `, [dbSymbol, before, after, limit]);
+    const nextBefore = rows.length ? String(rows[rows.length - 1].timestamp) : null;
+    res.json({ data: rows, nextBefore });
+  } catch (error) {
+    console.error('market-adl error:', error);
+    res.json({ data: [], error: 'No ADL data available yet' });
   }
 });
 
