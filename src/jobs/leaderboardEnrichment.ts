@@ -48,7 +48,8 @@ async function enrichOnce(): Promise<void> {
     for (const { wallet_address } of rows) {
       if (isSystemWallet(wallet_address)) continue;
       try {
-        const acc = await bulkApi.getFullAccount(wallet_address);
+        // background: yields BULK /account slots to user-facing wallet-page requests
+        const acc = await bulkApi.getFullAccount(wallet_address, { background: true });
         const m = acc?.margin;
         if (m) {
           const netPnl =

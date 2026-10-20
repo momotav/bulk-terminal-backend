@@ -20,19 +20,45 @@ const BULK_API_URL = process.env.BULK_API_URL || 'https://exchange-api.bulk.trad
 // load, fills in after a refresh". Serializing adds a little latency; correct
 // data beats fast-but-empty.
 const ACCOUNT_CONCURRENCY = 2;
+// Background sweeps (leaderboard enrichment: 250 wallets every 5 min) may hold
+// at most this many of the slots, and only when no user-facing call is waiting.
+// Before this, a sweep in progress took one of the two slots for ~2 of every 5
+// minutes, so a cold wallet page's fullAccount/positions/fills all sat ~3-4s in
+// the queue behind it. User requests now always jump the background queue.
+const BACKGROUND_MAX_IN_FLIGHT = 1;
 let accountInFlight = 0;
-const accountQueue: (() => void)[] = [];
-async function withAccountSlot<T>(fn: () => Promise<T>): Promise<T> {
-  if (accountInFlight >= ACCOUNT_CONCURRENCY) {
-    await new Promise<void>((resolve) => accountQueue.push(resolve));
+let backgroundInFlight = 0;
+const accountQueue: (() => void)[] = [];     // user-facing waiters (priority)
+const backgroundQueue: (() => void)[] = [];  // background waiters
+// Release: the finishing call HANDS ITS SLOT to the next waiter (counters are
+// adjusted here, not by the waiter) so there's no decrement→increment gap in
+// which a newcomer could slip in and over-subscribe BULK. Foreground first; a
+// background waiter runs only if nobody user-facing is waiting and background
+// stays under its own cap.
+function releaseAccountSlot(wasBackground: boolean): void {
+  if (wasBackground) backgroundInFlight--;
+  const next = accountQueue.shift();
+  if (next) { next(); return; }                         // slot transferred
+  if (backgroundInFlight < BACKGROUND_MAX_IN_FLIGHT) {
+    const bg = backgroundQueue.shift();
+    if (bg) { backgroundInFlight++; bg(); return; }     // slot transferred
   }
-  accountInFlight++;
+  accountInFlight--;                                    // nobody waiting: free it
+}
+async function withAccountSlot<T>(fn: () => Promise<T>, background = false): Promise<T> {
+  const free = accountInFlight < ACCOUNT_CONCURRENCY;
+  const bgOk = !background || (backgroundInFlight < BACKGROUND_MAX_IN_FLIGHT && accountQueue.length === 0);
+  if (free && bgOk) {
+    accountInFlight++;
+    if (background) backgroundInFlight++;
+  } else {
+    // Counters are bumped on our behalf by whoever hands us the slot.
+    await new Promise<void>((resolve) => (background ? backgroundQueue : accountQueue).push(resolve));
+  }
   try {
     return await fn();
   } finally {
-    accountInFlight--;
-    const next = accountQueue.shift();
-    if (next) next();
+    releaseAccountSlot(background);
   }
 }
 
@@ -280,7 +306,9 @@ class BulkApiService {
   //
   // Throws on final failure so the swrCache wrappers serve a STALE copy (or the
   // caller falls back to its own empty shape) rather than caching the failure.
-  private async postAccount(walletAddress: string, type: string, timeoutMs = 8000): Promise<unknown> {
+  // `background` marks calls from sweeps/jobs (not a user waiting on a page);
+  // they yield the /account slots to user-facing requests (see withAccountSlot).
+  private async postAccount(walletAddress: string, type: string, timeoutMs = 8000, background = false): Promise<unknown> {
     const maxAttempts = 4;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -297,7 +325,7 @@ class BulkApiService {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ type, user: walletAddress }),
             signal: controller.signal,
-          })));
+          }), background));
         clearTimeout(timer);
         if (res.ok) return await res.json();
         // 429 / 5xx are transient — back off and retry within the request.
@@ -325,12 +353,12 @@ class BulkApiService {
   // request instead of each hitting BULK — the duplicate fan-out was what tripped
   // BULK's rate limiter. On a transient upstream failure swrCache serves the last
   // good copy, so the page keeps showing data instead of blanking.
-  async getFullAccount(walletAddress: string): Promise<FullAccount | null> {
+  async getFullAccount(walletAddress: string, opts: { background?: boolean } = {}): Promise<FullAccount | null> {
     const net = getRequestNetwork();
     const key = `bulk:acct:full:${net}:${walletAddress}`;
     try {
       return await swrCache<FullAccount | null>(key, 20, async () => {
-        const data = await this.postAccount(walletAddress, 'fullAccount') as AccountResponse[];
+        const data = await this.postAccount(walletAddress, 'fullAccount', 8000, opts.background) as AccountResponse[];
         if (data && data[0] && data[0].fullAccount) return data[0].fullAccount;
         return null;
       }, 600);

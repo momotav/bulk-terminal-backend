@@ -24,6 +24,13 @@ docker compose build app
 echo "▶ Recreating app container (db + caddy left running)…"
 docker compose up -d app
 
+# The Caddyfile is bind-mounted into the caddy container, so `git pull` already
+# updated it on disk — but Caddy only re-reads it on reload. A graceful reload
+# applies config changes (e.g. compression) with zero downtime and keeps the
+# TLS certs; it is a no-op when the file is unchanged.
+echo "▶ Reloading Caddy config (graceful, keeps TLS)…"
+docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile || echo "   (caddy reload failed — check 'docker compose logs caddy')"
+
 echo "▶ Recent app logs:"
 docker compose logs app --since 30s --tail 40 || true
 

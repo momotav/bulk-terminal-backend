@@ -3614,17 +3614,22 @@ router.get('/candles/:symbol', async (req: Request, res: Response) => {
   const endKey = endTime ?? 'now';
 
   const cacheKey = `analytics:candles:${symbol}:${interval}:${limit}:${startKey}:${endKey}`;
-  const cached = await getCache<unknown>(cacheKey);
-  if (cached) return res.json(cached);
 
   try {
-    const klines = await fetchKlines(symbol, interval, limit, startTime, endTime);
-    const result = { symbol, interval, limit, candles: klines };
-    // Historical windows can cache forever (closed candles don't change).
-    // Recent (no time bound) windows still need a short TTL because the
-    // last candle is in-flight.
-    const ttl = startTime !== undefined && endTime !== undefined ? 3600 : 30;
-    await setCache(cacheKey, result, ttl);
+    // Stale-while-revalidate: a window that reaches the present (its last
+    // candle is still forming) is fresh for 60s, then served STALE instantly
+    // while one background refresh runs — so the wallet page's 4-symbol
+    // candle fan-out (~1.2s each from BULK) costs the first viewer only.
+    // A fully-historical window is fresh for an hour (closed candles don't
+    // change). The stale copy lives a day either way so a BULK blip never
+    // blanks a chart that was rendering a second ago.
+    const now = Date.now();
+    const touchesPresent = endTime === undefined || endTime >= now - 60_000;
+    const freshSec = startTime !== undefined && endTime !== undefined && !touchesPresent ? 3600 : 60;
+    const result = await swrCache(cacheKey, freshSec, async () => {
+      const klines = await fetchKlines(symbol, interval, limit, startTime, endTime);
+      return { symbol, interval, limit, candles: klines };
+    }, 86_400);
     res.json(result);
   } catch (error: any) {
     console.error('Error fetching candles for', symbol, ':', error);

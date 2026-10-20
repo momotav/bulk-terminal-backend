@@ -180,7 +180,8 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
   walletFetchCache.set(walletAddress, Date.now());
   
   try {
-    const account = await bulkApi.getFullAccount(walletAddress);
+    // background: yields BULK /account slots to user-facing wallet-page requests
+    const account = await bulkApi.getFullAccount(walletAddress, { background: true });
     if (!account) {
       console.log(`⚠️ No account data for ${walletAddress.slice(0, 8)}...`);
       return;

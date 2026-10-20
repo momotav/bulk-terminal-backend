@@ -1,3 +1,12 @@
 api.bulkstats.com {
+    # Compress JSON API responses. The wallet page's /fills (~210 KB raw) and
+    # per-symbol /candles (~140 KB raw each) were shipped uncompressed; they
+    # gzip ~6-8×. Matched on JSON only so the SSE stream (text/event-stream)
+    # stays unbuffered and flushes frame-by-frame as before.
+    encode zstd gzip {
+        match {
+            header Content-Type application/json*
+        }
+    }
     reverse_proxy app:3001
 }
