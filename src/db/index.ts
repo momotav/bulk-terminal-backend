@@ -150,6 +150,11 @@ export async function initializeDatabase(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_snapshots_wallet_time 
       ON trader_snapshots(wallet_address, timestamp DESC);
     `);
+    // Net worth (BULK totalBalance) per snapshot — lets the wallet page compute
+    // transfer-aware, time-weighted returns (deposits/withdrawals = the part of
+    // a net-worth change that PnL doesn't explain). Nullable: rows written
+    // before this column existed simply have no net worth.
+    await client.query(`ALTER TABLE trader_snapshots ADD COLUMN IF NOT EXISTS total_balance DECIMAL(20, 2)`);
 
     // Liquidations table
     await client.query(`

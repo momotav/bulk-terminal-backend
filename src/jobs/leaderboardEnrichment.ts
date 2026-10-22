@@ -67,9 +67,9 @@ async function enrichOnce(): Promise<void> {
             0
           );
           await query(
-            `INSERT INTO trader_snapshots (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [wallet_address, netPnl, m.unrealizedPnl || 0, positions.length, totalNotional]
+            `INSERT INTO trader_snapshots (wallet_address, pnl, unrealized_pnl, positions_count, total_notional, total_balance)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [wallet_address, netPnl, m.unrealizedPnl || 0, positions.length, totalNotional, Number.isFinite(m.totalBalance) ? m.totalBalance : null]
           );
           updated++;
         }
@@ -79,10 +79,26 @@ async function enrichOnce(): Promise<void> {
       await new Promise((r) => setTimeout(r, SPACING_MS + Math.floor((Math.random() - 0.5) * 2 * JITTER_MS)));
     }
 
-    // Bound the snapshot table: the whales query only looks back 24h.
-    await query(`DELETE FROM trader_snapshots WHERE timestamp < NOW() - INTERVAL '25 hours'`).catch(
-      () => {}
-    );
+    // Bound the snapshot table WITHOUT losing history. The leaderboard's whale
+    // windows need every row for the last 24h; beyond that the wallet page
+    // only needs the curve, so rows older than 25h are THINNED to one per
+    // wallet per 15 minutes (the latest in each bucket) instead of deleted.
+    // Only the 25h–49h band is touched each sweep, so the work stays small;
+    // older bands were already thinned by earlier sweeps. (Before 2026-10-22
+    // everything older than 25h was deleted outright — that is why wallet
+    // history only existed for a day while the exchange's own fills cap at
+    // 1,000. History accumulates from this deploy on.)
+    await query(`
+      DELETE FROM trader_snapshots WHERE id IN (
+        SELECT id FROM (
+          SELECT id, row_number() OVER (
+            PARTITION BY wallet_address, floor(extract(epoch FROM timestamp) / 900)
+            ORDER BY timestamp DESC
+          ) AS rn
+          FROM trader_snapshots
+          WHERE timestamp < NOW() - INTERVAL '25 hours' AND timestamp >= NOW() - INTERVAL '49 hours'
+        ) x WHERE rn > 1
+      )`).catch(() => {});
 
     console.log(`💹 Leaderboard PnL enrichment: updated ${updated}/${rows.length} traders`);
   } catch (e) {

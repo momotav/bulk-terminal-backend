@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db';
 import { bulkApi, FullAccount } from '../services/bulkApi';
 import { requireAuth } from '../middleware/auth';
-import { getCache, setCache } from '../services/cache';
+import { getCache, setCache, swrCache } from '../services/cache';
 import { resolveHierarchy } from '../services/accountResolver';
 
 const router = Router();
@@ -187,6 +187,35 @@ function deriveHistoryFromClosedPositions(
   return history;
 }
 
+// Collector snapshots of the account's BULK counters (net realized PnL,
+// unrealized PnL, net worth), one row per 15-minute bucket (the latest in
+// each), oldest first. This is the wallet page's long-range PnL curve: the
+// exchange's own fill history caps at 1,000 fills (a day or two for a busy
+// wallet) while these accumulate for as long as the collector has followed
+// the account. total_balance is null on rows written before 2026-10-22.
+async function loadSnapshots(address: string): Promise<Array<{ timestamp: string; pnl: number; unrealized_pnl: number; total_balance: number | null }>> {
+  return swrCache(`wallet:snapshots:${address}`, 60, async () => {
+    const rows = await query<{ timestamp: Date; pnl: string; unrealized_pnl: string; total_balance: string | null }>(
+      `SELECT bucket AS timestamp, pnl, unrealized_pnl, total_balance FROM (
+         SELECT DISTINCT ON (floor(extract(epoch FROM timestamp) / 900))
+                to_timestamp(floor(extract(epoch FROM timestamp) / 900) * 900) AS bucket,
+                pnl, unrealized_pnl, total_balance, timestamp
+         FROM trader_snapshots
+         WHERE wallet_address = $1
+         ORDER BY floor(extract(epoch FROM timestamp) / 900), timestamp DESC
+       ) s ORDER BY bucket ASC
+       LIMIT 40000`,
+      [address],
+    );
+    return rows.map((r) => ({
+      timestamp: new Date(r.timestamp).toISOString(),
+      pnl: parseFloat(r.pnl) || 0,
+      unrealized_pnl: parseFloat(r.unrealized_pnl) || 0,
+      total_balance: r.total_balance === null ? null : parseFloat(r.total_balance),
+    }));
+  }, 3600).catch(() => []);
+}
+
 // GET /wallet/:address - Get wallet info (live from BULK API + our data)
 //
 // Performance contract:
@@ -272,6 +301,7 @@ router.get('/:address', async (req: Request, res: Response) => {
         markPrices,
         tracked: trader,
         history: deriveHistoryFromClosedPositions(closedPositions || [], null),
+        snapshots: await loadSnapshots(address),
       });
     }
 
@@ -293,6 +323,7 @@ router.get('/:address', async (req: Request, res: Response) => {
       markPrices,
       tracked: trader,
       history: deriveHistoryFromClosedPositions(closedPositions || [], account),
+      snapshots: await loadSnapshots(address),
     };
 
     // Closed positions are the ONLY source of the PnL history curve. If the

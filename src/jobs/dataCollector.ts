@@ -136,7 +136,8 @@ export async function recordTrade(
 async function cleanupOldData(): Promise<void> {
   try {
     await query(`DELETE FROM market_stats WHERE timestamp < NOW() - INTERVAL '30 days'`);
-    await query(`DELETE FROM trader_snapshots WHERE timestamp < NOW() - INTERVAL '30 days'`);
+    // Thinned to 15-min rows after 25h (leaderboardEnrichment); keep ~13 months.
+    await query(`DELETE FROM trader_snapshots WHERE timestamp < NOW() - INTERVAL '400 days'`);
 
     // Trades retention: 2 days.
     //

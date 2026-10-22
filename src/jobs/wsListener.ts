@@ -252,9 +252,10 @@ async function fetchAndStoreWalletData(walletAddress: string): Promise<void> {
     const snapshotRealizedNet = realizedPnl + fees + funding;
     await query(
       `INSERT INTO trader_snapshots 
-       (wallet_address, pnl, unrealized_pnl, positions_count, total_notional)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [walletAddress, snapshotRealizedNet, unrealizedPnl, account.positions.length, totalNotional]
+       (wallet_address, pnl, unrealized_pnl, positions_count, total_notional, total_balance)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [walletAddress, snapshotRealizedNet, unrealizedPnl, account.positions.length, totalNotional,
+       Number.isFinite(account.margin?.totalBalance) ? account.margin.totalBalance : null]
     );
     
     console.log(`💰 ${walletAddress.slice(0, 8)}...: NetPnL=$${totalPnl.toFixed(2)} (gross R=$${realizedPnl.toFixed(2)}, U=$${unrealizedPnl.toFixed(2)}, fees=$${fees.toFixed(2)}, funding=$${funding.toFixed(2)}) | Notional=$${totalNotional.toFixed(2)} | Positions=${account.positions.length}`);
