@@ -2859,9 +2859,14 @@ router.get('/protocol-revenue-chart', async (req: Request, res: Response) => {
     }>(`
       SELECT 
         date_trunc('${bucketInterval}', timestamp) as time_bucket,
-        MAX(total_protocol_settlement) as protocol_revenue,
-        MAX(total_maker_fees) as maker_fees,
-        MAX(total_taker_fees) as taker_fees
+        -- The LATEST snapshot in each bucket for every column. MAX() was used
+        -- before, which is the latest value for the POSITIVE running totals
+        -- (maker, protocol) but the EARLIEST for total_taker_fees, which BULK
+        -- reports as a NEGATIVE running total — so the taker series lagged the
+        -- other two by exactly one bucket. Revenue bars were never affected.
+        (array_agg(total_protocol_settlement ORDER BY timestamp DESC))[1] as protocol_revenue,
+        (array_agg(total_maker_fees ORDER BY timestamp DESC))[1] as maker_fees,
+        (array_agg(total_taker_fees ORDER BY timestamp DESC))[1] as taker_fees
       FROM fee_snapshots
       WHERE timestamp > NOW() - INTERVAL '${hours} hours'
       GROUP BY time_bucket
