@@ -23,12 +23,21 @@ const only = arg('--wallet');
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
+  // Discovery: every address we have any trace of since the window start —
+  // the traders table (last_seen), BOTH sides of every trade in the tape, and
+  // anyone already in the liquidations table. traders.last_seen alone missed
+  // the very wallet that took a $520K cascade on Oct 21.
   const wallets: string[] = only
     ? [only]
-    : (await query<{ wallet_address: string }>(
-        `SELECT wallet_address FROM traders WHERE last_seen >= $1 ORDER BY total_volume DESC NULLS LAST`,
+    : (await query<{ w: string }>(
+        `SELECT DISTINCT w FROM (
+           SELECT wallet_address AS w FROM traders WHERE last_seen >= $1
+           UNION SELECT wallet_address FROM trades WHERE timestamp >= $1
+           UNION SELECT counterparty FROM trades WHERE timestamp >= $1 AND counterparty IS NOT NULL
+           UNION SELECT wallet_address FROM liquidations WHERE timestamp >= $1 - INTERVAL '7 days'
+         ) u WHERE w IS NOT NULL AND length(w) BETWEEN 32 AND 44`,
         [since],
-      )).map((r) => r.wallet_address);
+      )).map((r) => r.w);
   console.log(`backfill riskHistory since ${since.toISOString()} for ${wallets.length} wallet(s)`);
 
   let liqIns = 0, adlIns = 0, skipped = 0, scanned = 0;
