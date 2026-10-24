@@ -695,8 +695,16 @@ function processMessage(data: WebSocket.Data): void {
         const taker = trade.taker || null;
         const walletAddress = taker || maker || null;
         
-        // Check reason field (BULK API v1.0.12)
-        const reason = trade.reason || null;
+        // Reason: BULK v1.0.12–1.0.2x sent a STRING `reason` ("liquidation",
+        // "liquidation_sweep", "adl"); since ~2026-10-21 10:15 UTC the trade
+        // print carries a NUMERIC `reason_code` instead (0 trade, 1 liquidation,
+        // 2 ADL, 3 liquidation sweep — same codes as the account fills feed).
+        // We only read the string, so from that moment every liquidation and
+        // ADL was filed as a plain trade (a $520K cascade on Oct 21 among them).
+        // Normalise both shapes to the string token the checks below use.
+        const rc = trade.reason_code ?? trade.reasonCode;
+        const reason: string | null = trade.reason
+          || (rc === 1 ? 'liquidation' : rc === 3 ? 'liquidation_sweep' : rc === 2 ? 'adl' : null);
         
         // Check for liquidation
         // Per BULK API docs: reason="liquidation" and/or liq=true.
