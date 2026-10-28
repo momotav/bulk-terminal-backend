@@ -41,10 +41,23 @@ async function main() {
   console.log(`backfill riskHistory since ${since.toISOString()} for ${wallets.length} wallet(s)`);
 
   let liqIns = 0, adlIns = 0, skipped = 0, scanned = 0;
-  for (const w of wallets) {
-    if (isSystemWallet(w)) continue;
+  // Wallets BULK rate-limited; retried at the end with growing backoff rather
+  // than dropped. Dropping them is why a single pass left 946 wallets (18%)
+  // unscanned and why re-running whole passes converged so slowly.
+  const retry: string[] = [];
+  const spacing = Number(arg('--spacing') ?? 250);
+
+  const processWallet = async (w: string): Promise<'ok' | 'throttled'> => {
+    if (isSystemWallet(w)) return 'ok';
     let events;
-    try { events = await bulkApi.getRiskHistory(w); } catch (e) { console.error(`  ${w.slice(0, 8)}: riskHistory failed`, (e as Error).message); continue; }
+    try {
+      events = await bulkApi.getRiskHistory(w);
+    } catch (e) {
+      const msg = (e as Error).message || '';
+      if (/429/.test(msg)) return 'throttled';
+      console.error(`  ${w.slice(0, 8)}: riskHistory failed`, msg);
+      return 'ok';
+    }
     scanned++;
     for (const e of events) {
       const ms = Math.floor(e.timestamp / 1e6);
@@ -84,9 +97,38 @@ async function main() {
         console.log(`  + ${w.slice(0, 8)} ${e.symbol} ${side} $${value.toFixed(0)} @ ${new Date(ms).toISOString()}`);
       }
     }
-    await sleep(250); // stay polite to BULK's /account limiter
+    return 'ok';
+  };
+
+  for (const w of wallets) {
+    if ((await processWallet(w)) === 'throttled') retry.push(w);
+    await sleep(spacing); // stay polite to BULK's /account limiter
   }
-  console.log(`done: scanned ${scanned} wallets, inserted ${liqIns} liquidations + ${adlIns} ADL, ${skipped} already present`);
+
+  // Retry rounds: each round waits longer between wallets, so a wallet is only
+  // abandoned after BULK has refused it repeatedly at a very slow cadence.
+  let round = 0;
+  while (retry.length > 0 && round < 5) {
+    round++;
+    const queue = retry.splice(0, retry.length);
+    const wait = spacing * Math.pow(3, round); // 750ms, 2.2s, 6.7s, 20s, 60s
+    console.log(`retry round ${round}: ${queue.length} throttled wallet(s), ${wait}ms apart`);
+    await sleep(5000 * round); // let the limiter cool before the round
+    for (const w of queue) {
+      if ((await processWallet(w)) === 'throttled') retry.push(w);
+      await sleep(wait);
+    }
+    // No-progress guard: if a whole round resolved nothing, BULK is refusing
+    // us outright and slower rounds will only burn hours. Stop and let the
+    // operator re-run later rather than grind at 60s/wallet overnight.
+    if (retry.length >= queue.length) {
+      console.error(`retry round ${round} resolved none of ${queue.length} — stopping early`);
+      break;
+    }
+  }
+  if (retry.length) console.error(`STILL THROTTLED after ${round} rounds: ${retry.length} wallet(s) — re-run to pick them up`);
+
+  console.log(`done: scanned ${scanned} wallets, inserted ${liqIns} liquidations + ${adlIns} ADL, ${skipped} already present, ${retry.length} unresolved`);
   process.exit(0);
 }
 main().catch((e) => { console.error(e); process.exit(1); });
