@@ -3633,7 +3633,14 @@ router.get('/candles/:symbol', async (req: Request, res: Response) => {
     const freshSec = startTime !== undefined && endTime !== undefined && !touchesPresent ? 3600 : 60;
     const result = await swrCache(cacheKey, freshSec, async () => {
       const klines = await fetchKlines(symbol, interval, limit, startTime, endTime);
-      return { symbol, interval, limit, candles: klines };
+      // BULK's /klines IGNORES `limit` — it returns its whole retained window
+      // (hundreds to >1000 candles) no matter what we ask for, so a request for
+      // 24 candles was shipping ~140 KB. It does honour startTime/endTime, so:
+      //   • explicit window → that window IS the requested set, return it whole;
+      //   • no window ("most recent N") → keep only the newest `limit`.
+      const hasWindow = startTime !== undefined || endTime !== undefined;
+      const candles = hasWindow || klines.length <= limit ? klines : klines.slice(-limit);
+      return { symbol, interval, limit, candles };
     }, 86_400);
     res.json(result);
   } catch (error: any) {
