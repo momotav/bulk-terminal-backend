@@ -40,7 +40,7 @@ async function main() {
       )).map((r) => r.w);
   console.log(`backfill riskHistory since ${since.toISOString()} for ${wallets.length} wallet(s)`);
 
-  let liqIns = 0, adlIns = 0, skipped = 0, scanned = 0;
+  let liqIns = 0, adlIns = 0, vaultIns = 0, skipped = 0, scanned = 0;
   // Wallets BULK rate-limited; retried at the end with growing backoff rather
   // than dropped. Dropping them is why a single pass left 946 wallets (18%)
   // unscanned and why re-running whole passes converged so slowly.
@@ -71,6 +71,22 @@ async function main() {
       // ADL must NOT be filed as one — the original `else` branch here treated
       // every non-ADL event as a liquidation, which turned the vault's 199
       // shortfall absorptions into phantom liquidations.
+      if (e.eventType === 'risk_vault') {
+        // Shortfall the vault absorbed. BULK encodes the amount in the reason
+        // string: "absorbed_shortfall:absorbed 26092.10 / 26092.10, 100.0%".
+        const m = /absorbed\s+([\d.]+)\s*\/\s*([\d.]+)/.exec(e.reason ?? '');
+        const absorbed = m ? Number(m[1]) : null;
+        const dup = await query<{ n: string }>(
+          `SELECT count(*)::text AS n FROM vault_events WHERE vault_address = $1 AND symbol = $2 AND abs(extract(epoch FROM timestamp) * 1000 - $3) < 2000`,
+          [w, e.symbol, ms]);
+        if (parseInt(dup[0].n, 10) > 0) { skipped++; continue; }
+        await query(
+          `INSERT INTO vault_events (vault_address, symbol, side, size, price, notional, absorbed, reason, timestamp)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, to_timestamp($9/1000.0))`,
+          [w, e.symbol, side, size, e.price, value, Number.isFinite(absorbed as number) ? absorbed : null, e.reason ?? null, ms]);
+        vaultIns++;
+        continue;
+      }
       if (e.eventType !== 'liquidation' && e.eventType !== 'adl') continue;
       if (e.eventType === 'adl') {
         const dup = await query<{ n: string }>(
@@ -134,7 +150,7 @@ async function main() {
   }
   if (retry.length) console.error(`STILL THROTTLED after ${round} rounds: ${retry.length} wallet(s) — re-run to pick them up`);
 
-  console.log(`done: scanned ${scanned} wallets, inserted ${liqIns} liquidations + ${adlIns} ADL, ${skipped} already present, ${retry.length} unresolved`);
+  console.log(`done: scanned ${scanned} wallets, inserted ${liqIns} liquidations + ${adlIns} ADL + ${vaultIns} vault events, ${skipped} already present, ${retry.length} unresolved`);
   process.exit(0);
 }
 main().catch((e) => { console.error(e); process.exit(1); });

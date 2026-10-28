@@ -129,7 +129,13 @@ export interface RawRiskEvent {
   isBuy: boolean;       // direction of the forced fill, NOT the position side
   amount: number;       // size in base units (unscaled)
   price: number;        // fill price
-  eventType: 'liquidation' | 'adl';
+  // BULK emits at least three: 'liquidation', 'adl', and 'risk_vault' (the
+  // vault absorbing a shortfall). The union used to list only the first two,
+  // which is partly why callers wrote `else => liquidation` and filed vault
+  // events as liquidations. The `(string & {})` arm keeps autocomplete for the
+  // known values while allowing a future type to flow through as data rather
+  // than silently matching an else branch.
+  eventType: 'liquidation' | 'adl' | 'risk_vault' | (string & {});
   marginPrior: number;  // margin balance snapshot before the event
   marginAfter: number;  // margin balance snapshot after the event
   reason: string;       // human-readable, e.g. "liquidation due to equity X < maintenance margin: Y"

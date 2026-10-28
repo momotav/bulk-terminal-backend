@@ -172,6 +172,35 @@ export async function initializeDatabase(): Promise<void> {
       ON health_checks(name, checked_at DESC);
     `);
 
+    // Risk-vault shortfall absorptions. BULK's riskHistory has a THIRD event
+    // type besides liquidation/adl: 'risk_vault', where the protocol vault
+    // eats the part of a liquidated position that couldn't be closed for what
+    // it was worth — i.e. bad debt. We stored none of it, and worse, filed the
+    // vault's events as if it were a liquidated trader.
+    //
+    // `absorbed` is parsed out of BULK's reason string
+    // ("absorbed_shortfall:absorbed 26092.10 / 26092.10, 100.0%"); `notional`
+    // is amount x price. NOTE: this is what BULK's per-account ledger reports,
+    // which does NOT reproduce the "taken over by the vault" figure on BULK's
+    // own panel — that number is computed some other way we can't see, so this
+    // table is deliberately presented as shortfall absorbed, not as their line.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS vault_events (
+        id SERIAL PRIMARY KEY,
+        vault_address VARCHAR(64) NOT NULL,
+        symbol VARCHAR(32) NOT NULL,
+        side VARCHAR(8),
+        size DECIMAL(30, 10) DEFAULT 0,
+        price DECIMAL(20, 8) DEFAULT 0,
+        notional DECIMAL(20, 2) DEFAULT 0,
+        absorbed DECIMAL(20, 2),
+        reason TEXT,
+        timestamp TIMESTAMP NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_vault_events_time ON vault_events(timestamp DESC);
+      CREATE INDEX IF NOT EXISTS idx_vault_events_symbol_time ON vault_events(symbol, timestamp DESC);
+    `);
+
     // Liquidations table
     await client.query(`
       CREATE TABLE IF NOT EXISTS liquidations (

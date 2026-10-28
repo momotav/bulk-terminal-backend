@@ -2227,9 +2227,13 @@ router.get('/liquidations/treemap', async (req: Request, res: Response) => {
     '24h': '24 hours',
     '3d': '3 days',
     '7d': '7 days',
+    '30d': '30 days',
     'all': '365 days'
   };
-  const interval = intervalMap[period] || '24 hours';
+  // Unknown period => fall back to the WIDEST window, not the narrowest. The
+  // old '24 hours' default meant an unsupported value (e.g. '30d', which this
+  // map was missing) silently rendered a day of data under a 30-day label.
+  const interval = intervalMap[period] || '365 days';
   
   try {
     const cacheKey = `liq-treemap:${period}`;
@@ -2285,6 +2289,7 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
     '24h': { interval: '24 hours', bucket: '1 hour' },
     '3d': { interval: '3 days', bucket: '4 hours' },
     '7d': { interval: '7 days', bucket: '12 hours' },
+    '30d': { interval: '30 days', bucket: '1 day' },
     'all': { interval: '365 days', bucket: '1 day' }
   };
   const { bucket } = intervalMap[period] || intervalMap['all'];
@@ -2305,7 +2310,7 @@ router.get('/liquidations/chart', async (req: Request, res: Response) => {
 
     // Now get bucketed data for the visible period
     const intervalHours: Record<string, number> = {
-      '4h': 4, '24h': 24, '3d': 72, '7d': 168, 'all': 8760
+      '4h': 4, '24h': 24, '3d': 72, '7d': 168, '30d': 720, 'all': 8760
     };
     const hours = intervalHours[period] || 8760;
     
@@ -2920,6 +2925,76 @@ router.get('/protocol-revenue-chart', async (req: Request, res: Response) => {
 // duplicate was dead code and additionally had an invalid date_trunc
 // unit ('1_hour') that would have thrown had it ever been reached.
 
+
+// Risk-vault shortfall absorption — BULK's third forced-event type, where the
+// protocol vault eats the part of a liquidated position that couldn't be closed
+// for what it was worth (bad debt). Sourced from per-account riskHistory via
+// the backfill job.
+//
+// HONESTY NOTE: this is NOT a reproduction of the "taken over by the vault"
+// figure on BULK's internal panel. That number is computed in a way we can't
+// observe (their all-time is ~$13.2M; the vault's own ledger sums to ~$1.1M
+// over a Sep 5-9 window). We report what BULK's public ledger actually says
+// and label it as shortfall absorbed, rather than publish a number dressed up
+// to look like theirs.
+router.get('/vault-summary', async (req: Request, res: Response) => {
+  const period = (req.query.period as string) || 'all';
+  const intervalMap: Record<string, string> = {
+    '24h': '24 hours', '7d': '7 days', '30d': '30 days', 'all': '365 days',
+  };
+  const interval = intervalMap[period] || '365 days';
+  const cacheKey = `analytics:vault_summary:${period}`;
+  try {
+    const result = await swrCache(cacheKey, 120, async () => {
+      const [totals, bySymbol, recent] = await Promise.all([
+        query<{ events: string; notional: string; absorbed: string; first_at: string | null; last_at: string | null }>(`
+          SELECT count(*)::text AS events,
+                 COALESCE(SUM(notional), 0)::text AS notional,
+                 COALESCE(SUM(absorbed), 0)::text AS absorbed,
+                 MIN(timestamp)::text AS first_at,
+                 MAX(timestamp)::text AS last_at
+          FROM vault_events WHERE timestamp > NOW() - INTERVAL '${interval}'`),
+        query<{ symbol: string; events: string; notional: string; absorbed: string }>(`
+          SELECT symbol, count(*)::text AS events,
+                 COALESCE(SUM(notional), 0)::text AS notional,
+                 COALESCE(SUM(absorbed), 0)::text AS absorbed
+          FROM vault_events WHERE timestamp > NOW() - INTERVAL '${interval}'
+          GROUP BY symbol ORDER BY SUM(notional) DESC NULLS LAST LIMIT 20`),
+        query<{ symbol: string; notional: string; absorbed: string; reason: string; timestamp: string }>(`
+          SELECT symbol, notional::text, absorbed::text, reason, timestamp::text
+          FROM vault_events WHERE timestamp > NOW() - INTERVAL '${interval}'
+          ORDER BY timestamp DESC LIMIT 25`),
+      ]);
+      const t = totals[0];
+      return {
+        period,
+        source: "BULK riskHistory eventType 'risk_vault' (shortfall absorbed by the protocol vault)",
+        events: parseInt(t?.events || '0', 10),
+        notional: parseFloat(t?.notional || '0'),
+        absorbed: parseFloat(t?.absorbed || '0'),
+        firstAt: t?.first_at || null,
+        lastAt: t?.last_at || null,
+        bySymbol: bySymbol.map((r) => ({
+          symbol: r.symbol,
+          events: parseInt(r.events, 10),
+          notional: parseFloat(r.notional),
+          absorbed: parseFloat(r.absorbed),
+        })),
+        recent: recent.map((r) => ({
+          symbol: r.symbol,
+          notional: parseFloat(r.notional),
+          absorbed: r.absorbed === null ? null : parseFloat(r.absorbed),
+          reason: r.reason,
+          timestamp: r.timestamp,
+        })),
+      };
+    }, 3600);
+    res.json(result);
+  } catch (error) {
+    console.error('Error building vault summary:', error);
+    res.status(500).json({ error: 'Failed to build vault summary' });
+  }
+});
 
 // ADL summary stats
 router.get('/adl-summary', async (req: Request, res: Response) => {
