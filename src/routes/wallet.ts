@@ -590,7 +590,12 @@ router.get('/:address/closed-positions', async (req: Request, res: Response) => 
   try {
     const { address } = req.params;
     const symbol = (req.query.symbol as string) || null;
-    const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
+    // Cap raised 500 → 10000 (2026-10-28). BULK returns a wallet's ENTIRE
+    // closed-position history in one response (3,621 rows reaching back to
+    // mainnet launch for a heavy wallet), so the old 500 cap silently cut a
+    // seven-week history down to the last ~6 days — which is what the trade
+    // list, win rate, profit factor and streaks were computed from.
+    const limit = Math.min(parseInt(req.query.limit as string) || 100, 10000);
 
     const cacheKey = `wallet:closed-positions:${address}:${symbol || 'all'}:${limit}`;
     const cached = await getCache<{ positions: unknown[] }>(cacheKey);
