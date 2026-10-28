@@ -66,6 +66,12 @@ async function main() {
       const value = size * e.price;
       // Forced fill direction → position side: a forced BUY closes a SHORT.
       const side = e.isBuy ? 'short' : 'long';
+      // BULK has a third event type, 'risk_vault' (the vault absorbing a
+      // shortfall), and may add more. Anything that is not a liquidation or an
+      // ADL must NOT be filed as one — the original `else` branch here treated
+      // every non-ADL event as a liquidation, which turned the vault's 199
+      // shortfall absorptions into phantom liquidations.
+      if (e.eventType !== 'liquidation' && e.eventType !== 'adl') continue;
       if (e.eventType === 'adl') {
         const dup = await query<{ n: string }>(
           `SELECT count(*)::text AS n FROM adl_events WHERE wallet_address = $1 AND symbol = $2 AND abs(extract(epoch FROM timestamp) * 1000 - $3) < 2000`,

@@ -156,6 +156,22 @@ export async function initializeDatabase(): Promise<void> {
     // before this column existed simply have no net worth.
     await client.query(`ALTER TABLE trader_snapshots ADD COLUMN IF NOT EXISTS total_balance DECIMAL(20, 2)`);
 
+    // Reconciliation results — one row per check per run. Lets /health/detailed
+    // show what was last verified and when, instead of only "is the socket up".
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS health_checks (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(64) NOT NULL,
+        status VARCHAR(8) NOT NULL,
+        detail TEXT,
+        ours DOUBLE PRECISION,
+        theirs DOUBLE PRECISION,
+        checked_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_health_checks_name_time
+      ON health_checks(name, checked_at DESC);
+    `);
+
     // Liquidations table
     await client.query(`
       CREATE TABLE IF NOT EXISTS liquidations (

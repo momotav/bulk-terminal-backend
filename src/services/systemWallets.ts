@@ -23,6 +23,14 @@ const SYSTEM_WALLETS = new Set<string>([
   // every liquidation. Excluded from ingestion and from ranked liquidation views
   // so the real liquidated user is what surfaces.
   '5rXNKZnrV88vPbwWKDkUCsYUvNDCChY2Gzdj4MJDqvaa',
+  // Risk vault — the protocol account that absorbs shortfall when a liquidation
+  // can't be closed at a price that covers the position. BULK's own ledger shows
+  // it has ZERO liquidations of its own: all 199 of its risk events are
+  // eventType 'risk_vault' with reason 'absorbed_shortfall'. It appears on the
+  // vault side of liquidation fills, so recording it made it look like the
+  // single most-liquidated trader on the exchange ($435K of phantom volume).
+  // BULK reports its activity separately as "Taken over by the vault".
+  'HnJcHCqaWqj9FS571mkK8cGu1WxjXSMNfpurHgrZPWyp',
 ]);
 
 export function isSystemWallet(address: string | null | undefined): boolean {

@@ -29,6 +29,12 @@ const stats = {
   tradesReceived: 0,
   liquidationsReceived: 0,
   adlReceived: 0,
+  // Prints carrying a reason token we don't recognise. BULK has twice renamed
+  // this field without notice (string `reason` -> numeric `reason_code`), and
+  // each time we silently filed liquidations as ordinary trades for days. A
+  // non-zero count here means the feed changed shape and classification is
+  // already wrong — the reconciliation job alerts on it.
+  unknownReasonCodes: 0,
   tickerSnapshots: 0,
   lastTradeTime: null as Date | null,
   lastLiquidationTime: null as Date | null,
@@ -705,6 +711,15 @@ function processMessage(data: WebSocket.Data): void {
         const rc = trade.reason_code ?? trade.reasonCode;
         const reason: string | null = trade.reason
           || (rc === 1 ? 'liquidation' : rc === 3 ? 'liquidation_sweep' : rc === 2 ? 'adl' : null);
+        // Anything outside the codes we know (0 trade, 1 liq, 2 adl, 3 sweep)
+        // or an unrecognised string reason means BULK changed the feed.
+        if ((rc !== undefined && rc !== null && ![0, 1, 2, 3].includes(Number(rc))) ||
+            (typeof trade.reason === 'string' && !['trade', 'liquidation', 'liquidation_sweep', 'adl'].includes(trade.reason))) {
+          stats.unknownReasonCodes++;
+          if (stats.unknownReasonCodes <= 5) {
+            console.error(`🚨 UNKNOWN reason token from BULK: reason=${JSON.stringify(trade.reason)} reason_code=${JSON.stringify(rc)} — classification may be wrong`);
+          }
+        }
         
         // Check for liquidation
         // Per BULK API docs: reason="liquidation" and/or liq=true.

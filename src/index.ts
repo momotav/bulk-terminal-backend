@@ -16,6 +16,7 @@ import { startBulkSolHistory } from './services/bulksolIndexer';
 
 import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
 import { startLeaderboardEnrichment } from './jobs/leaderboardEnrichment';
+import { startReconciliation, latestHealth } from './jobs/reconciliation';
 import { startDevnetPoller } from './jobs/devnetPoller';
 import { initRedis, getCacheStats } from './services/cache';
 
@@ -112,6 +113,27 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     websocket: wsStats,
   });
+});
+
+// Deeper health: the reconciliation job's latest verdict per check, so "is the
+// data right" can be answered without reading the DB by hand. Public and
+// read-only — it exposes aggregate figures we already publish, no raw rows.
+// `status` is the worst individual check, so a monitor can watch one field.
+app.get('/health/detailed', async (req, res) => {
+  try {
+    const checks = (await latestHealth()) as Array<{ status: string; checked_at: string }>;
+    const worst = checks.some((c) => c.status === 'fail') ? 'fail'
+      : checks.some((c) => c.status === 'warn') ? 'warn'
+      : checks.length ? 'ok' : 'unknown';
+    res.json({
+      status: worst,
+      timestamp: new Date().toISOString(),
+      websocket: getWebSocketStats(),
+      checks,
+    });
+  } catch (e) {
+    res.status(500).json({ status: 'unknown', error: (e as Error).message });
+  }
 });
 
 // Gate every /debug/* endpoint behind a secret. These expose raw DB rows and an
@@ -395,6 +417,11 @@ async function start() {
   // Enrich the PnL leaderboard from BULK account data for our top traders by
   // volume (BULK's own indexer leaderboard is disabled — we build it ourselves).
   startLeaderboardEnrichment();
+
+  // Continuously verify stored data against BULK's own counters and alert on
+  // divergence, so a broken ingestion path is caught by the system in minutes
+  // rather than by a user in weeks.
+  startReconciliation();
 
   // The site is mainnet-only. The devnet poller and the explorer/network-metrics
   // collectors ingest NON-mainnet data (devnet tickers; the testnet-chain
