@@ -155,6 +155,17 @@ export async function initializeDatabase(): Promise<void> {
     // a net-worth change that PnL doesn't explain). Nullable: rows written
     // before this column existed simply have no net worth.
     await client.query(`ALTER TABLE trader_snapshots ADD COLUMN IF NOT EXISTS total_balance DECIMAL(20, 2)`);
+    // Unique event identity from BULK (slot, sequence) on the forced-event
+    // tables. Without it, dedup fell back to "same wallet+symbol within 2s",
+    // which collapsed genuinely distinct partial liquidations in a cascade —
+    // measured at 88 of 199 events dropped on one account.
+    for (const t of ['liquidations', 'adl_events']) {
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS slot BIGINT`);
+      await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS sequence INT`);
+      await client.query(
+        `CREATE UNIQUE INDEX IF NOT EXISTS uq_${t}_identity
+         ON ${t}(wallet_address, slot, sequence) WHERE slot IS NOT NULL`);
+    }
 
     // Reconciliation results — one row per check per run. Lets /health/detailed
     // show what was last verified and when, instead of only "is the socket up".
@@ -195,9 +206,15 @@ export async function initializeDatabase(): Promise<void> {
         notional DECIMAL(20, 2) DEFAULT 0,
         absorbed DECIMAL(20, 2),
         reason TEXT,
-        timestamp TIMESTAMP NOT NULL
+        timestamp TIMESTAMP NOT NULL,
+        -- BULK's (slot, sequence) uniquely identifies a risk event. Storing it
+        -- lets re-runs dedup exactly instead of guessing from a time window.
+        slot BIGINT,
+        sequence INT
       );
       CREATE INDEX IF NOT EXISTS idx_vault_events_time ON vault_events(timestamp DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_vault_events_identity
+        ON vault_events(vault_address, slot, sequence) WHERE slot IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_vault_events_symbol_time ON vault_events(symbol, timestamp DESC);
     `);
 

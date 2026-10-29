@@ -47,6 +47,34 @@ async function main() {
   const retry: string[] = [];
   const spacing = Number(arg('--spacing') ?? 250);
 
+  // Has this exact event already been stored? BULK's (slot, sequence) is a
+  // unique identity, so prefer it. Rows ingested live by the WS listener have
+  // no slot, so fall back to an EXACT value match (symbol + time + size +
+  // price) rather than the old "same symbol within 2s", which collapsed
+  // distinct partial liquidations in a cascade — 88 of 199 events on one
+  // account were being dropped as phantom duplicates.
+  const alreadyStored = async (
+    table: 'liquidations' | 'adl_events' | 'vault_events',
+    walletCol: 'wallet_address' | 'vault_address',
+    w: string, symbol: string, ms: number, size: number, price: number,
+    slot: number | null, sequence: number | null,
+  ): Promise<boolean> => {
+    if (slot !== null && sequence !== null) {
+      const byId = await query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM ${table} WHERE ${walletCol} = $1 AND slot = $2 AND sequence = $3`,
+        [w, slot, sequence]);
+      if (parseInt(byId[0].n, 10) > 0) return true;
+    }
+    const byValue = await query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM ${table}
+       WHERE ${walletCol} = $1 AND symbol = $2
+         AND abs(extract(epoch FROM timestamp) * 1000 - $3) < 2000
+         AND abs(size - $4) < 0.000000001
+         AND abs(price - $5) < 0.000000001`,
+      [w, symbol, ms, size, price]);
+    return parseInt(byValue[0].n, 10) > 0;
+  };
+
   const processWallet = async (w: string): Promise<'ok' | 'throttled'> => {
     // System wallets (liquidation engine, risk vault) must never be recorded
     // as liquidated traders — but the vault IS the source of risk_vault
@@ -69,6 +97,8 @@ async function main() {
     for (const e of events) {
       const ms = Math.floor(e.timestamp / 1e6);
       if (ms < since.getTime()) continue;
+      const slot = Number.isFinite(e.slot) ? Number(e.slot) : null;
+      const sequence = Number.isFinite(e.sequence) ? Number(e.sequence) : null;
       const size = Math.abs(e.amount);
       const value = size * e.price;
       // Forced fill direction → position side: a forced BUY closes a SHORT.
@@ -83,14 +113,12 @@ async function main() {
         // string: "absorbed_shortfall:absorbed 26092.10 / 26092.10, 100.0%".
         const m = /absorbed\s+([\d.]+)\s*\/\s*([\d.]+)/.exec(e.reason ?? '');
         const absorbed = m ? Number(m[1]) : null;
-        const dup = await query<{ n: string }>(
-          `SELECT count(*)::text AS n FROM vault_events WHERE vault_address = $1 AND symbol = $2 AND abs(extract(epoch FROM timestamp) * 1000 - $3) < 2000`,
-          [w, e.symbol, ms]);
-        if (parseInt(dup[0].n, 10) > 0) { skipped++; continue; }
+        if (await alreadyStored('vault_events', 'vault_address', w, e.symbol, ms, size, e.price, slot, sequence)) { skipped++; continue; }
         await query(
-          `INSERT INTO vault_events (vault_address, symbol, side, size, price, notional, absorbed, reason, timestamp)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, to_timestamp($9/1000.0))`,
-          [w, e.symbol, side, size, e.price, value, Number.isFinite(absorbed as number) ? absorbed : null, e.reason ?? null, ms]);
+          `INSERT INTO vault_events (vault_address, symbol, side, size, price, notional, absorbed, reason, timestamp, slot, sequence)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8, to_timestamp($9/1000.0), $10, $11)
+           ON CONFLICT DO NOTHING`,
+          [w, e.symbol, side, size, e.price, value, Number.isFinite(absorbed as number) ? absorbed : null, e.reason ?? null, ms, slot, sequence]);
         vaultIns++;
         continue;
       }
@@ -98,28 +126,23 @@ async function main() {
       if (systemOnly) continue;
       if (e.eventType !== 'liquidation' && e.eventType !== 'adl') continue;
       if (e.eventType === 'adl') {
-        const dup = await query<{ n: string }>(
-          `SELECT count(*)::text AS n FROM adl_events WHERE wallet_address = $1 AND symbol = $2 AND abs(extract(epoch FROM timestamp) * 1000 - $3) < 2000`,
-          [w, e.symbol, ms]);
-        if (parseInt(dup[0].n, 10) > 0) { skipped++; continue; }
+        if (await alreadyStored('adl_events', 'wallet_address', w, e.symbol, ms, size, e.price, slot, sequence)) { skipped++; continue; }
         await query(
-          `INSERT INTO adl_events (wallet_address, counterparty, symbol, side, size, price, value, timestamp)
-           VALUES ($1, NULL, $2, $3, $4, $5, $6, to_timestamp($7/1000.0))`,
-          [w, e.symbol, side, size, e.price, value, ms]);
+          `INSERT INTO adl_events (wallet_address, counterparty, symbol, side, size, price, value, timestamp, slot, sequence)
+           VALUES ($1, NULL, $2, $3, $4, $5, $6, to_timestamp($7/1000.0), $8, $9)
+           ON CONFLICT DO NOTHING`,
+          [w, e.symbol, side, size, e.price, value, ms, slot, sequence]);
         await query(
           `INSERT INTO traders (wallet_address, total_adl, adl_value, last_seen) VALUES ($1, 1, $2, NOW())
            ON CONFLICT (wallet_address) DO UPDATE SET total_adl = COALESCE(traders.total_adl, 0) + 1, adl_value = COALESCE(traders.adl_value, 0) + $2`,
           [w, value]);
         adlIns++;
       } else {
-        const dup = await query<{ n: string }>(
-          `SELECT count(*)::text AS n FROM liquidations WHERE wallet_address = $1 AND symbol = $2 AND abs(extract(epoch FROM timestamp) * 1000 - $3) < 2000`,
-          [w, e.symbol, ms]);
-        if (parseInt(dup[0].n, 10) > 0) { skipped++; continue; }
+        if (await alreadyStored('liquidations', 'wallet_address', w, e.symbol, ms, size, e.price, slot, sequence)) { skipped++; continue; }
         await query(
-          `INSERT INTO liquidations (wallet_address, symbol, side, size, price, value, timestamp)
-           VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0)) ON CONFLICT DO NOTHING`,
-          [w, e.symbol, side, size, e.price, value, ms]);
+          `INSERT INTO liquidations (wallet_address, symbol, side, size, price, value, timestamp, slot, sequence)
+           VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0), $8, $9) ON CONFLICT DO NOTHING`,
+          [w, e.symbol, side, size, e.price, value, ms, slot, sequence]);
         await query(
           `INSERT INTO traders (wallet_address, total_liquidations, liquidation_value, last_seen) VALUES ($1, 1, $2, NOW())
            ON CONFLICT (wallet_address) DO UPDATE SET total_liquidations = traders.total_liquidations + 1, liquidation_value = traders.liquidation_value + $2`,
