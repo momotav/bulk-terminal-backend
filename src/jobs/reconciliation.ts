@@ -151,10 +151,18 @@ async function checkFeeIdentity(): Promise<CheckResult> {
  * the flow checks can't see because events are still arriving, just not all.
  */
 async function checkLiquidationAccuracy(): Promise<CheckResult> {
+  // Pick busy wallets by recent activity, but COUNT ALL their rows: BULK's
+  // riskHistory is a lifetime ledger, so filtering our side to 30 days made
+  // every sample look ~18% short and the check cried wolf on healthy data.
   const sample = await query<{ wallet_address: string; n: string }>(
-    `SELECT wallet_address, count(*)::text AS n FROM liquidations
-     WHERE timestamp > NOW() - INTERVAL '30 days'
-     GROUP BY wallet_address ORDER BY count(*) DESC LIMIT 5`);
+    `SELECT l.wallet_address, count(*)::text AS n
+     FROM liquidations l
+     WHERE l.wallet_address IN (
+       SELECT wallet_address FROM liquidations
+       WHERE timestamp > NOW() - INTERVAL '30 days'
+       GROUP BY wallet_address ORDER BY count(*) DESC LIMIT 5
+     )
+     GROUP BY l.wallet_address`);
   if (sample.length === 0) return { name: 'liquidation_accuracy', status: 'warn', detail: 'no liquidations to sample' };
   let ours = 0, theirs = 0, checked = 0;
   for (const r of sample) {

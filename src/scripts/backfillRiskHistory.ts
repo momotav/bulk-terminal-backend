@@ -48,7 +48,11 @@ async function main() {
   const spacing = Number(arg('--spacing') ?? 250);
 
   const processWallet = async (w: string): Promise<'ok' | 'throttled'> => {
-    if (isSystemWallet(w)) return 'ok';
+    // System wallets (liquidation engine, risk vault) must never be recorded
+    // as liquidated traders — but the vault IS the source of risk_vault
+    // shortfall events, so we still scan it and keep only those. Skipping it
+    // outright left vault_events permanently empty.
+    const systemOnly = isSystemWallet(w);
     let events;
     try {
       events = await bulkApi.getRiskHistory(w);
@@ -90,6 +94,8 @@ async function main() {
         vaultIns++;
         continue;
       }
+      // For a system wallet, vault events above are the ONLY thing we keep.
+      if (systemOnly) continue;
       if (e.eventType !== 'liquidation' && e.eventType !== 'adl') continue;
       if (e.eventType === 'adl') {
         const dup = await query<{ n: string }>(
