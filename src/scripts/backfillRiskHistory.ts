@@ -134,11 +134,12 @@ async function main() {
       if (e.eventType !== 'liquidation' && e.eventType !== 'adl') continue;
       if (e.eventType === 'adl') {
         if (await alreadyStored('adl_events', 'wallet_address', w, e.symbol, ms, size, e.price, slot, sequence)) { skipped++; continue; }
-        await query(
+        const insA = await query<{ id: number }>(
           `INSERT INTO adl_events (wallet_address, counterparty, symbol, side, size, price, value, timestamp, slot, sequence)
            VALUES ($1, NULL, $2, $3, $4, $5, $6, to_timestamp($7/1000.0), $8, $9)
-           ON CONFLICT DO NOTHING`,
+           ON CONFLICT DO NOTHING RETURNING id`,
           [w, e.symbol, side, size, e.price, value, ms, slot, sequence]);
+        if (insA.length === 0) { skipped++; continue; }
         await query(
           `INSERT INTO traders (wallet_address, total_adl, adl_value, last_seen) VALUES ($1, 1, $2, NOW())
            ON CONFLICT (wallet_address) DO UPDATE SET total_adl = COALESCE(traders.total_adl, 0) + 1, adl_value = COALESCE(traders.adl_value, 0) + $2`,
@@ -146,10 +147,17 @@ async function main() {
         adlIns++;
       } else {
         if (await alreadyStored('liquidations', 'wallet_address', w, e.symbol, ms, size, e.price, slot, sequence)) { skipped++; continue; }
-        await query(
+        // RETURNING tells us whether the row actually landed. ON CONFLICT DO
+        // NOTHING silently drops a duplicate, and the counter update below used
+        // to run regardless — so a blocked insert still incremented
+        // total_liquidations and the counter drifted far above the real row
+        // count (one wallet read 141 against 71 actual rows).
+        const ins = await query<{ id: number }>(
           `INSERT INTO liquidations (wallet_address, symbol, side, size, price, value, timestamp, slot, sequence)
-           VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0), $8, $9) ON CONFLICT DO NOTHING`,
+           VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7/1000.0), $8, $9)
+           ON CONFLICT DO NOTHING RETURNING id`,
           [w, e.symbol, side, size, e.price, value, ms, slot, sequence]);
+        if (ins.length === 0) { skipped++; continue; }
         await query(
           `INSERT INTO traders (wallet_address, total_liquidations, liquidation_value, last_seen) VALUES ($1, 1, $2, NOW())
            ON CONFLICT (wallet_address) DO UPDATE SET total_liquidations = traders.total_liquidations + 1, liquidation_value = traders.liquidation_value + $2`,
