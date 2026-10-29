@@ -65,12 +65,19 @@ async function main() {
         [w, slot, sequence]);
       if (parseInt(byId[0].n, 10) > 0) return true;
     }
+    // Compare at the STORED precision. size is DECIMAL(30,10) and price
+    // DECIMAL(20,8), so a raw `abs(stored - incoming) < 1e-9` can never match:
+    // BULK sends more decimals than the column keeps, and the rounding
+    // difference alone exceeds the tolerance. That made every existing row
+    // invisible to this check and the backfill re-inserted the lot — one
+    // wallet went from 71 rows to 141. Round the incoming value the same way
+    // the column did, then compare.
     const byValue = await query<{ n: string }>(
       `SELECT count(*)::text AS n FROM ${table}
        WHERE ${walletCol} = $1 AND symbol = $2
          AND abs(extract(epoch FROM timestamp) * 1000 - $3) < 2000
-         AND abs(size - $4) < 0.000000001
-         AND abs(price - $5) < 0.000000001`,
+         AND size  = ROUND($4::numeric, 10)
+         AND price = ROUND($5::numeric, 8)`,
       [w, symbol, ms, size, price]);
     return parseInt(byValue[0].n, 10) > 0;
   };
