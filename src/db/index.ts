@@ -159,12 +159,18 @@ export async function initializeDatabase(): Promise<void> {
     // tables. Without it, dedup fell back to "same wallet+symbol within 2s",
     // which collapsed genuinely distinct partial liquidations in a cascade —
     // measured at 88 of 199 events dropped on one account.
-    for (const t of ['liquidations', 'adl_events']) {
+    // CREATE TABLE IF NOT EXISTS does NOT add columns to a table that already
+    // exists, so every column added after a table's first deploy needs an
+    // explicit ALTER here — and any index over those columns must come after
+    // it. (Creating the index inline with the table definition took the API
+    // down once: vault_events already existed without `slot`.)
+    for (const t of ['liquidations', 'adl_events', 'vault_events']) {
+      const walletCol = t === 'vault_events' ? 'vault_address' : 'wallet_address';
       await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS slot BIGINT`);
       await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS sequence INT`);
       await client.query(
         `CREATE UNIQUE INDEX IF NOT EXISTS uq_${t}_identity
-         ON ${t}(wallet_address, slot, sequence) WHERE slot IS NOT NULL`);
+         ON ${t}(${walletCol}, slot, sequence) WHERE slot IS NOT NULL`);
     }
 
     // Reconciliation results — one row per check per run. Lets /health/detailed
@@ -213,8 +219,6 @@ export async function initializeDatabase(): Promise<void> {
         sequence INT
       );
       CREATE INDEX IF NOT EXISTS idx_vault_events_time ON vault_events(timestamp DESC);
-      CREATE UNIQUE INDEX IF NOT EXISTS uq_vault_events_identity
-        ON vault_events(vault_address, slot, sequence) WHERE slot IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_vault_events_symbol_time ON vault_events(symbol, timestamp DESC);
     `);
 
