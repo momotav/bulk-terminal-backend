@@ -160,6 +160,7 @@ async function checkLiquidationAccuracy(): Promise<CheckResult> {
   for (const r of sample) {
     try {
       const ev = await bulkApi.getRiskHistory(r.wallet_address);
+      if (ev === null) continue; // throttled — skip rather than count as zero
       theirs += ev.filter((e) => e.eventType === 'liquidation').length;
       ours += Number(r.n);
       checked++;

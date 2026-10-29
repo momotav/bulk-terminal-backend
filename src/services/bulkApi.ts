@@ -658,7 +658,13 @@ class BulkApiService {
   //
   // Same defensive shape-detection as getFills / getClosedPositions so a
   // future BULK rewrap doesn't silently break the panel.
-  async getRiskHistory(walletAddress: string): Promise<RawRiskEvent[]> {
+  // Returns null when the upstream call FAILED (429, timeout, 5xx) and an
+  // array — possibly empty — when BULK genuinely answered. Returning [] for a
+  // failure is the bug that has bitten this codebase repeatedly: callers can't
+  // tell "no events" from "we never got an answer", so a rate-limited wallet
+  // silently looks like a wallet that was never liquidated. The backfill in
+  // particular counted 797 throttled wallets as fully scanned because of it.
+  async getRiskHistory(walletAddress: string): Promise<RawRiskEvent[] | null> {
     const net = getRequestNetwork();
     const key = `bulk:acct:risk:${net}:${walletAddress}`;
     try {
@@ -727,7 +733,7 @@ class BulkApiService {
       console.error(
         `[bulkApi.getRiskHistory] failed for ${walletAddress.slice(0, 8)}…: ${reason}`
       );
-      return [];
+      return null; // failure, NOT an empty history — see the note on the signature
     }
   }
 }

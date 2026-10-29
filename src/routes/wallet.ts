@@ -793,6 +793,11 @@ router.get('/:address/liquidations', async (req: Request, res: Response) => {
     const typeFilter = String(req.query.type ?? 'all').toLowerCase();
 
     const raw = await bulkApi.getRiskHistory(address);
+    // null = upstream failure, not an empty history → 503 so the client retries
+    // instead of rendering "no liquidations" for a wallet that may have many.
+    if (raw === null) {
+      return res.status(503).json({ error: 'Risk history temporarily unavailable, please retry', retriable: true });
+    }
 
     // Convert ns timestamp → ms, derive position side from fill direction,
     // pre-compute margin delta + USD value so the frontend stays simple.

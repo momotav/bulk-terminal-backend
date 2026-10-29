@@ -53,11 +53,14 @@ async function main() {
     try {
       events = await bulkApi.getRiskHistory(w);
     } catch (e) {
-      const msg = (e as Error).message || '';
-      if (/429/.test(msg)) return 'throttled';
-      console.error(`  ${w.slice(0, 8)}: riskHistory failed`, msg);
-      return 'ok';
+      // Defensive: getRiskHistory signals failure by returning null, but a
+      // throw would also mean "no answer", so queue it either way.
+      console.error(`  ${w.slice(0, 8)}: riskHistory threw`, (e as Error).message);
+      return 'throttled';
     }
+    // null = upstream refused us (429/timeout). Must NOT be read as "this
+    // wallet has no forced events" — queue it for retry instead.
+    if (events === null) return 'throttled';
     scanned++;
     for (const e of events) {
       const ms = Math.floor(e.timestamp / 1e6);
