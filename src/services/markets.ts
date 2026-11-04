@@ -47,6 +47,30 @@ const FALLBACK_SYMBOLS: readonly string[] = [
   'FARTCOIN-USD',
 ];
 
+// ---- Asset classes ----------------------------------------------------------
+//
+// BULK listed stock perps (NVDA, TSLA, MSTR, …) on 2026-11-01, and its
+// /exchangeInfo carries NO asset-class field — a stock record is shaped
+// exactly like BTC's. So the crypto/stock split is curated here and stamped
+// onto each market by /exchange-info as `assetClass`. The frontend keeps an
+// identical list as a fallback (src/lib/coins.ts STOCK_COINS); keep the two
+// in sync when BULK lists a new stock.
+//
+// PAXG (tokenised gold) is classed as crypto on purpose — it's an on-chain
+// token, and a one-coin "commodities" group would look thin.
+export type AssetClass = 'crypto' | 'stock';
+
+export const STOCK_COINS: readonly string[] = [
+  'NVDA', 'TSLA', 'MSTR', 'MU', 'SNDK', 'SKHYNIX', 'CRCL', 'SPACEX',
+];
+const STOCK_SET = new Set(STOCK_COINS);
+
+/** "NVDA-USD" / "nvda" → 'stock'; everything else → 'crypto'. */
+export function classifyCoin(symbolOrCoin: string): AssetClass {
+  const base = symbolOrCoin.replace(/-USD$/i, '').toUpperCase();
+  return STOCK_SET.has(base) ? 'stock' : 'crypto';
+}
+
 // Per-network caches. The symbol list differs between testnet and devnet
 // (devnet lists markets testnet hasn't, e.g. MU-USD / MINIMAX-USD), and
 // `bulkFetch` already routes /exchangeInfo to the right host based on the

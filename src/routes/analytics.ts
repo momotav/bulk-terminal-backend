@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { query } from '../db';
 import { getCache, setCache, swrCache } from '../services/cache';
-import { getActiveSymbols } from '../services/markets';
+import { getActiveSymbols, classifyCoin } from '../services/markets';
 import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coinShape';
 import { filterOutSystemWallets, SYSTEM_WALLET_ADDRESSES } from '../services/systemWallets';
 import { bulkFetch } from '../services/bulkAuth';
@@ -3594,6 +3594,10 @@ router.get('/exchange-info', async (_req: Request, res: Response) => {
           .map((m: any) => ({
             symbol: String(m.symbol),                              // e.g. "BTC-USD"
             coin: String(m.baseAsset || m.symbol.replace('-USD', '')), // e.g. "BTC"
+            // 'crypto' | 'stock' — BULK doesn't send this; curated in
+            // services/markets.ts (STOCK_COINS). Drives the All/Crypto/Stocks
+            // filter on the frontend.
+            assetClass: classifyCoin(String(m.symbol)),
             quoteAsset: String(m.quoteAsset || 'USDC'),
             status: String(m.status || 'TRADING'),
             maxLeverage: Number(m.maxLeverage || 0),
@@ -3617,6 +3621,7 @@ router.get('/exchange-info', async (_req: Request, res: Response) => {
       markets = symbols.map((symbol) => ({
         symbol,
         coin: symbol.replace('-USD', ''),
+        assetClass: classifyCoin(symbol),
         quoteAsset: 'USDC',
         status: 'TRADING',
         maxLeverage: 0,
