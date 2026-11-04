@@ -219,6 +219,9 @@ export interface ActivityEvent {
   // consumers when needed.
 }
 
+// Most pages of fill history to walk per wallet (5,000 rows each).
+const MAX_FILL_PAGES = 8;
+
 class BulkApiService {
   private baseUrl: string;
 
@@ -314,7 +317,7 @@ class BulkApiService {
   // caller falls back to its own empty shape) rather than caching the failure.
   // `background` marks calls from sweeps/jobs (not a user waiting on a page);
   // they yield the /account slots to user-facing requests (see withAccountSlot).
-  private async postAccount(walletAddress: string, type: string, timeoutMs = 8000, background = false): Promise<unknown> {
+  private async postAccount(walletAddress: string, type: string, timeoutMs = 8000, background = false, extra: Record<string, unknown> = {}): Promise<unknown> {
     const maxAttempts = 4;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -329,7 +332,7 @@ class BulkApiService {
           withAccountSlot(() => bulkFetch(`${this.baseUrl}/account`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type, user: walletAddress }),
+            body: JSON.stringify({ type, user: walletAddress, ...extra }),
             signal: controller.signal,
           }), background));
         clearTimeout(timer);
@@ -463,16 +466,27 @@ class BulkApiService {
       // showed its live snapshot but "no trades / no fills". postAccount retries
       // 429/5xx, and swrCache serves the last good list on a hard failure.
       return await swrCache<unknown[]>(key, 45, async () => {
-      const parsed = await this.postAccount(walletAddress, 'fills');
-      // BULK v1.0.17 wraps history in a paged envelope { data: [...], page: {...} };
-      // older builds returned a bare array. Normalize both to a row array — without
-      // this the envelope object failed the Array.isArray check below and EVERY
-      // fill was dropped (the wallet PnL chart then collapsed to a single point).
-      const data: unknown[] = Array.isArray(parsed)
-        ? parsed
-        : (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).data))
-          ? ((parsed as Record<string, unknown>).data as unknown[])
-          : [];
+      // BULK pages history 5,000 rows at a time behind `page.nextCursor`, passed
+      // back as `cursor`. Walk every page: a wallet with 6,640 fills lost its
+      // oldest 1,640, which is what put wrong sides on the share card. BULK itself
+      // stops at roughly the latest 5,000 fills for very busy wallets, so this is
+      // normally 2 calls; MAX_FILL_PAGES only guards against a runaway cursor. A
+      // failed page throws, so swrCache serves the last complete list rather than
+      // a silently partial one.
+      const data: unknown[] = [];
+      let cursor: string | undefined;
+      for (let pageNo = 0; pageNo < MAX_FILL_PAGES; pageNo++) {
+        const parsed = await this.postAccount(walletAddress, 'fills', 8000, false, cursor ? { cursor } : {});
+        // BULK v1.0.17 wraps history in a paged envelope { data: [...], page: {...} };
+        // older builds returned a bare array. Normalize both to a row array — without
+        // this the envelope object failed the Array.isArray check below and EVERY
+        // fill was dropped (the wallet PnL chart then collapsed to a single point).
+        if (Array.isArray(parsed)) { data.push(...parsed); break; }
+        const envelope = (parsed && typeof parsed === 'object' ? parsed : {}) as { data?: unknown; page?: { hasMore?: boolean; nextCursor?: string } };
+        if (Array.isArray(envelope.data)) data.push(...envelope.data);
+        if (!envelope.page?.hasMore || !envelope.page.nextCursor) break;
+        cursor = envelope.page.nextCursor;
+      }
       const results: unknown[] = [];
 
       // Real BULK fills response shape (verified from production logs):

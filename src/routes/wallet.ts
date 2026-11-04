@@ -436,11 +436,13 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
     const symbol = (req.query.symbol as string) || null;
-    // Hard cap to keep payloads sane. 500 fills is plenty for a chart
-    // overlay — beyond that, markers stack and become unreadable anyway.
-    const limit = Math.min(parseInt(req.query.limit as string) || 500, 1000);
+    // Default stays small for chart overlays. Callers that walk the whole
+    // history (wallet page, trade lifecycle) ask for more, and pass lite=1 to
+    // drop the order ids and counterparties that make up most of the payload.
+    const limit = Math.min(parseInt(req.query.limit as string) || 500, 40000);
+    const lite = req.query.lite === '1';
 
-    const cacheKey = `wallet:fills:${address}:${symbol || 'all'}:${limit}`;
+    const cacheKey = `wallet:fills:${address}:${symbol || 'all'}:${limit}:${lite ? 'lite' : 'full'}`;
     const cached = await getCache<{ fills: unknown[] }>(cacheKey);
     if (cached) {
       return res.json(cached);
@@ -553,7 +555,9 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
           continue;
         }
       }
-      filtered.push(f);
+      filtered.push(lite
+        ? { timestamp: f.timestamp, symbol: f.symbol, price: f.price, size: f.size, isBuy: f.isBuy, reasonCode: f.reasonCode }
+        : f);
       if (filtered.length >= limit) break;
     }
 
