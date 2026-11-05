@@ -1005,6 +1005,9 @@ router.get('/:address/activity', async (req: Request, res: Response) => {
     if (cached) return res.json(cached);
 
     const events = await bulkApi.getActivityHistory(address);
+    if (events === null) {
+      return res.status(503).json({ error: 'Activity temporarily unavailable, please retry', retriable: true });
+    }
     const truncated = events.slice(0, limit);
 
     // Enrich with resolver labels. We only resolve unique pubkeys to avoid

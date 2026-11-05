@@ -393,28 +393,27 @@ class BulkApiService {
   // We unwrap to a flat ActivityEvent[] and trust BULK's ordering. If BULK
   // truncates / paginates we handle it at the caller; this method just hands
   // back what came down the wire.
-  async getActivityHistory(walletAddress: string): Promise<ActivityEvent[]> {
+  // null = upstream failure, never []: an empty list here reads as a wallet that
+  // never deposited, so the route turns it into a 503 the client retries.
+  async getActivityHistory(walletAddress: string): Promise<ActivityEvent[] | null> {
+    const key = `bulk:acct:activity:${getRequestNetwork()}:${walletAddress}`;
     try {
-      const res = await withAccountSlot(() => bulkFetch(`${this.baseUrl}/account`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'activityHistory', user: walletAddress }),
-      }));
-      if (!res.ok) return [];
-      const parsed = await res.json() as unknown;
-      // v1.0.17 paged envelope { data: [...], page } vs older bare array.
-      const rows: AccountResponse[] = Array.isArray(parsed)
-        ? (parsed as AccountResponse[])
-        : (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).data))
-          ? ((parsed as Record<string, unknown>).data as AccountResponse[])
-          : [];
-      return rows
-        // Envelope rows are flat events; older rows wrap under `activityHistory`.
-        .map((row) => (row && typeof row === 'object' && 'activityHistory' in row ? row.activityHistory : row) as ActivityEvent | undefined)
-        .filter((e): e is ActivityEvent => Boolean(e));
+      return await swrCache<ActivityEvent[]>(key, 60, async () => {
+        const parsed = await this.postAccount(walletAddress, 'activityHistory');
+        // v1.0.17 paged envelope { data: [...], page } vs older bare array.
+        const rows: AccountResponse[] = Array.isArray(parsed)
+          ? (parsed as AccountResponse[])
+          : (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).data))
+            ? ((parsed as Record<string, unknown>).data as AccountResponse[])
+            : [];
+        return rows
+          // Envelope rows are flat events; older rows wrap under `activityHistory`.
+          .map((row) => (row && typeof row === 'object' && 'activityHistory' in row ? row.activityHistory : row) as ActivityEvent)
+          .filter((e): e is ActivityEvent => Boolean(e));
+      }, 3600);
     } catch (error) {
       console.error(`Failed to fetch activity history for ${walletAddress}:`, error);
-      return [];
+      return null;
     }
   }
 
