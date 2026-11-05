@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { query } from '../db';
 import { getCache, setCache, swrCache } from '../services/cache';
-import { getActiveSymbols, classifyCoin } from '../services/markets';
+import { getActiveSymbols, classifyCoin, type AssetClass } from '../services/markets';
 import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coinShape';
 import { filterOutSystemWallets, SYSTEM_WALLET_ADDRESSES } from '../services/systemWallets';
 import { bulkFetch } from '../services/bulkAuth';
@@ -530,7 +530,7 @@ router.get('/dashboard-sparklines', async (req: Request, res: Response) => {
         return first && first > 0 ? ((last - first) / first) * 100 : null;
       };
 
-      const [volRows, oiRows, dauRows, liqRows] = await Promise.all([
+      const [volRows, oiRows, dauRows, liqRows, classOiRows, classVolRows] = await Promise.all([
         // 24h volume, hourly, from our fills.
         query<{ v: string }>(
           `SELECT SUM(value) AS v FROM trades
@@ -554,6 +554,17 @@ router.get('/dashboard-sparklines', async (req: Request, res: Response) => {
            WHERE network = $1 AND timestamp > NOW() - INTERVAL '14 days'
            GROUP BY date_trunc('day', timestamp) ORDER BY date_trunc('day', timestamp) ASC`, [net]
         ).catch(() => []),
+        // Per market, hourly, for the asset-class cards. Summed per class below.
+        query<{ h: Date; symbol: string; v: string }>(
+          `SELECT date_trunc('hour', timestamp) AS h, symbol, AVG(open_interest_usd) AS v FROM ticker_snapshots
+           WHERE network = $1 AND timestamp > NOW() - INTERVAL '24 hours'
+           GROUP BY 1, 2`, [net]
+        ).catch(() => []),
+        query<{ h: Date; symbol: string; v: string }>(
+          `SELECT date_trunc('hour', timestamp) AS h, symbol, SUM(value) AS v FROM trades
+           WHERE network = $1 AND timestamp > NOW() - INTERVAL '24 hours'
+           GROUP BY 1, 2`, [net]
+        ).catch(() => []),
       ]);
 
       const vol = nums(volRows);
@@ -569,11 +580,34 @@ router.get('/dashboard-sparklines', async (req: Request, res: Response) => {
         high: s.length ? Math.max(...s) : null,
       });
 
+      /** Hour -> summed value for one asset class, or every market when class is null. */
+      const hourly = (rows: { h: Date; symbol: string; v: string }[], cls: AssetClass | null) => {
+        const out = new Map<number, number>();
+        for (const r of rows) {
+          if (cls && classifyCoin(r.symbol) !== cls) continue;
+          const t = new Date(r.h).getTime();
+          out.set(t, (out.get(t) || 0) + (Number(r.v) || 0));
+        }
+        return out;
+      };
+      const volAll = hourly(classVolRows, null);
+      const byClass = Object.fromEntries((['crypto', 'stock'] as const).map((cls) => {
+        const oiByHour = hourly(classOiRows, cls);
+        const volByHour = hourly(classVolRows, cls);
+        const hours = (m: Map<number, number>) => Array.from(m.keys()).sort((a, b) => a - b);
+        return [cls, {
+          openInterest: stat(hours(oiByHour).map((t) => (oiByHour.get(t) || 0) * OI_SIDE_FACTOR)),
+          // Every hour with trades counts, so a class that sat out an hour shows 0%.
+          volumeShare: stat(hours(volAll).map((t) => ((volByHour.get(t) || 0) / (volAll.get(t) || 1)) * 100)),
+        }];
+      }));
+
       return {
         volume24h: stat(vol),
         openInterest: stat(oi),
         activeTraders: stat(dau),
         liquidations24h: stat(liq),
+        byClass,
       };
     });
     res.json(result);
