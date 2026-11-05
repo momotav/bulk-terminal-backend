@@ -408,6 +408,29 @@ router.get('/:address/trades', async (req: Request, res: Response) => {
 });
 
 // ============================================================================
+// GET /wallet/:address/funding - Funding paid and received, summarised.
+//
+// A busy wallet has ~10,000 rows, so the totals and per-market split are built
+// here and only the latest payments go to the client.
+router.get('/:address/funding', async (req: Request, res: Response) => {
+  try {
+    const rows = await bulkApi.getFundingHistory(req.params.address);
+    if (rows === null) {
+      return res.status(503).json({ error: 'Funding history temporarily unavailable, please retry', retriable: true });
+    }
+    let paid = 0, received = 0;
+    const bySymbol: Record<string, number> = {};
+    for (const r of rows) {
+      if (r.payment < 0) paid += r.payment; else received += r.payment;
+      bySymbol[r.symbol] = (bySymbol[r.symbol] ?? 0) + r.payment;
+    }
+    const recent = [...rows].sort((a, b) => b.timestamp - a.timestamp).slice(0, 200);
+    res.json({ count: rows.length, paid, received, net: paid + received, bySymbol, recent });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to fetch funding' });
+  }
+});
+
 // GET /wallet/:address/fills - Live fills from BULK API for chart overlay
 //
 // Used by the position chart modal to draw markers showing every entry the
@@ -531,6 +554,9 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
         taker: f.taker,
         iso: Boolean(f.iso ?? false),
         counterpartyHint: f.counterpartyHint,
+        // This wallet's own fee on the fill: negative paid, positive rebate.
+        // Sums exactly to margin.fees when the wallet's history is complete.
+        fee: Number(f.fee ?? 0),
       };
     }
 
@@ -556,7 +582,7 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
         }
       }
       filtered.push(lite
-        ? { timestamp: f.timestamp, symbol: f.symbol, price: f.price, size: f.size, isBuy: f.isBuy, reasonCode: f.reasonCode }
+        ? { timestamp: f.timestamp, symbol: f.symbol, price: f.price, size: f.size, isBuy: f.isBuy, reasonCode: f.reasonCode, fee: f.fee, isMaker: f.maker === address }
         : f);
       if (filtered.length >= limit) break;
     }

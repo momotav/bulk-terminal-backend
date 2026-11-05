@@ -219,6 +219,14 @@ export interface ActivityEvent {
   // consumers when needed.
 }
 
+export interface FundingPayment {
+  timestamp: number;   // ms
+  symbol: string;
+  payment: number;     // negative when paid, positive when received
+  fundingRate: number;
+  size: number;        // signed position size at the payment
+}
+
 // Most pages of fill history to walk per wallet (5,000 rows each).
 const MAX_FILL_PAGES = 8;
 
@@ -443,6 +451,40 @@ class BulkApiService {
     } catch (error) {
       console.error(`Failed to fetch order history for ${walletAddress}:`, error);
       return [];
+    }
+  }
+
+  // Every funding payment on the account, oldest pages included. Unlike fills,
+  // BULK keeps this feed complete: the rows sum exactly to margin.funding even on
+  // wallets whose fill history is cut short. null = upstream failure, never [].
+  async getFundingHistory(walletAddress: string): Promise<FundingPayment[] | null> {
+    const key = `bulk:acct:funding:${getRequestNetwork()}:${walletAddress}`;
+    try {
+      return await swrCache<FundingPayment[]>(key, 300, async () => {
+        const rows: FundingPayment[] = [];
+        let cursor: string | undefined;
+        for (let pageNo = 0; pageNo < MAX_FILL_PAGES; pageNo++) {
+          const parsed = await this.postAccount(walletAddress, 'fundingHistory', 8000, false, cursor ? { cursor } : {});
+          const envelope = (parsed && typeof parsed === 'object' ? parsed : {}) as { data?: unknown; page?: { hasMore?: boolean; nextCursor?: string } };
+          const data = Array.isArray(parsed) ? parsed : Array.isArray(envelope.data) ? envelope.data : [];
+          for (const raw of data as Array<Record<string, unknown>>) {
+            const r = (raw.fundingHistory ?? raw) as Record<string, unknown>;
+            rows.push({
+              timestamp: Math.floor(Number(r.timestamp) / 1e6),
+              symbol: String(r.symbol ?? ''),
+              payment: Number(r.payment) || 0,
+              fundingRate: Number(r.fundingRate) || 0,
+              size: Number(r.size) || 0,
+            });
+          }
+          if (Array.isArray(parsed) || !envelope.page?.hasMore || !envelope.page.nextCursor) break;
+          cursor = envelope.page.nextCursor;
+        }
+        return rows;
+      }, 3600);
+    } catch (error: any) {
+      console.error(`[bulkApi.getFundingHistory] failed for ${walletAddress.slice(0, 8)}…: ${error?.message || error}`);
+      return null;
     }
   }
 
