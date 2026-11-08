@@ -33,6 +33,7 @@ import streamRoutes from './routes/stream';
 import { startExplorerListener } from './services/bulkExplorer';
 import { startNetworkMetricsCollector } from './jobs/networkMetricsCollector';
 import { requestNetworkMiddleware } from './services/networkContext';
+import { laneMiddleware } from './services/lane';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -89,6 +90,9 @@ app.use(cors({
     }
   },
   credentials: true,
+  // Browsers may reuse a preflight answer this long (Chrome caps it at 2h), so a
+  // logged-in visitor's calls don't each pay an extra round trip first.
+  maxAge: 7200,
 }));
 app.use(express.json());
 
@@ -104,6 +108,8 @@ app.use((req, res, next) => {
 // chosen network's URLs. Without this middleware, all fetches go to
 // testnet (the safe default).
 app.use(requestNetworkMiddleware);
+// Marks each request interactive (a person is waiting) for BULK call priority; see lane.ts.
+app.use(laneMiddleware);
 
 // Health check
 app.get('/health', (req, res) => {

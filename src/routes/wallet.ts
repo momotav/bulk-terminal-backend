@@ -263,9 +263,10 @@ router.get('/:address', async (req: Request, res: Response) => {
     //    every hour, sometimes both).
     // Deriving from closed positions gives every wallet a real, dense,
     // deterministic PnL curve from their first closed trade onward.
-    const [account, tickers, trader, closedPositions] = await Promise.all([
+    const [account, markPrices, trader, closedPositions] = await Promise.all([
       bulkApi.getFullAccount(address),
-      bulkApi.getAllTickers(),
+      // Mark prices only, from one cached /stats call (see getMarkPrices).
+      bulkApi.getMarkPrices(),
       queryOne(
         'SELECT * FROM traders WHERE wallet_address = $1',
         [address]
@@ -291,10 +292,6 @@ router.get('/:address', async (req: Request, res: Response) => {
       // a valid response shape so the frontend renders the empty state
       // instead of erroring. Crucially, we do NOT cache this — next
       // request will retry BULK fresh.
-      const markPrices: Record<string, number> = {};
-      for (const ticker of tickers) {
-        markPrices[ticker.symbol] = ticker.markPrice;
-      }
       return res.json({
         address,
         live: null,
@@ -306,10 +303,6 @@ router.get('/:address', async (req: Request, res: Response) => {
     }
 
     // BULK responded successfully. Build the response.
-    const markPrices: Record<string, number> = {};
-    for (const ticker of tickers) {
-      markPrices[ticker.symbol] = ticker.markPrice;
-    }
 
     // Net the PnL fields at the API boundary so all consumers (the
     // wallet page KPIs, the positions list, the PnL chart fallback) see

@@ -28,6 +28,7 @@
 
 import { resolveBulkUrl, type NetworkId } from './networks';
 import { getRequestNetwork } from './networkContext';
+import { noteResult, waitForTurn } from './lane';
 
 const BULK_API_KEY = process.env.BULK_API_KEY;
 
@@ -56,6 +57,8 @@ export function bulkHeaders(): Record<string, string> {
 // has confirmed devnet accepts the testnet key.
 export interface BulkFetchOpts {
   net?: NetworkId;
+  /** The caller already waited its background turn (see postAccount). */
+  paced?: boolean;
 }
 
 // BULK executor upgrades (API v1.0.18) pause transaction admission and return
@@ -102,7 +105,10 @@ export async function bulkFetch(
   // requests. Only string/JSON bodies are used here, so re-sending `init` is
   // safe (no consumed streams).
   for (let attempt = 0; ; attempt++) {
+    // Background calls queue here behind spacing and any 429 cooldown (see lane.ts).
+    if (!opts?.paced) await waitForTurn();
     const res = await fetch(targetUrl, { ...init, headers: mergedHeaders });
+    noteResult(res.status);
     if (res.status !== 503 || attempt >= MAX_UPGRADE_RETRIES) return res;
 
     let isUpgrade = false;

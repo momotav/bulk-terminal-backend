@@ -1,4 +1,5 @@
 import Redis from 'ioredis';
+import { runInLane } from './lane';
 
 // Redis client singleton
 let redisClient: Redis | null = null;
@@ -189,7 +190,8 @@ export async function swrCache<T>(
   // background failures: the stale copy stays valid in Redis and the
   // next request will retry the rebuild.
   if (envelope) {
-    startRebuild().catch((e) =>
+    // Nobody waits on this refresh, so it yields BULK's rate budget to those who do.
+    runInLane('background', startRebuild).catch((e) =>
       console.error(`SWR background rebuild failed for ${key}:`, e),
     );
     return envelope.v;

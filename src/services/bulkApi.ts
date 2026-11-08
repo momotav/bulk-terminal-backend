@@ -4,6 +4,7 @@ import { getActiveSymbols } from './markets';
 import { bulkFetch } from './bulkAuth';
 import { swrCache } from './cache';
 import { getRequestNetwork } from './networkContext';
+import { currentLane, waitForTurn } from './lane';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -229,6 +230,8 @@ export interface FundingPayment {
 
 // Most pages of fill history to walk per wallet (5,000 rows each).
 const MAX_FILL_PAGES = 8;
+const SKIP_TICKERS_ENDPOINT = true; // BULK's /tickers 404s on mainnet; flip if it returns
+const FILLS_KEEP_SECONDS = 6 * 3600;
 
 class BulkApiService {
   private baseUrl: string;
@@ -241,12 +244,8 @@ class BulkApiService {
   async getTicker(symbol: string): Promise<Ticker | null> {
     try {
       // Try the direct ticker endpoint first
-      let res = await bulkFetch(`${this.baseUrl}/ticker/${symbol}`);
-      
-      // If that fails, try without the symbol in path (some APIs use query params)
-      if (!res.ok) {
-        res = await bulkFetch(`${this.baseUrl}/ticker?symbol=${symbol}`);
-      }
+      // One attempt. A second form on failure doubled every 429 into two.
+      const res = await bulkFetch(`${this.baseUrl}/ticker/${symbol}`);
       
       if (!res.ok) {
         console.log(`⚠️ Ticker endpoint failed for ${symbol}: ${res.status}`);
@@ -277,10 +276,49 @@ class BulkApiService {
     }
   }
 
-  // Fetch all tickers
-  async getAllTickers(): Promise<Ticker[]> {
-    // First try bulk endpoint
+  /**
+   * Mark price per market from ONE /stats call. The wallet route only needs these,
+   * and getting them from getAllTickers cost 31 to 62 calls per wallet request
+   * (per open tab, every 10 seconds), most of our BULK 429s.
+   */
+  async getMarkPrices(): Promise<Record<string, number>> {
     try {
+      return await swrCache<Record<string, number>>(`bulk:markprices:${getRequestNetwork()}`, 5, async () => {
+        const res = await bulkFetch(`${this.baseUrl}/stats?period=1d`);
+        if (!res.ok) throw new Error(`BULK /stats returned ${res.status}`);
+        const data = await res.json() as { markets?: { symbol: string; markPrice?: number | string }[] };
+        const out: Record<string, number> = {};
+        for (const m of data.markets ?? []) {
+          const px = Number(m.markPrice);
+          if (m.symbol && px > 0) out[m.symbol] = px;
+        }
+        if (!Object.keys(out).length) throw new Error('BULK /stats returned no markets');
+        return out;
+      }, 3600);
+    } catch (error: any) {
+      console.error(`[bulkApi.getMarkPrices] ${error?.message || error}`);
+      return {};
+    }
+  }
+
+  // Fetch all tickers. Cached and shared: the per-market fallback is 31+ calls, and
+  // concurrent callers used to each fire their own burst.
+  async getAllTickers(): Promise<Ticker[]> {
+    try {
+      return await swrCache<Ticker[]>(`bulk:tickers:all:${getRequestNetwork()}`, 20, async () => {
+        const all = await this.fetchAllTickers();
+        if (!all.length) throw new Error('no tickers');
+        return all;
+      }, 600);
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchAllTickers(): Promise<Ticker[]> {
+    // BULK's /tickers answers 404 on mainnet, so asking costs a call and never helps.
+    try {
+      if (SKIP_TICKERS_ENDPOINT) throw new Error('skip');
       const res = await bulkFetch(`${this.baseUrl}/tickers`);
       if (res.ok) {
         const data: any = await res.json();
@@ -328,7 +366,12 @@ class BulkApiService {
   private async postAccount(walletAddress: string, type: string, timeoutMs = 8000, background = false, extra: Record<string, unknown> = {}): Promise<unknown> {
     const maxAttempts = 4;
     let lastErr: unknown;
+    // A background call waits out spacing and cooldowns before its timeout starts and
+    // before it takes a slot, so it never sits on one of the two account slots while a
+    // person's request queues behind it.
+    const isBackground = background || currentLane() === 'background';
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (isBackground) await waitForTurn();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
@@ -342,7 +385,7 @@ class BulkApiService {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ type, user: walletAddress, ...extra }),
             signal: controller.signal,
-          }), background));
+          }, { paced: true }), isBackground));
         clearTimeout(timer);
         if (res.ok) return await res.json();
         // 429 / 5xx are transient — back off and retry within the request.
@@ -506,6 +549,8 @@ class BulkApiService {
       // on a 429 — so under load (e.g. the enrichment sweep) the wallet page
       // showed its live snapshot but "no trades / no fills". postAccount retries
       // 429/5xx, and swrCache serves the last good list on a hard failure.
+      // Kept for 6 hours past freshness: a wallet opened again later shows at once from
+      // the stale copy while a fresh one loads behind it, instead of refetching cold.
       return await swrCache<unknown[]>(key, 45, async () => {
       // BULK pages history 5,000 rows at a time behind `page.nextCursor`, passed
       // back as `cursor`. Walk every page: a wallet with 6,640 fills lost its
@@ -588,7 +633,7 @@ class BulkApiService {
           (sample?.symbol ? ` (sample symbol: "${sample.symbol}")` : '')
       );
       return results;
-      }, 600);
+      }, FILLS_KEEP_SECONDS);
     } catch (error: any) {
       const reason =
         error?.name === 'AbortError'

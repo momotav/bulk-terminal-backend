@@ -22,6 +22,8 @@
 // Hot paths and the hour-windows the frontend actually requests.
 // Keep in sync with the analytics page's fetches (see Network tab):
 // 24h default views, 168h (7d) revenue, 720h (30d) users, 17520h (ALL).
+import { WARM_HEADER } from '../services/lane';
+
 const WARM_PATHS: string[] = [
   // Volume / trades / liquidations / ADL charts — default + all-time
   '/api/analytics/volume-chart-api?hours=24',
@@ -63,6 +65,8 @@ async function warmOnce(baseUrl: string): Promise<void> {
     try {
       const res = await fetch(`${baseUrl}${path}`, {
         signal: AbortSignal.timeout(30_000),
+        // Runs our routes in the background lane: nobody is waiting on the warmer.
+        headers: { [WARM_HEADER]: '1' },
       });
       if (res.ok) ok++;
       else failed++;
