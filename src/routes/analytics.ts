@@ -149,6 +149,24 @@ async function fetchKlines(
   }
 }
 
+// Strict sibling of fetchKlines for the /candles proxy: a failed BULK call
+// THROWS instead of returning [], so the SWR cache never stores a failure as
+// "no candles" (that blanked charts for a day: an empty list served as a 200).
+async function fetchKlinesStrict(
+  symbol: string, interval: string, limit: number, startTime?: number, endTime?: number,
+): Promise<BulkKline[]> {
+  const params = new URLSearchParams({ symbol, interval, limit: String(limit) });
+  if (typeof startTime === 'number' && Number.isFinite(startTime)) params.set('startTime', String(Math.floor(startTime)));
+  if (typeof endTime === 'number' && Number.isFinite(endTime)) params.set('endTime', String(Math.floor(endTime)));
+  const response = await bulkFetch(`${BULK_API_BASE}/klines?${params.toString()}`);
+  if (!response.ok) throw new Error(`BULK klines ${symbol} ${interval}: HTTP ${response.status}`);
+  const rows = await response.json() as BulkKline[];
+  if (!Array.isArray(rows)) throw new Error(`BULK klines ${symbol}: not a list`);
+  // A listed market always has recent candles; none for "most recent" means the call failed.
+  if (!rows.length && startTime === undefined && endTime === undefined) throw new Error(`BULK klines ${symbol}: empty`);
+  return rows;
+}
+
 // Fetch klines for all markets and combine
 // Helper: fetch klines for every market BULK currently has listed. The symbol
 // list comes from the shared `getActiveSymbols()` helper (which proxies
@@ -3785,7 +3803,7 @@ router.get('/candles/:symbol', async (req: Request, res: Response) => {
     const touchesPresent = endTime === undefined || endTime >= now - 60_000;
     const freshSec = startTime !== undefined && endTime !== undefined && !touchesPresent ? 3600 : 60;
     const result = await swrCache(cacheKey, freshSec, async () => {
-      const klines = await fetchKlines(symbol, interval, limit, startTime, endTime);
+      const klines = await fetchKlinesStrict(symbol, interval, limit, startTime, endTime);
       // BULK's /klines IGNORES `limit` — it returns its whole retained window
       // (hundreds to >1000 candles) no matter what we ask for, so a request for
       // 24 candles was shipping ~140 KB. It does honour startTime/endTime, so:
@@ -3797,8 +3815,8 @@ router.get('/candles/:symbol', async (req: Request, res: Response) => {
     }, 86_400);
     res.json(result);
   } catch (error: any) {
-    console.error('Error fetching candles for', symbol, ':', error);
-    res.status(500).json({ error: error.message || 'Failed to fetch candles' });
+    console.error('Error fetching candles for', symbol, ':', error?.message ?? error);
+    res.status(503).json({ error: error.message || 'Failed to fetch candles' });
   }
 });
 
