@@ -530,6 +530,21 @@ class BulkApiService {
     }
   }
 
+  /** BULK's fee-tier quote for one account: 14-day volume, tier, rates, maker share. */
+  async getFeeTier(walletAddress: string): Promise<Record<string, unknown> | null> {
+    try {
+      return await swrCache<Record<string, unknown>>(`bulk:acct:feetier:${getRequestNetwork()}:${walletAddress}`, 120, async () => {
+        const parsed = await this.postAccount(walletAddress, 'feeTier') as Array<{ feeTier?: Record<string, unknown> }> | null;
+        const tier = Array.isArray(parsed) ? parsed.find((x) => x && x.feeTier)?.feeTier : null;
+        if (!tier) throw new Error('no feeTier in response');
+        return tier;
+      }, 3600);
+    } catch (error: any) {
+      console.error(`[bulkApi.getFeeTier] ${walletAddress.slice(0, 8)}…: ${error?.message || error}`);
+      return null;
+    }
+  }
+
   // Fetch fills (executed trades) for a wallet.
   //
   // Heavy wallets (high-volume traders) can have thousands of fills, and

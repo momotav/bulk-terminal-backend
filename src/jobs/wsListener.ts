@@ -58,6 +58,16 @@ interface TickerData {
 
 // Track last ticker snapshot time per symbol to avoid duplicates
 const lastTickerSnapshotTime: Map<string, number> = new Map();
+
+// Mark over oracle per market, latest seen on the ticker stream. Every message updates
+// it; the database only keeps one a minute.
+export interface MarkOracle { symbol: string; bps: number; mark: number; oracle: number; ts: number }
+const latestMarkOracle: Map<string, MarkOracle> = new Map();
+export function getLatestMarkOracle(): MarkOracle[] {
+  return Array.from(latestMarkOracle.values());
+}
+const markOracleBps = (mark: number, oracle: number): number | null =>
+  mark > 0 && oracle > 0 ? ((mark - oracle) / oracle) * 10_000 : null;
 const TICKER_SNAPSHOT_INTERVAL = 60000; // Save max 1 snapshot per minute per symbol
 
 // Record ticker snapshot from WebSocket (real-time)
@@ -66,7 +76,8 @@ async function recordTickerSnapshot(
   openInterestCoins: number, 
   openInterestUsd: number, 
   fundingRate: number, 
-  markPrice: number
+  markPrice: number,
+  premiumBps: number | null = null,
 ): Promise<void> {
   // Rate limit: only save 1 snapshot per minute per symbol
   const lastTime = lastTickerSnapshotTime.get(symbol) || 0;
@@ -76,9 +87,9 @@ async function recordTickerSnapshot(
   
   try {
     await query(
-      `INSERT INTO ticker_snapshots (symbol, open_interest_coins, open_interest_usd, funding_rate, mark_price, timestamp)
-       VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice]
+      `INSERT INTO ticker_snapshots (symbol, open_interest_coins, open_interest_usd, funding_rate, mark_price, mark_oracle_bps, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice, premiumBps]
     );
     
     lastTickerSnapshotTime.set(symbol, Date.now());
@@ -119,12 +130,15 @@ async function snapshotTickersFallback(): Promise<void> {
       const regime = ticker.regime ?? null;
       const regimeVol = ticker.regimeVol ?? null;
       const fairBookPx = ticker.fairBookPx ?? null;
+      const oracle = parseFloat(String((ticker as { oraclePrice?: number | string }).oraclePrice || 0));
+      const premium = markOracleBps(markPrice, oracle);
+      if (premium !== null) latestMarkOracle.set(symbol, { symbol, bps: premium, mark: markPrice, oracle, ts: Date.now() });
       
       // Store snapshot in database (now includes regime data)
       await query(
-        `INSERT INTO ticker_snapshots (symbol, open_interest_coins, open_interest_usd, funding_rate, mark_price, regime, regime_vol, fair_book_px, timestamp)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
-        [symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice, regime, regimeVol, fairBookPx]
+        `INSERT INTO ticker_snapshots (symbol, open_interest_coins, open_interest_usd, funding_rate, mark_price, regime, regime_vol, fair_book_px, mark_oracle_bps, timestamp)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+        [symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice, regime, regimeVol, fairBookPx, premium]
       );
       
       lastTickerSnapshotTime.set(symbol, Date.now());
@@ -641,10 +655,13 @@ function processMessage(data: WebSocket.Data): void {
       const markPrice = parseFloat(String(tickerData.markPrice || tickerData.lastPrice || 0));
       const openInterestUsd = openInterestCoins * markPrice;
       const fundingRate = parseFloat(String(tickerData.fundingRate || 0));
+      const oracle = parseFloat(String(tickerData.oraclePrice || 0));
+      const premium = markOracleBps(markPrice, oracle);
+      if (premium !== null) latestMarkOracle.set(symbol, { symbol, bps: premium, mark: markPrice, oracle, ts: Date.now() });
       
       if (markPrice > 0) {
         // Save to ticker_snapshots (same as before, but now real-time!)
-        recordTickerSnapshot(symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice);
+        recordTickerSnapshot(symbol, openInterestCoins, openInterestUsd, fundingRate, markPrice, premium);
         // Fan out to live chart subscribers (PositionChartModal).
         publishMarketUpdate({ symbol, price: markPrice, kind: 'mark', ts: Date.now() });
       }

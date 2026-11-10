@@ -2814,7 +2814,7 @@ router.get('/fair-spread-chart', async (req: Request, res: Response) => {
 
 // Fee tiers (from BULK API)
 router.get('/fee-tiers', async (req: Request, res: Response) => {
-  const cacheKey = 'analytics:fee_tiers';
+  const cacheKey = 'analytics:fee_tiers:v2'; // v2 adds makerShareTiers and overrides
   
   const cached = await getCache<any>(cacheKey);
   if (cached) {
@@ -2858,6 +2858,22 @@ router.get('/fee-tiers', async (req: Request, res: Response) => {
         makerBps: t.maker_bps ?? t.makerBps ?? 0,
         takerBps: t.taker_bps ?? t.takerBps ?? 0,
       })),
+      // Maker rebates by share of all maker volume, and markets with their own schedule
+      // (BULK prices its stock and index perps separately, and lower).
+      makerShareTiers: (globalScope?.active_policy?.maker_share_tiers || globalScope?.activePolicy?.makerShareTiers || []).map((t: any) => ({
+        thresholdPpm: t.threshold_ppm ?? t.thresholdPpm ?? 0,
+        rebateBps: t.rebate_bps ?? t.rebateBps ?? 0,
+      })),
+      overrides: (feeState.scopes || [])
+        .filter((sc: any) => sc.instrument && sc.instrument !== 'global' && (sc.active_policy || sc.activePolicy))
+        .map((sc: any) => {
+          const p = sc.active_policy || sc.activePolicy;
+          return {
+            symbol: sc.instrument,
+            tiers: (p.tiers || []).map((t: any) => ({ thresholdVolume: t.threshold_volume ?? t.thresholdVolume ?? 0, makerBps: t.maker_bps ?? t.makerBps ?? 0, takerBps: t.taker_bps ?? t.takerBps ?? 0 })),
+            makerShareTiers: (p.maker_share_tiers || p.makerShareTiers || []).map((t: any) => ({ thresholdPpm: t.threshold_ppm ?? t.thresholdPpm ?? 0, rebateBps: t.rebate_bps ?? t.rebateBps ?? 0 })),
+          };
+        }),
       totalMakerFees: feeState.totalMakerFees ?? feeState.total_maker_fees ?? 0,
       totalTakerFees: feeState.totalTakerFees ?? feeState.total_taker_fees ?? 0,
       totalProtocolSettlement:
@@ -2870,6 +2886,29 @@ router.get('/fee-tiers', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error fetching fee tiers:', error);
     res.status(500).json({ error: 'Failed to fetch fee tiers' });
+  }
+});
+
+// Mark over oracle per market: the live gap from the ticker stream, and its hourly
+// average from the snapshots (recorded from 2026-11-10 on).
+router.get('/mark-oracle', async (req: Request, res: Response) => {
+  const hours = Math.min(720, Math.max(1, parseInt(req.query.hours as string) || 24));
+  try {
+    const history = await swrCache(`analytics:mark_oracle:${hours}`, 120, async () => {
+      const rows = await query<{ symbol: string; h: Date; bps: string }>(
+        `SELECT symbol, date_trunc('hour', timestamp) AS h, AVG(mark_oracle_bps) AS bps
+         FROM ticker_snapshots
+         WHERE mark_oracle_bps IS NOT NULL AND timestamp > NOW() - ($1 || ' hours')::interval
+         GROUP BY 1, 2 ORDER BY 2`, [String(hours)]);
+      const bySymbol: Record<string, { t: number; bps: number }[]> = {};
+      for (const r of rows) (bySymbol[r.symbol] ??= []).push({ t: new Date(r.h).getTime(), bps: Number(r.bps) });
+      return bySymbol;
+    }, 3600);
+    const { getLatestMarkOracle } = await import('../jobs/wsListener');
+    res.json({ live: getLatestMarkOracle(), history });
+  } catch (error) {
+    console.error('Error fetching mark-oracle:', error);
+    res.status(500).json({ error: 'Failed to fetch mark-oracle' });
   }
 });
 

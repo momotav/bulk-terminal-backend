@@ -405,6 +405,13 @@ router.get('/:address/trades', async (req: Request, res: Response) => {
 //
 // A busy wallet has ~10,000 rows, so the totals and per-market split are built
 // here and only the latest payments go to the client.
+// The account's fee tier as BULK quotes it, for the fee calculator.
+router.get('/:address/fee-tier', async (req: Request, res: Response) => {
+  const tier = await bulkApi.getFeeTier(req.params.address);
+  if (!tier) return res.status(503).json({ error: 'Fee tier unavailable' });
+  res.json(tier);
+});
+
 router.get('/:address/funding', async (req: Request, res: Response) => {
   try {
     const rows = await bulkApi.getFundingHistory(req.params.address);

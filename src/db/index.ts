@@ -449,6 +449,11 @@ export async function initializeDatabase(): Promise<void> {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ticker_snapshots' AND column_name='regime_vol') THEN
           ALTER TABLE ticker_snapshots ADD COLUMN regime_vol DECIMAL(20, 8);
         END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ticker_snapshots' AND column_name='mark_oracle_bps') THEN
+          -- Mark over oracle, in bps. Stored as a ratio because mark_price is
+          -- rounded to cents, which says nothing for a $0.003 coin.
+          ALTER TABLE ticker_snapshots ADD COLUMN mark_oracle_bps DECIMAL(14, 6);
+        END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='ticker_snapshots' AND column_name='fair_book_px') THEN
           ALTER TABLE ticker_snapshots ADD COLUMN fair_book_px DECIMAL(20, 2);
         END IF;
