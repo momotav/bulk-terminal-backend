@@ -480,7 +480,11 @@ class BulkApiService {
    */
   async accountRows(walletAddress: string, type: string, extra: Record<string, unknown> = {}): Promise<{ rows: Record<string, unknown>[]; nextCursor: string | null } | null> {
     try {
-      const parsed = await this.postAccount(walletAddress, type, 8000, false, extra);
+      // Slot-bounded lookups are one tiny query: they skip the per-wallet queue, where a
+      // busy wallet's full-history paging could hold them 30s+ (and the share page then
+      // gave up). Still inside the global /account slots, so the BULK budget is kept.
+      const bounded = extra.startSlot != null && extra.endSlot != null;
+      const parsed = bounded ? await this.postAccountUnlocked(walletAddress, type, extra) : await this.postAccount(walletAddress, type, 8000, false, extra);
       const env = (parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { data: parsed }) as { data?: unknown; page?: { hasMore?: boolean; nextCursor?: string } };
       const raw = Array.isArray(env.data) ? env.data : [];
       const rows: Record<string, unknown>[] = [];
@@ -496,6 +500,28 @@ class BulkApiService {
       console.error(`accountRows ${type} for ${walletAddress.slice(0, 8)} failed:`, error);
       return null;
     }
+  }
+
+  private async postAccountUnlocked(walletAddress: string, type: string, extra: Record<string, unknown>): Promise<unknown> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 6000);
+      try {
+        const res = await withAccountSlot(() => bulkFetch(`${this.baseUrl}/account`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type, user: walletAddress, ...extra }),
+          signal: controller.signal,
+        }, { paced: true }));
+        clearTimeout(timer);
+        if (res.ok) return await res.json();
+        lastErr = new Error(`BULK /account ${type} returned ${res.status}`);
+        if (!(res.status === 429 || res.status >= 500)) break;
+      } catch (e) { clearTimeout(timer); lastErr = e; }
+      await sleep(300 * attempt + Math.floor(Math.random() * 150));
+    }
+    throw lastErr;
   }
 
   // Fetch order history for a wallet
