@@ -553,38 +553,53 @@ router.get('/:address/order/:orderId', async (req: Request, res: Response) => {
     const cached = await getCache<unknown>(key);
     if (cached) return res.json(cached);
 
-    let order: Record<string, unknown> | null = null;
-    let open = false;
-    const acc = await bulkApi.getFullAccount(address).catch(() => null);
-    const resting = (acc as any)?.openOrders as Record<string, unknown>[] | undefined;
-    const r = resting?.find((o) => o.orderId === orderId);
-    if (r) { order = r; open = true; }
-    if (!order) {
-      if (slot) {
-        const pg = await bulkApi.accountRows(address, 'orderHistory', { startSlot: slot, endSlot: slot });
-        if (!pg) return res.status(503).json({ error: 'BULK is busy, try again' });
-        order = pg.rows.find((o) => o.orderId === orderId) ?? null;
-      }
-      let cursor: string | null = null;
-      for (let i = 0; !order && i < 3; i++) {
-        const pg = await bulkApi.accountRows(address, 'orderHistory', cursor ? { cursor } : {});
-        if (!pg) return res.status(503).json({ error: 'BULK is busy, try again' });
-        order = pg.rows.find((o) => o.orderId === orderId) ?? null;
-        cursor = pg.nextCursor;
-        if (!cursor) break;
-      }
-    }
-    if (!order) return res.status(404).json({ error: 'Order not found for this wallet' });
-
+    // The order's fills first (cached full history): they also say where BULK filed
+    // the order, which is the slot it FINISHED in, i.e. its last fill's slot.
     const all = await bulkApi.getFills(address).catch(() => null);
     const fills = (all ?? [])
       .filter((f: any) => f && (f.orderIdMaker === orderId || f.orderIdTaker === orderId))
       .map((f: any) => { const n = normalizeFill(f); return { ...n, isMaker: n.maker === address }; })
       .sort((a: any, b: any) => a.timestamp - b.timestamp);
+
+    let order: Record<string, unknown> | null = null;
+    let open = false;
+    let inferred = false;
+    const acc = await bulkApi.getFullAccount(address).catch(() => null);
+    const resting = (acc as any)?.openOrders as Record<string, unknown>[] | undefined;
+    const r = resting?.find((o) => o.orderId === orderId);
+    if (r) { order = r; open = true; }
+    const slots = Array.from(new Set([slot, fills.length ? Number(fills[fills.length - 1].slot) || 0 : 0].filter((x) => x > 0)));
+    for (const sl of slots) {
+      if (order) break;
+      const pg = await bulkApi.accountRows(address, 'orderHistory', { startSlot: sl, endSlot: sl });
+      if (!pg) return res.status(503).json({ error: 'BULK is busy, try again' });
+      order = pg.rows.find((o) => o.orderId === orderId) ?? null;
+    }
+    if (!order) {
+      let cursor: string | null = null;
+      for (let i = 0; !order && i < 3; i++) {
+        const pg = await bulkApi.accountRows(address, 'orderHistory', cursor ? { cursor } : {});
+        if (!pg) break;
+        order = pg.rows.find((o) => o.orderId === orderId) ?? null;
+        cursor = pg.nextCursor;
+        if (!cursor) break;
+      }
+    }
+    // BULK's record of the order is out of reach, but its fills say what happened.
+    if (!order && fills.length) {
+      const size = fills.reduce((t: number, f: any) => t + Math.abs(f.size), 0);
+      const value = fills.reduce((t: number, f: any) => t + Math.abs(f.size) * f.price, 0);
+      const last: any = fills[fills.length - 1];
+      order = { symbol: last.symbol, side: last.isBuy ? 'buy' : 'sell', orderType: fills.every((f: any) => f.isMaker) ? 'limit' : '', price: 0, vwap: size ? value / size : 0,
+        originalSize: size, executedSize: size, status: 'filled', slot: last.slot, timestamp: last.timestamp };
+      inferred = true;
+    }
+    if (!order) return res.status(404).json({ error: 'Order not found for this wallet' });
+
     const ts = Number(order.timestamp ?? 0);
     const payload = {
       order: {
-        orderId, open,
+        orderId, open, inferred,
         symbol: String(order.symbol ?? ''),
         side: String(order.side ?? (Number(order.size ?? 0) < 0 ? 'sell' : 'buy')),
         orderType: String(order.orderType ?? ''),
