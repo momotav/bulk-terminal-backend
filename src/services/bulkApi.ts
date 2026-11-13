@@ -473,6 +473,31 @@ class BulkApiService {
     }
   }
 
+  /**
+   * One page of an account history query (fills, orderHistory, ...), as plain rows.
+   * Unwraps BULK's { data, page } envelope and the older [{ <type>: row }] shape.
+   * `extra` carries startSlot/endSlot/limit/cursor. null = upstream failure, never [].
+   */
+  async accountRows(walletAddress: string, type: string, extra: Record<string, unknown> = {}): Promise<{ rows: Record<string, unknown>[]; nextCursor: string | null } | null> {
+    try {
+      const parsed = await this.postAccount(walletAddress, type, 8000, false, extra);
+      const env = (parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { data: parsed }) as { data?: unknown; page?: { hasMore?: boolean; nextCursor?: string } };
+      const raw = Array.isArray(env.data) ? env.data : [];
+      const rows: Record<string, unknown>[] = [];
+      for (const r of raw) {
+        if (!r || typeof r !== 'object') continue;
+        const inner = (r as Record<string, unknown>)[type];
+        if (Array.isArray(inner)) rows.push(...(inner as Record<string, unknown>[]));
+        else if (inner && typeof inner === 'object') rows.push(inner as Record<string, unknown>);
+        else rows.push(r as Record<string, unknown>);
+      }
+      return { rows, nextCursor: env.page?.hasMore && env.page.nextCursor ? env.page.nextCursor : null };
+    } catch (error) {
+      console.error(`accountRows ${type} for ${walletAddress.slice(0, 8)} failed:`, error);
+      return null;
+    }
+  }
+
   // Fetch order history for a wallet
   async getOrderHistory(walletAddress: string): Promise<unknown[]> {
     try {

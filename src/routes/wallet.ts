@@ -455,6 +455,162 @@ router.get('/:address/funding', async (req: Request, res: Response) => {
 //     reasonCode?: string  // e.g. "trade", "liq", "adl"
 //   }
 // ============================================================================
+// BULK fill row -> our stable shape (see the notes inside).
+function normalizeFill(f: any): any {
+  const tsRaw = Number(f.timestamp ?? f.time ?? 0);
+  // Heuristic: BULK timestamps are nanoseconds (16+ digits when
+  // looked at as ms). If the value is greater than ~year 5000 in
+  // ms (~1e14), it's nanoseconds and needs scaling down by 1e6.
+  // Anything else we trust as ms or seconds.
+  const tsMs =
+    tsRaw > 1e14 ? Math.floor(tsRaw / 1e6) :
+    tsRaw > 1e11 ? tsRaw : // already ms
+    tsRaw * 1000; // seconds → ms
+
+  return {
+    timestamp: tsMs,
+    symbol: String(f.symbol ?? f.sym ?? ''),
+    price: Number(f.price ?? f.px ?? 0),
+    size: Number(f.amount ?? f.size ?? f.sz ?? 0),
+    isBuy: Boolean(f.isBuy ?? false),
+    // Prefer the string `reason` ("liquidation", "trade") over the
+    // numeric `reasonCode` since the frontend marker logic compares
+    // strings. Map to our standard tokens.
+    //
+    // v1.0.15 added reasonCode 3 = "liquidation_sweep" (partial-liq
+    // cascade). Check for "sweep" BEFORE the generic "liq" check so
+    // "liquidation_sweep" gets the more specific `liq_sweep` token
+    // rather than the generic `liq`.
+    reasonCode: ((): string => {
+      const reason = String(f.reason ?? '').toLowerCase();
+      if (reason.includes('sweep')) return 'liq_sweep';
+      if (reason.includes('liq')) return 'liq';
+      if (reason.includes('adl')) return 'adl';
+      // Numeric fallback when string is missing — based on observed
+      // BULK behavior: 0 = trade, 1 = liq, 2 = adl, 3 = liq_sweep (v1.0.15).
+      const code = Number(f.reasonCode ?? 0);
+      if (code === 1) return 'liq';
+      if (code === 2) return 'adl';
+      if (code === 3) return 'liq_sweep';
+      return 'trade';
+    })(),
+    // Pass through identifiers in case the frontend needs them later.
+    orderIdMaker: f.orderIdMaker,
+    orderIdTaker: f.orderIdTaker,
+    maker: f.maker,
+    taker: f.taker,
+    iso: Boolean(f.iso ?? false),
+    counterpartyHint: f.counterpartyHint,
+    // This wallet's own fee on the fill: negative paid, positive rebate.
+    // Sums exactly to margin.fees when the wallet's history is complete.
+    fee: Number(f.fee ?? 0),
+    // One execution's id, the same for both sides: BULK's tradeId, or the
+    // <slot>:<sequence> it is made of (mainnet doesn't send the field yet).
+    tradeId: f.tradeId ? String(f.tradeId) : (f.slot != null && f.sequence != null ? `${f.slot}:${f.sequence}` : undefined),
+    slot: f.slot != null ? Number(f.slot) : undefined,
+  };
+}
+
+// ============================================================================
+// GET /wallet/:address/trade/:tradeId  — one execution, for share links.
+// tradeId is BULK's "<slot>:<sequence>", the same for both sides of the fill, so
+// the lookup is one fills query bounded to that slot. Immutable: cached a day.
+// ============================================================================
+router.get('/:address/trade/:tradeId', async (req: Request, res: Response) => {
+  try {
+    const { address, tradeId } = req.params;
+    const m = /^(\d+):(\d+)$/.exec(tradeId);
+    if (!address || address.length < 32 || !m) return res.status(400).json({ error: 'Invalid address or trade id' });
+    const key = `wallet:trade:${address}:${tradeId}`;
+    const cached = await getCache<unknown>(key);
+    if (cached) return res.json(cached);
+    const slot = Number(m[1]); const seq = Number(m[2]);
+    const page = await bulkApi.accountRows(address, 'fills', { startSlot: slot, endSlot: slot });
+    if (!page) return res.status(503).json({ error: 'BULK is busy, try again' });
+    const raw = page.rows.find((r) => String(r.tradeId ?? '') === tradeId || (Number(r.slot) === slot && Number(r.sequence) === seq));
+    if (!raw) return res.status(404).json({ error: 'Trade not found for this wallet' });
+    const fill = normalizeFill(raw);
+    const payload = { fill: { ...fill, isMaker: fill.maker === address, makerFee: Number((raw as any).makerFee ?? 0), takerFee: Number((raw as any).takerFee ?? 0) } };
+    await setCache(key, payload, 86400);
+    res.json(payload);
+  } catch (error: any) {
+    console.error('GET /wallet/:address/trade error:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch trade' });
+  }
+});
+
+// ============================================================================
+// GET /wallet/:address/order/:orderId[?slot=]  — one order and its fills.
+// BULK has no lookup by order id, so: still resting (open orders), then the
+// order's own slot when the link carries it, else the latest history pages.
+// ============================================================================
+router.get('/:address/order/:orderId', async (req: Request, res: Response) => {
+  try {
+    const { address, orderId } = req.params;
+    if (!address || address.length < 32 || !/^[1-9A-HJ-NP-Za-km-z]{20,64}$/.test(orderId)) return res.status(400).json({ error: 'Invalid address or order id' });
+    const slot = Number(req.query.slot) || 0;
+    const key = `wallet:order:${address}:${orderId}`;
+    const cached = await getCache<unknown>(key);
+    if (cached) return res.json(cached);
+
+    let order: Record<string, unknown> | null = null;
+    let open = false;
+    const acc = await bulkApi.getFullAccount(address).catch(() => null);
+    const resting = (acc as any)?.openOrders as Record<string, unknown>[] | undefined;
+    const r = resting?.find((o) => o.orderId === orderId);
+    if (r) { order = r; open = true; }
+    if (!order) {
+      if (slot) {
+        const pg = await bulkApi.accountRows(address, 'orderHistory', { startSlot: slot, endSlot: slot });
+        if (!pg) return res.status(503).json({ error: 'BULK is busy, try again' });
+        order = pg.rows.find((o) => o.orderId === orderId) ?? null;
+      }
+      let cursor: string | null = null;
+      for (let i = 0; !order && i < 3; i++) {
+        const pg = await bulkApi.accountRows(address, 'orderHistory', cursor ? { cursor } : {});
+        if (!pg) return res.status(503).json({ error: 'BULK is busy, try again' });
+        order = pg.rows.find((o) => o.orderId === orderId) ?? null;
+        cursor = pg.nextCursor;
+        if (!cursor) break;
+      }
+    }
+    if (!order) return res.status(404).json({ error: 'Order not found for this wallet' });
+
+    const all = await bulkApi.getFills(address).catch(() => null);
+    const fills = (all ?? [])
+      .filter((f: any) => f && (f.orderIdMaker === orderId || f.orderIdTaker === orderId))
+      .map((f: any) => { const n = normalizeFill(f); return { ...n, isMaker: n.maker === address }; })
+      .sort((a: any, b: any) => a.timestamp - b.timestamp);
+    const ts = Number(order.timestamp ?? 0);
+    const payload = {
+      order: {
+        orderId, open,
+        symbol: String(order.symbol ?? ''),
+        side: String(order.side ?? (Number(order.size ?? 0) < 0 ? 'sell' : 'buy')),
+        orderType: String(order.orderType ?? ''),
+        tif: order.tif ?? null,
+        price: Number(order.price ?? 0),
+        vwap: Number(order.vwap ?? 0),
+        originalSize: Math.abs(Number(order.originalSize ?? order.size ?? 0)),
+        executedSize: Math.abs(Number(order.executedSize ?? order.filledSize ?? 0)),
+        reduceOnly: Boolean(order.reduceOnly),
+        status: String(order.status ?? (open ? 'resting' : '')),
+        reason: order.reason ?? null,
+        trigger: order.trigger ?? null,
+        slot: order.slot != null ? Number(order.slot) : null,
+        timestamp: ts > 1e14 ? Math.floor(ts / 1e6) : ts,
+      },
+      fills,
+    };
+    // A finished order never changes; a resting one can fill any second.
+    await setCache(key, payload, open ? 15 : 3600);
+    res.json(payload);
+  } catch (error: any) {
+    console.error('GET /wallet/:address/order error:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch order' });
+  }
+});
+
 router.get('/:address/fills', async (req: Request, res: Response) => {
   try {
     const { address } = req.params;
@@ -509,56 +665,6 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
     //   3. reasonCode: BULK returns a numeric code AND a string `reason`.
     //      We pass the string through as `reasonCode` since that's what
     //      the chart marker logic switches on ("trade" vs "liq" vs "adl").
-    function normalizeFill(f: any): any {
-      const tsRaw = Number(f.timestamp ?? f.time ?? 0);
-      // Heuristic: BULK timestamps are nanoseconds (16+ digits when
-      // looked at as ms). If the value is greater than ~year 5000 in
-      // ms (~1e14), it's nanoseconds and needs scaling down by 1e6.
-      // Anything else we trust as ms or seconds.
-      const tsMs =
-        tsRaw > 1e14 ? Math.floor(tsRaw / 1e6) :
-        tsRaw > 1e11 ? tsRaw : // already ms
-        tsRaw * 1000; // seconds → ms
-
-      return {
-        timestamp: tsMs,
-        symbol: String(f.symbol ?? f.sym ?? ''),
-        price: Number(f.price ?? f.px ?? 0),
-        size: Number(f.amount ?? f.size ?? f.sz ?? 0),
-        isBuy: Boolean(f.isBuy ?? false),
-        // Prefer the string `reason` ("liquidation", "trade") over the
-        // numeric `reasonCode` since the frontend marker logic compares
-        // strings. Map to our standard tokens.
-        //
-        // v1.0.15 added reasonCode 3 = "liquidation_sweep" (partial-liq
-        // cascade). Check for "sweep" BEFORE the generic "liq" check so
-        // "liquidation_sweep" gets the more specific `liq_sweep` token
-        // rather than the generic `liq`.
-        reasonCode: ((): string => {
-          const reason = String(f.reason ?? '').toLowerCase();
-          if (reason.includes('sweep')) return 'liq_sweep';
-          if (reason.includes('liq')) return 'liq';
-          if (reason.includes('adl')) return 'adl';
-          // Numeric fallback when string is missing — based on observed
-          // BULK behavior: 0 = trade, 1 = liq, 2 = adl, 3 = liq_sweep (v1.0.15).
-          const code = Number(f.reasonCode ?? 0);
-          if (code === 1) return 'liq';
-          if (code === 2) return 'adl';
-          if (code === 3) return 'liq_sweep';
-          return 'trade';
-        })(),
-        // Pass through identifiers in case the frontend needs them later.
-        orderIdMaker: f.orderIdMaker,
-        orderIdTaker: f.orderIdTaker,
-        maker: f.maker,
-        taker: f.taker,
-        iso: Boolean(f.iso ?? false),
-        counterpartyHint: f.counterpartyHint,
-        // This wallet's own fee on the fill: negative paid, positive rebate.
-        // Sums exactly to margin.fees when the wallet's history is complete.
-        fee: Number(f.fee ?? 0),
-      };
-    }
 
     const bareCoin = symbol ? symbol.replace(/-USD$/, '') : null;
     const filtered: any[] = [];
@@ -582,7 +688,7 @@ router.get('/:address/fills', async (req: Request, res: Response) => {
         }
       }
       filtered.push(lite
-        ? { timestamp: f.timestamp, symbol: f.symbol, price: f.price, size: f.size, isBuy: f.isBuy, reasonCode: f.reasonCode, fee: f.fee, isMaker: f.maker === address }
+        ? { timestamp: f.timestamp, symbol: f.symbol, price: f.price, size: f.size, isBuy: f.isBuy, reasonCode: f.reasonCode, fee: f.fee, isMaker: f.maker === address, tradeId: f.tradeId }
         : f);
       if (filtered.length >= limit) break;
     }
