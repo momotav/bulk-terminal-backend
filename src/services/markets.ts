@@ -61,7 +61,7 @@ const FALLBACK_SYMBOLS: readonly string[] = [
 export type AssetClass = 'crypto' | 'stock';
 
 export const STOCK_COINS: readonly string[] = [
-  'NVDA', 'TSLA', 'MSTR', 'MU', 'SNDK', 'SKHYNIX', 'CRCL', 'SPACEX', 'US500', 'SOXL',
+  'NVDA', 'TSLA', 'MSTR', 'MU', 'SNDK', 'SKHYNIX', 'CRCL', 'SPACEX', 'US500', 'SOXL', 'QQQ',
 ];
 const STOCK_SET = new Set(STOCK_COINS);
 
