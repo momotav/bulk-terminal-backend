@@ -18,6 +18,7 @@ const BULK_API_BASE = 'https://exchange-api.bulk.trade/api/v1';
 
 import { bulkFetch } from './bulkAuth';
 import { getRequestNetwork } from './networkContext';
+import { getCache, setCache } from './cache';
 import type { NetworkId } from './networks';
 
 // 5-minute cache. BULK adds/delists markets infrequently so this is plenty
@@ -137,13 +138,19 @@ export async function getActiveSymbols(forceRefresh = false): Promise<string[]> 
     try {
       const symbols = await fetchFromBulk();
       cache.set(net, { symbols, expiresAt: Date.now() + CACHE_TTL_MS });
+      // Kept outside this process too, so a restart during a BULK outage still knows every market.
+      void setCache(`markets:symbols:${net}`, symbols, 30 * 86400).catch(() => {});
       console.log(`📋 [${net}] Market list refreshed: ${symbols.length} symbols — ${symbols.join(', ')}`);
       return symbols;
     } catch (err) {
       console.error(`⚠️  [${net}] Failed to fetch /exchangeInfo, using fallback symbol list:`, err);
       // Populate cache with the fallback so we don't retry on every single call;
       // short TTL so we try BULK again soon.
-      const fb = [...FALLBACK_SYMBOLS];
+      // Never shrink a known list because BULK hiccupped: keep the last good one (this
+      // process, else the saved copy), the short built-in list only as a last resort.
+      // Shrinking it turned every other market into "Unsupported market" during outages.
+      const saved = entry?.symbols?.length ? entry.symbols : await getCache<string[]>(`markets:symbols:${net}`).catch(() => null);
+      const fb = saved && saved.length ? saved : [...FALLBACK_SYMBOLS, ...STOCK_COINS.map((c) => `${c}-USD`)];
       cache.set(net, { symbols: fb, expiresAt: Date.now() + 30 * 1000 });
       return fb;
     } finally {
