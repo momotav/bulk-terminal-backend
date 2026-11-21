@@ -262,6 +262,20 @@ export async function initializeDatabase(): Promise<void> {
       END $$;
     `);
 
+    // Shared fills and orders, kept for good. BULK only keeps ~8 days of account
+    // history, so a share link would die once its fill ages out; the first time a
+    // link is opened or copied, what it shows is stored here.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS share_snapshots (
+        kind VARCHAR(10) NOT NULL,
+        address VARCHAR(64) NOT NULL,
+        ref VARCHAR(100) NOT NULL,
+        payload JSONB NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (kind, address, ref)
+      );
+    `);
+
     // Trades table
     await client.query(`
       CREATE TABLE IF NOT EXISTS trades (

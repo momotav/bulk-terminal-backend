@@ -516,6 +516,25 @@ function normalizeFill(f: any): any {
 // tradeId is BULK's "<slot>:<sequence>", the same for both sides of the fill, so
 // the lookup is one fills query bounded to that slot. Immutable: cached a day.
 // ============================================================================
+// Shared fills/orders are stored the first time a link is opened, so it outlives
+// BULK's ~8-day history window.
+async function savedShare(kind: 'trade' | 'order', address: string, ref: string): Promise<unknown | null> {
+  try {
+    const row = await queryOne<{ payload: unknown }>('SELECT payload FROM share_snapshots WHERE kind = $1 AND address = $2 AND ref = $3', [kind, address, ref]);
+    return row?.payload ?? null;
+  } catch { return null; }
+}
+async function saveShare(kind: 'trade' | 'order', address: string, ref: string, payload: unknown): Promise<void> {
+  try {
+    await query(
+      `INSERT INTO share_snapshots (kind, address, ref, payload) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (kind, address, ref) DO UPDATE SET payload = EXCLUDED.payload`,
+      [kind, address, ref, JSON.stringify(payload)],
+    );
+  } catch (e) { console.error('saveShare failed:', (e as Error).message); }
+}
+const EXPIRED = { error: 'BULK only keeps about 8 days of account history, and this one is older. Links opened while it was still there keep working.', expired: true };
+
 router.get('/:address/trade/:tradeId', async (req: Request, res: Response) => {
   try {
     const { address, tradeId } = req.params;
@@ -524,14 +543,18 @@ router.get('/:address/trade/:tradeId', async (req: Request, res: Response) => {
     const key = `wallet:trade:${address}:${tradeId}`;
     const cached = await getCache<unknown>(key);
     if (cached) return res.json(cached);
+    const saved = await savedShare('trade', address, tradeId);
+    if (saved) { await setCache(key, saved, 86400); return res.json(saved); }
     const slot = Number(m[1]); const seq = Number(m[2]);
     const page = await bulkApi.accountRows(address, 'fills', { startSlot: slot, endSlot: slot });
     if (!page) return res.status(503).json({ error: 'BULK is busy, try again' });
     const raw = page.rows.find((r) => String(r.tradeId ?? '') === tradeId || (Number(r.slot) === slot && Number(r.sequence) === seq));
+    if (!raw && page.minAvailableSlot && slot < page.minAvailableSlot) return res.status(410).json(EXPIRED);
     if (!raw) return res.status(404).json({ error: 'Trade not found for this wallet' });
     const fill = normalizeFill(raw);
     const payload = { fill: { ...fill, isMaker: fill.maker === address, makerFee: Number((raw as any).makerFee ?? 0), takerFee: Number((raw as any).takerFee ?? 0) } };
     await setCache(key, payload, 86400);
+    await saveShare('trade', address, tradeId, payload);
     res.json(payload);
   } catch (error: any) {
     console.error('GET /wallet/:address/trade error:', error);
@@ -552,6 +575,8 @@ router.get('/:address/order/:orderId', async (req: Request, res: Response) => {
     const key = `wallet:order:${address}:${orderId}`;
     const cached = await getCache<unknown>(key);
     if (cached) return res.json(cached);
+    const saved = await savedShare('order', address, orderId);
+    if (saved) { await setCache(key, saved, 3600); return res.json(saved); }
 
     // The order's fills first (cached full history): they also say where BULK filed
     // the order, which is the slot it FINISHED in, i.e. its last fill's slot.
@@ -562,6 +587,7 @@ router.get('/:address/order/:orderId', async (req: Request, res: Response) => {
       .sort((a: any, b: any) => a.timestamp - b.timestamp);
 
     let order: Record<string, unknown> | null = null;
+    let minSlot: number | null = null;
     let open = false;
     let inferred = false;
     const acc = await bulkApi.getFullAccount(address).catch(() => null);
@@ -573,6 +599,7 @@ router.get('/:address/order/:orderId', async (req: Request, res: Response) => {
       if (order) break;
       const pg = await bulkApi.accountRows(address, 'orderHistory', { startSlot: sl, endSlot: sl });
       if (!pg) return res.status(503).json({ error: 'BULK is busy, try again' });
+      minSlot = pg.minAvailableSlot ?? minSlot;
       order = pg.rows.find((o) => o.orderId === orderId) ?? null;
     }
     if (!order) {
@@ -594,6 +621,7 @@ router.get('/:address/order/:orderId', async (req: Request, res: Response) => {
         originalSize: size, executedSize: size, status: 'filled', slot: last.slot, timestamp: last.timestamp };
       inferred = true;
     }
+    if (!order && slot && minSlot && slot < minSlot) return res.status(410).json(EXPIRED);
     if (!order) return res.status(404).json({ error: 'Order not found for this wallet' });
 
     const ts = Number(order.timestamp ?? 0);
@@ -619,6 +647,8 @@ router.get('/:address/order/:orderId', async (req: Request, res: Response) => {
     };
     // A finished order never changes; a resting one can fill any second.
     await setCache(key, payload, open ? 15 : 3600);
+    // A finished order is final: keep it past BULK's history window.
+    if (!open) await saveShare('order', address, orderId, payload);
     res.json(payload);
   } catch (error: any) {
     console.error('GET /wallet/:address/order error:', error);

@@ -478,14 +478,14 @@ class BulkApiService {
    * Unwraps BULK's { data, page } envelope and the older [{ <type>: row }] shape.
    * `extra` carries startSlot/endSlot/limit/cursor. null = upstream failure, never [].
    */
-  async accountRows(walletAddress: string, type: string, extra: Record<string, unknown> = {}): Promise<{ rows: Record<string, unknown>[]; nextCursor: string | null } | null> {
+  async accountRows(walletAddress: string, type: string, extra: Record<string, unknown> = {}): Promise<{ rows: Record<string, unknown>[]; nextCursor: string | null; minAvailableSlot: number | null } | null> {
     try {
       // Slot-bounded lookups are one tiny query: they skip the per-wallet queue, where a
       // busy wallet's full-history paging could hold them 30s+ (and the share page then
       // gave up). Still inside the global /account slots, so the BULK budget is kept.
       const bounded = extra.startSlot != null && extra.endSlot != null;
       const parsed = bounded ? await this.postAccountUnlocked(walletAddress, type, extra) : await this.postAccount(walletAddress, type, 8000, false, extra);
-      const env = (parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { data: parsed }) as { data?: unknown; page?: { hasMore?: boolean; nextCursor?: string } };
+      const env = (parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { data: parsed }) as { data?: unknown; page?: { hasMore?: boolean; nextCursor?: string; minAvailableSlot?: number } };
       const raw = Array.isArray(env.data) ? env.data : [];
       const rows: Record<string, unknown>[] = [];
       for (const r of raw) {
@@ -495,7 +495,9 @@ class BulkApiService {
         else if (inner && typeof inner === 'object') rows.push(inner as Record<string, unknown>);
         else rows.push(r as Record<string, unknown>);
       }
-      return { rows, nextCursor: env.page?.hasMore && env.page.nextCursor ? env.page.nextCursor : null };
+      // minAvailableSlot: the oldest slot BULK still keeps history for (it prunes after ~8 days).
+      const min = Number(env.page?.minAvailableSlot);
+      return { rows, nextCursor: env.page?.hasMore && env.page.nextCursor ? env.page.nextCursor : null, minAvailableSlot: Number.isFinite(min) && min > 0 ? min : null };
     } catch (error) {
       console.error(`accountRows ${type} for ${walletAddress.slice(0, 8)} failed:`, error);
       return null;
