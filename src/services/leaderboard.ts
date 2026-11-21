@@ -284,13 +284,21 @@ class LeaderboardService {
   }
 
   // Get recent big trades
-  async getRecentTrades(limit: number = 50, minValue: number = 100): Promise<any[]> {
+  async getRecentTrades(limit: number = 50, minValue: number = 0, symbol?: string): Promise<any[]> {
+    // Size / market filters (live tape). The 7-day bound keeps a $100K filter on a
+    // quiet market from walking the whole table.
+    const where: string[] = [];
+    const args: any[] = [limit];
+    if (minValue > 0) { args.push(minValue); where.push(`value >= $${args.length}`); }
+    if (symbol) { args.push(symbol); where.push(`symbol = $${args.length}`); }
+    if (where.length) where.push(`timestamp > NOW() - INTERVAL '7 days'`);
     return query(
       `SELECT id, wallet_address, symbol, side, size, price, value, timestamp
        FROM trades
+       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
        ORDER BY timestamp DESC
        LIMIT $1`,
-      [limit]
+      args
     );
   }
 

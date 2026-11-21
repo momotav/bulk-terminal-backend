@@ -114,10 +114,13 @@ router.get('/liquidations/recent', async (req: Request, res: Response) => {
 // GET /leaderboard/trades/recent - Recent big trades
 router.get('/trades/recent', async (req: Request, res: Response) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
-    const minValue = parseInt(req.query.minValue as string) || 10000;
-    
-    const rawData = await leaderboardService.getRecentTrades(limit + 10, minValue);
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+    // Only filters when asked (older callers send no minValue and expect every trade).
+    const minValue = Math.max(0, parseInt(req.query.minValue as string) || 0);
+    const rawSym = String(req.query.symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const symbol = rawSym ? `${rawSym.replace(/USD$/, '')}-USD` : undefined;
+
+    const rawData = await leaderboardService.getRecentTrades(limit + 10, minValue, symbol);
     const data = filterOutSystemWallets(rawData, t => t.wallet_address).slice(0, limit);
     res.json({ data });
   } catch (error: any) {
