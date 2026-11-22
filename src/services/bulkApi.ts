@@ -1,5 +1,10 @@
 // Service to interact with BULK Exchange API
 
+import { liveMarkPrices, liveTickers } from './liveMarket';
+
+// A market with no ticker yet (listed, never traded: BULK 404s it) is asked again
+// only every 10 minutes instead of on every poll.
+const tickerMissUntil = new Map<string, number>();
 import { getActiveSymbols } from './markets';
 import { bulkFetch } from './bulkAuth';
 import { swrCache } from './cache';
@@ -243,21 +248,22 @@ class BulkApiService {
   // Fetch ticker for a symbol
   async getTicker(symbol: string): Promise<Ticker | null> {
     try {
-      // Try the direct ticker endpoint first
-      // One attempt. A second form on failure doubled every 429 into two.
-      const res = await bulkFetch(`${this.baseUrl}/ticker/${symbol}`);
-      
-      if (!res.ok) {
-        console.log(`⚠️ Ticker endpoint failed for ${symbol}: ${res.status}`);
-        return null;
+      // The live WebSocket feed first: no HTTP call when the stream has this market.
+      const streamed = liveTickers([symbol]);
+      let ticker: any = streamed?.[0] ?? null;
+      if (!ticker) {
+        if ((tickerMissUntil.get(symbol) ?? 0) > Date.now()) return null;
+        // One attempt. A second form on failure doubled every 429 into two.
+        const res = await bulkFetch(`${this.baseUrl}/ticker/${symbol}`);
+        if (!res.ok) {
+          if (res.status === 404) tickerMissUntil.set(symbol, Date.now() + 10 * 60_000);
+          console.log(`⚠️ Ticker endpoint failed for ${symbol}: ${res.status}`);
+          return null;
+        }
+        const data: any = await res.json();
+        // Could be { symbol, markPrice, ... } or { data: { ... } } or array
+        ticker = data.data || data[0] || data;
       }
-      
-      const data: any = await res.json();
-      console.log(`📊 Raw ticker data for ${symbol}:`, JSON.stringify(data).slice(0, 200));
-      
-      // Handle different response formats
-      // Could be { symbol, markPrice, ... } or { data: { ... } } or array
-      const ticker: any = data.data || data[0] || data;
       
       return {
         symbol: ticker.symbol || symbol,
@@ -296,6 +302,9 @@ class BulkApiService {
         return out;
       }, 3600);
     } catch (error: any) {
+      // /stats switched off (2026-11-22): the live ticker stream has every mark.
+      const live = liveMarkPrices();
+      if (Object.keys(live).length) return live;
       console.error(`[bulkApi.getMarkPrices] ${error?.message || error}`);
       return {};
     }

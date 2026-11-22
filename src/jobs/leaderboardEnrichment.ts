@@ -18,6 +18,11 @@
 import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
 import { isSystemWallet } from '../services/systemWallets';
+import { setCache } from '../services/cache';
+
+/** One open position's liquidation point, for the liquidation map. */
+export interface LiqPoint { w: string; s: string; side: 'long' | 'short'; n: number; liq: number; entry: number; lev: number }
+export const LIQMAP_KEY = 'liqmap:book';
 
 const REFRESH_MS = 5 * 60_000; // re-rank every 5 minutes
 const TOP_N = 250;             // enrich the top-N traders by collected volume
@@ -45,6 +50,10 @@ async function enrichOnce(): Promise<void> {
     );
 
     let updated = 0;
+    // Liquidation map: every open position's liquidation price from this same sweep
+    // (no extra BULK calls). Published once the sweep ends.
+    const book: LiqPoint[] = [];
+    let scanned = 0;
     for (const { wallet_address } of rows) {
       if (isSystemWallet(wallet_address)) continue;
       try {
@@ -62,6 +71,13 @@ async function enrichOnce(): Promise<void> {
           // Snapshot open-position notional so "Whale Watch" (biggest positions)
           // ranks from live account data. Same fetch we already made for PnL.
           const positions = acc?.positions ?? [];
+          scanned++;
+          for (const p of positions) {
+            const size = Number(p.size) || 0; const liq = Number(p.liquidationPrice) || 0;
+            const n = Math.abs(Number(p.notional) || 0);
+            if (!size || !(liq > 0) || n < 10) continue; // skip dust
+            book.push({ w: wallet_address, s: p.symbol, side: size > 0 ? 'long' : 'short', n, liq, entry: Number(p.price) || 0, lev: Number(p.leverage) || 0 });
+          }
           const totalNotional = positions.reduce(
             (s, p) => s + Math.abs(Number((p as { notional?: number }).notional) || 0),
             0
@@ -78,6 +94,8 @@ async function enrichOnce(): Promise<void> {
       }
       await new Promise((r) => setTimeout(r, SPACING_MS + Math.floor((Math.random() - 0.5) * 2 * JITTER_MS)));
     }
+
+    if (scanned > 0) await setCache(LIQMAP_KEY, { at: Date.now(), wallets: scanned, positions: book }, 86400);
 
     // Bound the snapshot table WITHOUT losing history. The leaderboard's whale
     // windows need every row for the last 24h; beyond that the wallet page

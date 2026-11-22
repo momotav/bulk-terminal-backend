@@ -5,6 +5,7 @@ import { getActiveSymbols, classifyCoin, type AssetClass } from '../services/mar
 import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coinShape';
 import { filterOutSystemWallets, SYSTEM_WALLET_ADDRESSES } from '../services/systemWallets';
 import { bulkFetch } from '../services/bulkAuth';
+import { liveExchangeTotals, liveTickers, liveMarketStatus } from '../services/liveMarket';
 import { getRequestNetwork } from '../services/networkContext';
 
 const router = Router();
@@ -441,6 +442,18 @@ router.get('/exchange-stats', async (req: Request, res: Response) => {
       }
     } catch (e) {
       console.error('Failed to fetch BULK /stats totals:', e);
+    }
+
+    // SECOND source (2026-11-22: BULK switched /stats off): the live WebSocket
+    // frontendContext stream — every market's volume and OI in one message, the
+    // source BULK's docs recommend for dashboards. No HTTP calls at all.
+    if (totalVolume24h === 0 || totalOpenInterest === 0) {
+      const live = liveExchangeTotals(await getActiveSymbols().catch(() => []));
+      if (live) {
+        if (totalVolume24h === 0) totalVolume24h = live.volume24h;
+        if (totalOpenInterest === 0) totalOpenInterest = live.openInterest;
+        timestamp = live.ts;
+      }
     }
 
     // FALLBACK: if /stats was down / rate-limited and left either total at 0,
@@ -1969,7 +1982,15 @@ router.get('/tickers-bulk', async (req: Request, res: Response) => {
   try {
     // Use live symbol list so new markets appear automatically.
     const symbols = await getActiveSymbols();
-    const fetched = await Promise.all(
+    // Live stream first: BULK pushes every market over the WebSocket, so the table
+    // needs no HTTP call per market. The REST fan-out below is only for when the
+    // stream is stale, and is single-flighted so concurrent viewers share it.
+    const live = liveTickers(symbols);
+    if (live) {
+      live.forEach((t) => lastGoodTickers.set(t.symbol, t as unknown as BulkTicker & { symbol?: string }));
+      return res.json({ tickers: live, source: 'bulk-ws' });
+    }
+    const fetched = await swrCache(`tickers-bulk:rest:${symbols.length}`, 15, () => Promise.all(
       symbols.map(async (symbol) => {
         try {
           const response = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
@@ -1979,7 +2000,7 @@ router.get('/tickers-bulk', async (req: Request, res: Response) => {
           return null;
         }
       })
-    );
+    ), 120);
 
     // Per-symbol fallback to the last known-good ticker. BULK's per-market
     // /ticker calls occasionally fail/rate-limit under load; without this the
@@ -2909,6 +2930,49 @@ router.get('/fee-tiers', async (req: Request, res: Response) => {
 
 // Mark over oracle per market: the live gap from the ticker stream, and its hourly
 // average from the snapshots (recorded from 2026-11-10 on).
+// GET /analytics/liquidation-map[?symbol=BTC-USD]
+// Where open positions would be liquidated, from the leaderboard sweep's live
+// account reads (top traders by volume, refreshed every ~5 min). Without a symbol:
+// per-market totals for the picker. With one: that market's positions plus how
+// much of its open interest they cover, so the map is honest about its reach.
+// GET /analytics/live-status — is the live market stream feeding us?
+router.get('/live-status', (_req: Request, res: Response) => { res.json(liveMarketStatus()); });
+
+router.get('/liquidation-map', async (req: Request, res: Response) => {
+  try {
+    const snap = await getCache<{ at: number; wallets: number; positions: { w: string; s: string; side: 'long' | 'short'; n: number; liq: number; entry: number; lev: number }[] }>('liqmap:book');
+    if (!snap) return res.status(503).json({ error: 'Liquidation map is warming up, try again in a few minutes' });
+    const raw = String(req.query.symbol || '').toUpperCase().replace(/[^A-Z0-9-]/g, '');
+    if (!raw) {
+      const by = new Map<string, { symbol: string; longUsd: number; shortUsd: number; positions: number }>();
+      for (const p of snap.positions) {
+        const r = by.get(p.s) ?? { symbol: p.s, longUsd: 0, shortUsd: 0, positions: 0 };
+        if (p.side === 'long') r.longUsd += p.n; else r.shortUsd += p.n;
+        r.positions++; by.set(p.s, r);
+      }
+      const markets = Array.from(by.values()).sort((a, b) => b.longUsd + b.shortUsd - (a.longUsd + a.shortUsd));
+      return res.json({ at: snap.at, wallets: snap.wallets, markets });
+    }
+    const symbol = raw.endsWith('-USD') ? raw : `${raw}-USD`;
+    // One ticker (cached briefly) for the mark and this market's open interest.
+    const t = await swrCache<BulkTicker | null>(`liqmap:ticker:${symbol}`, 10, async () => {
+      const r = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
+      if (!r.ok) throw new Error(`ticker ${symbol} ${r.status}`);
+      return (await r.json()) as BulkTicker;
+    }, 600).catch(() => null);
+    const mark = Number(t?.markPrice) || Number(t?.lastPrice) || 0;
+    const positions = snap.positions.filter((p) => p.s === symbol)
+      .map((p) => ({ wallet: p.w, side: p.side, notional: p.n, liq: p.liq, entry: p.entry, leverage: p.lev }));
+    const covered = positions.reduce((s, p) => s + p.notional, 0);
+    // Ticker OI is one-sided (see OI_SIDE_FACTOR); longs + shorts = both sides.
+    const oiUsd = t ? (Number(t.openInterest) || 0) * mark * OI_SIDE_FACTOR : 0;
+    res.json({ at: snap.at, wallets: snap.wallets, symbol, mark, coveredUsd: covered, openInterestUsd: oiUsd, positions });
+  } catch (error: any) {
+    console.error('liquidation-map error:', error);
+    res.status(500).json({ error: error.message || 'Failed to build liquidation map' });
+  }
+});
+
 router.get('/mark-oracle', async (req: Request, res: Response) => {
   const hours = Math.min(720, Math.max(1, parseInt(req.query.hours as string) || 24));
   try {

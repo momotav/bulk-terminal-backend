@@ -1,3 +1,4 @@
+import { recordFrontendContext, recordLiveTicker } from '../services/liveMarket';
 import WebSocket from 'ws';
 import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
@@ -645,11 +646,20 @@ function processMessage(data: WebSocket.Data): void {
       console.log(`📨 Raw message (type=${message.type}, topic=${message.topic}):`, JSON.stringify(message).slice(0, 800));
     }
 
+    // ============ FRONTEND CONTEXT (every market, every 2s) ============
+    // BULK's aggregate stream: volume/OI/funding/price for all symbols in one
+    // message. Feeds the exchange totals and tickers without a REST call per market.
+    if (message.type === 'frontendContext' || message.topic === 'frontendContext') {
+      recordFrontendContext(message.data?.ctx);
+      return;
+    }
+
     // ============ HANDLE TICKER MESSAGES (Real-time OI, Funding, Price) ============
     // Format: { type: 'ticker', topic: 'ticker.BTC-USD', data: { ticker: {...} } }
     if (message.type === 'ticker' || (message.topic && message.topic.startsWith('ticker.'))) {
       const tickerData = message.data?.ticker || message.data || message;
       const symbol = tickerData.symbol || message.topic?.replace('ticker.', '') || 'UNKNOWN';
+      recordLiveTicker(symbol, tickerData);
       
       const openInterestCoins = parseFloat(String(tickerData.openInterest || 0));
       const markPrice = parseFloat(String(tickerData.markPrice || tickerData.lastPrice || 0));
@@ -1278,7 +1288,7 @@ function connect(): void {
         // Supports up to 100 subscriptions per connection — we need 2 per
         // market (trades + ticker), so we stay well under the limit even with
         // ~50 coins.
-        const subs: Array<{ type: string; symbol: string }> = [];
+        const subs: Array<{ type: string; symbol?: string }> = [{ type: 'frontendContext' }];
         for (const symbol of symbols) {
           subs.push({ type: 'trades', symbol });
           subs.push({ type: 'ticker', symbol });
