@@ -621,6 +621,143 @@ async function recordADL(adl: {
   }
 }
 
+
+/**
+ * Record one trade print (live feed, or a fill recovered by the gap backfill):
+ * trade / liquidation / ADL, same classification and tables either way.
+ * Backfilled prints don't fan out to live charts (they're history).
+ */
+export function ingestTradePrint(trade: any, topicSymbol: string | null, opts: { backfill?: boolean } = {}): void {
+  // Skip if this is a resting order, not a fill
+  if (trade.status === 'resting' || trade.filledSize === 0) {
+    return;
+  }
+  
+  // Extract data from BULK format
+  const symbol = trade.s || trade.symbol || topicSymbol || 'UNKNOWN';
+  const price = parseFloat(trade.px || trade.price || trade.p || 0);
+  const size = parseFloat(trade.sz || trade.size || trade.q || trade.qty || 0);
+  const time = trade.time || trade.T || trade.timestamp || Date.now();
+  
+  // Handle side - BULK might use boolean, string, or 'B'/'S'
+  let side = 'buy';
+  if (trade.side === false || trade.side === 'S' || trade.side === 'sell' || trade.side === 'short') {
+    side = 'sell';
+  }
+  
+  const maker = trade.maker || null;
+  const taker = trade.taker || null;
+  const walletAddress = taker || maker || null;
+  
+  // Reason: BULK v1.0.12–1.0.2x sent a STRING `reason` ("liquidation",
+  // "liquidation_sweep", "adl"); since ~2026-10-21 10:15 UTC the trade
+  // print carries a NUMERIC `reason_code` instead (0 trade, 1 liquidation,
+  // 2 ADL, 3 liquidation sweep — same codes as the account fills feed).
+  // We only read the string, so from that moment every liquidation and
+  // ADL was filed as a plain trade (a $520K cascade on Oct 21 among them).
+  // Normalise both shapes to the string token the checks below use.
+  const rc = trade.reason_code ?? trade.reasonCode;
+  const reason: string | null = trade.reason
+    || (rc === 1 ? 'liquidation' : rc === 3 ? 'liquidation_sweep' : rc === 2 ? 'adl' : null);
+  // Anything outside the codes we know (0 trade, 1 liq, 2 adl, 3 sweep)
+  // or an unrecognised string reason means BULK changed the feed.
+  if ((rc !== undefined && rc !== null && ![0, 1, 2, 3].includes(Number(rc))) ||
+      (typeof trade.reason === 'string' && !['trade', 'liquidation', 'liquidation_sweep', 'adl'].includes(trade.reason))) {
+    stats.unknownReasonCodes++;
+    if (stats.unknownReasonCodes <= 5) {
+      console.error(`🚨 UNKNOWN reason token from BULK: reason=${JSON.stringify(trade.reason)} reason_code=${JSON.stringify(rc)} — classification may be wrong`);
+    }
+  }
+  
+  // Check for liquidation
+  // Per BULK API docs: reason="liquidation" and/or liq=true.
+  // v1.0.15 added reason="liquidation_sweep" (fill reasonCode 3) — a
+  // partial-liquidation cascade. Treat it as a liquidation for DB
+  // purposes since it IS one economically; the wallet detail page's
+  // chart marker distinguishes the two via the fills.reasonCode token.
+  const isLiquidation = reason === 'liquidation' ||
+                        reason === 'liquidation_sweep' ||
+                        trade.liq === true ||
+                        trade.liquidation || trade.isLiquidation || 
+                        trade.orderType === 'liquidation' || 
+                        trade.type === 'liquidation' ||
+                        (trade.reduceOnly && trade.forcedLiquidation);
+  
+  // Check for ADL
+  const isADL = reason === 'adl' ||
+                trade.adl || trade.isAdl || trade.isADL || 
+                trade.orderType === 'adl' || trade.type === 'adl' ||
+                trade.autoDeleverage || trade.auto_deleverage;
+  
+  if (price <= 0 || size <= 0) {
+    console.log(`⚠️ Invalid trade data: price=${price}, size=${size}`);
+    return;
+  }
+
+  // Fan out the last traded price to live chart subscribers. Every
+  // valid print counts (incl. liq/adl) — they all move the tape.
+  if (!opts.backfill) publishMarketUpdate({
+    symbol,
+    price,
+    kind: 'trade',
+    ts: typeof time === 'number' && time > 1e12 ? time : Date.now(),
+  });
+  
+  if (isADL) {
+    console.log(`⚡ ADL detected: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
+    recordADL({
+      symbol,
+      price,
+      size,
+      side: side === 'buy' ? 'short' : 'long',
+      wallet: walletAddress,
+      counterparty: trade.counterparty || trade.reducer || (maker === walletAddress ? taker : maker),
+      time,
+    });
+  } else if (isLiquidation) {
+    // Record the TAKER — the liquidated party. BULK emits BOTH sides of a
+    // liquidation fill as separate reason="liquidation" prints: one where
+    // the taker is the real liquidated user, and one where the taker is the
+    // liquidation engine (the protocol account taking over the position).
+    // Recording the engine side makes it a phantom "liquidated party" on
+    // every liquidation, so skip any fill whose taker is a system wallet.
+    if (taker && isSystemWallet(taker)) {
+      console.log(`⏭️ LIQUIDATION skipped (engine side): ${side} ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
+    } else if (taker) {
+      console.log(`🔥 LIQUIDATION detected: ${side} ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
+      recordLiquidation({
+        symbol,
+        price,
+        size,
+        side: side === 'buy' ? 'short' : 'long',
+        wallet: taker,  // Always use taker, not walletAddress
+        time,
+      });
+    } else {
+      console.log(`⚠️ LIQUIDATION skipped (no taker): ${side} ${symbol} | $${(price * size).toFixed(2)}`);
+    }
+  } else {
+    recordTrade({
+      symbol,
+      price,
+      size,
+      side,
+      maker,
+      taker: walletAddress,
+      time,
+    });
+  }
+}
+
+/** Trades waiting to be written (the backfill paces itself on this). */
+export function tradeQueueDepth(): number { return tradeQueue.length; }
+
+// Feed-gap hook: when the socket comes back after a silence, whoever registered
+// (the gap backfill) is told the window that was missed.
+let gapHandler: ((fromMs: number, toMs: number) => void) | null = null;
+export function onFeedGap(cb: (fromMs: number, toMs: number) => void): void { gapHandler = cb; }
+let silentSince: number | null = null;
+
 // Process incoming WebSocket message
 function processMessage(data: WebSocket.Data): void {
   try {
@@ -706,127 +843,7 @@ function processMessage(data: WebSocket.Data): void {
       
       console.log(`📊 Processing ${trades.length} trades from ${topicSymbol || 'unknown'}`);
       
-      for (const trade of trades) {
-        // Skip if this is a resting order, not a fill
-        if (trade.status === 'resting' || trade.filledSize === 0) {
-          continue;
-        }
-        
-        // Extract data from BULK format
-        const symbol = trade.s || trade.symbol || topicSymbol || 'UNKNOWN';
-        const price = parseFloat(trade.px || trade.price || trade.p || 0);
-        const size = parseFloat(trade.sz || trade.size || trade.q || trade.qty || 0);
-        const time = trade.time || trade.T || trade.timestamp || Date.now();
-        
-        // Handle side - BULK might use boolean, string, or 'B'/'S'
-        let side = 'buy';
-        if (trade.side === false || trade.side === 'S' || trade.side === 'sell' || trade.side === 'short') {
-          side = 'sell';
-        }
-        
-        const maker = trade.maker || null;
-        const taker = trade.taker || null;
-        const walletAddress = taker || maker || null;
-        
-        // Reason: BULK v1.0.12–1.0.2x sent a STRING `reason` ("liquidation",
-        // "liquidation_sweep", "adl"); since ~2026-10-21 10:15 UTC the trade
-        // print carries a NUMERIC `reason_code` instead (0 trade, 1 liquidation,
-        // 2 ADL, 3 liquidation sweep — same codes as the account fills feed).
-        // We only read the string, so from that moment every liquidation and
-        // ADL was filed as a plain trade (a $520K cascade on Oct 21 among them).
-        // Normalise both shapes to the string token the checks below use.
-        const rc = trade.reason_code ?? trade.reasonCode;
-        const reason: string | null = trade.reason
-          || (rc === 1 ? 'liquidation' : rc === 3 ? 'liquidation_sweep' : rc === 2 ? 'adl' : null);
-        // Anything outside the codes we know (0 trade, 1 liq, 2 adl, 3 sweep)
-        // or an unrecognised string reason means BULK changed the feed.
-        if ((rc !== undefined && rc !== null && ![0, 1, 2, 3].includes(Number(rc))) ||
-            (typeof trade.reason === 'string' && !['trade', 'liquidation', 'liquidation_sweep', 'adl'].includes(trade.reason))) {
-          stats.unknownReasonCodes++;
-          if (stats.unknownReasonCodes <= 5) {
-            console.error(`🚨 UNKNOWN reason token from BULK: reason=${JSON.stringify(trade.reason)} reason_code=${JSON.stringify(rc)} — classification may be wrong`);
-          }
-        }
-        
-        // Check for liquidation
-        // Per BULK API docs: reason="liquidation" and/or liq=true.
-        // v1.0.15 added reason="liquidation_sweep" (fill reasonCode 3) — a
-        // partial-liquidation cascade. Treat it as a liquidation for DB
-        // purposes since it IS one economically; the wallet detail page's
-        // chart marker distinguishes the two via the fills.reasonCode token.
-        const isLiquidation = reason === 'liquidation' ||
-                              reason === 'liquidation_sweep' ||
-                              trade.liq === true ||
-                              trade.liquidation || trade.isLiquidation || 
-                              trade.orderType === 'liquidation' || 
-                              trade.type === 'liquidation' ||
-                              (trade.reduceOnly && trade.forcedLiquidation);
-        
-        // Check for ADL
-        const isADL = reason === 'adl' ||
-                      trade.adl || trade.isAdl || trade.isADL || 
-                      trade.orderType === 'adl' || trade.type === 'adl' ||
-                      trade.autoDeleverage || trade.auto_deleverage;
-        
-        if (price <= 0 || size <= 0) {
-          console.log(`⚠️ Invalid trade data: price=${price}, size=${size}`);
-          continue;
-        }
-
-        // Fan out the last traded price to live chart subscribers. Every
-        // valid print counts (incl. liq/adl) — they all move the tape.
-        publishMarketUpdate({
-          symbol,
-          price,
-          kind: 'trade',
-          ts: typeof time === 'number' && time > 1e12 ? time : Date.now(),
-        });
-        
-        if (isADL) {
-          console.log(`⚡ ADL detected: ${side} ${symbol} | $${(price * size).toFixed(2)}`);
-          recordADL({
-            symbol,
-            price,
-            size,
-            side: side === 'buy' ? 'short' : 'long',
-            wallet: walletAddress,
-            counterparty: trade.counterparty || trade.reducer || (maker === walletAddress ? taker : maker),
-            time,
-          });
-        } else if (isLiquidation) {
-          // Record the TAKER — the liquidated party. BULK emits BOTH sides of a
-          // liquidation fill as separate reason="liquidation" prints: one where
-          // the taker is the real liquidated user, and one where the taker is the
-          // liquidation engine (the protocol account taking over the position).
-          // Recording the engine side makes it a phantom "liquidated party" on
-          // every liquidation, so skip any fill whose taker is a system wallet.
-          if (taker && isSystemWallet(taker)) {
-            console.log(`⏭️ LIQUIDATION skipped (engine side): ${side} ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
-          } else if (taker) {
-            console.log(`🔥 LIQUIDATION detected: ${side} ${symbol} | $${(price * size).toFixed(2)} | taker=${taker}`);
-            recordLiquidation({
-              symbol,
-              price,
-              size,
-              side: side === 'buy' ? 'short' : 'long',
-              wallet: taker,  // Always use taker, not walletAddress
-              time,
-            });
-          } else {
-            console.log(`⚠️ LIQUIDATION skipped (no taker): ${side} ${symbol} | $${(price * size).toFixed(2)}`);
-          }
-        } else {
-          recordTrade({
-            symbol,
-            price,
-            size,
-            side,
-            maker,
-            taker: walletAddress,
-            time,
-          });
-        }
-      }
+      for (const trade of trades) ingestTradePrint(trade, topicSymbol);
       return;
     }
 
@@ -1173,6 +1190,10 @@ function processMessage(data: WebSocket.Data): void {
 
 // Track last pong time for connection health
 let lastPongTime: number = Date.now();
+// Last data message of any kind. frontendContext arrives every 2s, so a healthy
+// connection is never quiet for long; silence means a zombie socket.
+let lastMessageAt: number = Date.now();
+const STALE_MS = 60_000;
 
 // Start heartbeat - respond to server pings (BULK API v1.0.12 requires pong response)
 function startHeartbeat(): void {
@@ -1180,15 +1201,21 @@ function startHeartbeat(): void {
   // But we'll also track connection health
   lastPongTime = Date.now();
   
-  // Monitor connection health every 45 seconds (server pings every 30s, timeout at 10s)
+  lastMessageAt = Date.now();
+  // Every 30s: ping BULK, and if no data has arrived for STALE_MS, drop the
+  // socket so 'close' reconnects. (2026-11-23: the socket went silent for 10h
+  // with no error or close — trades, liquidations and the market stream all
+  // stopped — because this check used to only log a warning.)
   heartbeatInterval = setInterval(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    
-    const timeSinceLastActivity = Date.now() - lastPongTime;
-    if (timeSinceLastActivity > 60000) {
-      console.warn('⚠️ No ping/pong activity for 60s, connection may be stale');
+    try { ws.ping(); } catch { /* terminate below if it stays silent */ }
+    const quiet = Date.now() - lastMessageAt;
+    if (quiet > STALE_MS) {
+      console.warn(`⚠️ WebSocket silent for ${Math.round(quiet / 1000)}s (last pong ${Math.round((Date.now() - lastPongTime) / 1000)}s ago) — reconnecting`);
+      if (silentSince === null) silentSince = lastMessageAt;
+      try { ws.terminate(); } catch { /* close handler reconnects */ }
     }
-  }, 45000);
+  }, 30_000);
 }
 
 // Stop heartbeat
@@ -1307,9 +1334,19 @@ function connect(): void {
       }
 
       startHeartbeat();
+      // Back after a silence of more than 2 minutes: recover what was missed.
+      if (silentSince !== null) {
+        const from = silentSince; silentSince = null;
+        if (Date.now() - from > 120_000 && gapHandler) {
+          const to = Date.now();
+          console.log(`🩹 Feed gap ${new Date(from).toISOString()} → ${new Date(to).toISOString()}, backfilling`);
+          setTimeout(() => gapHandler?.(from - 60_000, to + 30_000), 20_000);
+        }
+      }
     });
 
     ws.on('message', (data: WebSocket.Data) => {
+      lastMessageAt = Date.now();
       processMessage(data);
     });
 
@@ -1326,6 +1363,7 @@ function connect(): void {
     });
 
     ws.on('close', (code, reason) => {
+      if (silentSince === null) silentSince = lastMessageAt;
       isConnected = false;
       stopHeartbeat();
       console.log(`❌ WebSocket closed: ${code} - ${reason?.toString() || 'No reason'}`);

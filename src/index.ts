@@ -16,6 +16,7 @@ import { startBulkSolHistory } from './services/bulksolIndexer';
 
 import { startWebSocketListener, getWebSocketStats, forceReconnect } from './jobs/wsListener';
 import { startLeaderboardEnrichment } from './jobs/leaderboardEnrichment';
+import { startGapBackfill } from './services/gapBackfill';
 import { startReconciliation, latestHealth } from './jobs/reconciliation';
 import { startDevnetPoller } from './jobs/devnetPoller';
 import { initRedis, getCacheStats } from './services/cache';
@@ -419,6 +420,7 @@ async function start() {
   
   // Start WebSocket listener for live trades/liquidations
   startWebSocketListener();
+  startGapBackfill();
 
   // Enrich the PnL leaderboard from BULK account data for our top traders by
   // volume (BULK's own indexer leaderboard is disabled — we build it ourselves).

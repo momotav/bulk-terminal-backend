@@ -6,6 +6,7 @@ import { buildAdditiveRow, coinFromSymbol, zeroCoinDict } from '../services/coin
 import { filterOutSystemWallets, SYSTEM_WALLET_ADDRESSES } from '../services/systemWallets';
 import { bulkFetch } from '../services/bulkAuth';
 import { liveExchangeTotals, liveTickers, liveMarketStatus } from '../services/liveMarket';
+import { getBackfillStatus } from '../services/gapBackfill';
 import { getRequestNetwork } from '../services/networkContext';
 
 const router = Router();
@@ -2936,7 +2937,7 @@ router.get('/fee-tiers', async (req: Request, res: Response) => {
 // per-market totals for the picker. With one: that market's positions plus how
 // much of its open interest they cover, so the map is honest about its reach.
 // GET /analytics/live-status — is the live market stream feeding us?
-router.get('/live-status', (_req: Request, res: Response) => { res.json(liveMarketStatus()); });
+router.get('/live-status', (_req: Request, res: Response) => { res.json({ ...liveMarketStatus(), backfill: getBackfillStatus() }); });
 
 router.get('/liquidation-map', async (req: Request, res: Response) => {
   try {
