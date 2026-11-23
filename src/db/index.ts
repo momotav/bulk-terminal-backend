@@ -262,6 +262,27 @@ export async function initializeDatabase(): Promise<void> {
       END $$;
     `);
 
+    // Per wallet, per market, per day — kept for good. The raw trades table is
+    // pruned after 2 days; this keeps what windowed stats need (7d/30d
+    // leaderboards, per-market history) at a few MB a month. Volume credits BOTH
+    // sides of a fill, like traders.total_volume.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS wallet_daily (
+        day DATE NOT NULL,
+        wallet_address VARCHAR(64) NOT NULL,
+        symbol VARCHAR(20) NOT NULL,
+        volume NUMERIC(24, 2) NOT NULL DEFAULT 0,
+        trades INTEGER NOT NULL DEFAULT 0,
+        buy_volume NUMERIC(24, 2) NOT NULL DEFAULT 0,
+        sell_volume NUMERIC(24, 2) NOT NULL DEFAULT 0,
+        maker_volume NUMERIC(24, 2) NOT NULL DEFAULT 0,
+        liq_count INTEGER NOT NULL DEFAULT 0,
+        liq_value NUMERIC(24, 2) NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, wallet_address, symbol)
+      );
+      CREATE INDEX IF NOT EXISTS idx_wallet_daily_wallet ON wallet_daily (wallet_address, day);
+    `);
+
     // Shared fills and orders, kept for good. BULK only keeps ~8 days of account
     // history, so a share link would die once its fill ages out; the first time a
     // link is opened or copied, what it shows is stored here.

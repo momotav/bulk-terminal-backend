@@ -7,6 +7,7 @@ import { filterOutSystemWallets, SYSTEM_WALLET_ADDRESSES } from '../services/sys
 import { bulkFetch } from '../services/bulkAuth';
 import { liveExchangeTotals, liveTickers, liveMarketStatus } from '../services/liveMarket';
 import { getBackfillStatus } from '../services/gapBackfill';
+import { accountStreamStatus } from '../services/accountStream';
 import { getRequestNetwork } from '../services/networkContext';
 
 const router = Router();
@@ -1164,6 +1165,30 @@ router.get('/oi-chart', async (req: Request, res: Response) => {
       if (!dataMap.has(ts)) dataMap.set(ts, zeroCoinDict(symbols));
       const coin = coinFromSymbol(row.symbol || '');
       if (coin) dataMap.get(ts)![coin] = parseFloat(row.value || 0);
+    }
+
+    // A market with no snapshot in a bucket is MISSING data, not zero OI. When the
+    // feed is degraded (2026-11-23: live socket dead, REST fallback rate-limited)
+    // many buckets miss some markets, and counting them as 0 drew a comb of fake
+    // drops in the total. Carry each market's last reading forward (up to 3h).
+    {
+      const seenIn = new Map<string, Set<string>>();
+      for (const row of result) {
+        const ts = new Date(row.timestamp).toISOString();
+        const coin = coinFromSymbol(row.symbol || '');
+        if (!coin) continue;
+        if (!seenIn.has(ts)) seenIn.set(ts, new Set());
+        seenIn.get(ts)!.add(coin);
+      }
+      const last: Record<string, { v: number; t: number }> = {};
+      for (const ts of Array.from(dataMap.keys()).sort()) {
+        const t = Date.parse(ts), vals = dataMap.get(ts)!, have = seenIn.get(ts) ?? new Set<string>();
+        for (const coin of Object.keys(vals)) {
+          if (have.has(coin)) { last[coin] = { v: vals[coin], t }; continue; }
+          const prev = last[coin];
+          if (prev && t - prev.t <= 3 * 3_600_000) vals[coin] = prev.v;
+        }
+      }
     }
 
     // Build an intermediate array that has per-coin values + `total`. We do
@@ -2937,7 +2962,7 @@ router.get('/fee-tiers', async (req: Request, res: Response) => {
 // per-market totals for the picker. With one: that market's positions plus how
 // much of its open interest they cover, so the map is honest about its reach.
 // GET /analytics/live-status — is the live market stream feeding us?
-router.get('/live-status', (_req: Request, res: Response) => { res.json({ ...liveMarketStatus(), backfill: getBackfillStatus() }); });
+router.get('/live-status', (_req: Request, res: Response) => { res.json({ ...liveMarketStatus(), accounts: accountStreamStatus(), backfill: getBackfillStatus() }); });
 
 router.get('/liquidation-map', async (req: Request, res: Response) => {
   try {

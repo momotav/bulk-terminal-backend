@@ -204,6 +204,28 @@ class LeaderboardService {
     }
   }
 
+  /**
+   * Volume / trade-count ranking over a window. 24h from the raw trades (kept 2
+   * days, exact to the minute); 7d/30d from wallet_daily (whole UTC days, today
+   * included). Both sides of every fill count, as in traders.total_volume.
+   */
+  private async windowed(timeframe: Exclude<TimeFrame, 'all'>, order: 'volume' | 'trades', limit: number): Promise<LeaderboardEntry[]> {
+    const ex = this.getExcludedFilter('w');
+    const by = order === 'volume' ? 'vol' : 'n';
+    const rows = timeframe === '24h'
+      ? await query<{ w: string; vol: string; n: string }>(
+        `SELECT w, SUM(value) AS vol, COUNT(*) AS n FROM (
+           SELECT p.w, t.value FROM trades t
+           CROSS JOIN LATERAL (VALUES (t.wallet_address), (CASE WHEN t.counterparty IS DISTINCT FROM t.wallet_address THEN t.counterparty END)) AS p(w)
+           WHERE t.timestamp > NOW() - INTERVAL '24 hours' AND p.w IS NOT NULL
+         ) x WHERE 1=1 ${ex} GROUP BY w ORDER BY ${by} DESC LIMIT $1`, [limit])
+      : await query<{ w: string; vol: string; n: string }>(
+        `SELECT wallet_address AS w, SUM(volume) AS vol, SUM(trades) AS n FROM wallet_daily
+         WHERE day > (NOW() AT TIME ZONE 'UTC')::date - $2::int AND trades > 0 ${this.getExcludedFilter('wallet_address')}
+         GROUP BY wallet_address ORDER BY ${by} DESC LIMIT $1`, [limit, timeframe === '7d' ? 7 : 30]);
+    return rows.map((r, i) => ({ rank: i + 1, wallet_address: r.w, value: parseFloat(r.vol) || 0, trades: parseInt(r.n) || 0 }));
+  }
+
   // Most Active Traders (by trade count)
   async getMostActive(timeframe: TimeFrame = 'all', limit: number = 50): Promise<LeaderboardEntry[]> {
     const cacheKey = `leaderboard:active:${timeframe}:${limit}`;
@@ -213,7 +235,13 @@ class LeaderboardService {
     const excludeFilter = this.getExcludedFilter();
     
     try {
-      // Use pre-aggregated traders table - FAST!
+      // Windowed tabs used to show all-time here (the timeframe was ignored).
+      if (timeframe !== 'all') {
+        const result = await this.windowed(timeframe, 'trades', limit);
+        await setCache(cacheKey, result, 30);
+        return result;
+      }
+      // All time: pre-aggregated traders table - FAST!
       const rows = await query<{ wallet_address: string; total_trades: number; total_volume: number }>(
         `SELECT wallet_address, total_trades, total_volume
          FROM traders
@@ -247,7 +275,12 @@ class LeaderboardService {
     const excludeFilter = this.getExcludedFilter();
     
     try {
-      // Use pre-aggregated traders table - FAST!
+      if (timeframe !== 'all') {
+        const result = await this.windowed(timeframe, 'volume', limit);
+        await setCache(cacheKey, result, 30);
+        return result;
+      }
+      // All time: pre-aggregated traders table - FAST!
       const rows = await query<{ wallet_address: string; total_volume: number; total_trades: number }>(
         `SELECT wallet_address, total_volume, total_trades
          FROM traders

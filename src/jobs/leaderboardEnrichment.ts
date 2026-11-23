@@ -19,6 +19,7 @@ import { query } from '../db';
 import { bulkApi } from '../services/bulkApi';
 import { isSystemWallet } from '../services/systemWallets';
 import { setCache } from '../services/cache';
+import { getLiveAccount } from '../services/accountStream';
 
 /** One open position's liquidation point, for the liquidation map. */
 export interface LiqPoint { w: string; s: string; side: 'long' | 'short'; n: number; liq: number; entry: number; lev: number }
@@ -32,7 +33,11 @@ const TOP_N = 250;             // enrich the top-N traders by collected volume
 // 250 calls over ~2 min as a gentle ~2 req/s trickle, leaving BULK headroom for
 // live page traffic. Still well inside the 5-min cycle.
 const SPACING_MS = 500;
-const JITTER_MS = 200;             // ± randomization so calls don't align to a beat
+const JITTER_MS = 200;
+// Adaptive pace for the HTTP fallback (AIMD): double the gap after a failed
+// (usually 429'd) call, ease back 100ms per success. Starts at SPACING_MS.
+const MAX_SPACING_MS = 4000;
+let spacing = SPACING_MS;             // ± randomization so calls don't align to a beat
 const FIRST_RUN_DELAY_MS = 30_000; // let the server settle after boot
 
 let running = false;
@@ -54,11 +59,22 @@ async function enrichOnce(): Promise<void> {
     // (no extra BULK calls). Published once the sweep ends.
     const book: LiqPoint[] = [];
     let scanned = 0;
+    let streamed = 0;
+    let usedHttp = false;
     for (const { wallet_address } of rows) {
+      usedHttp = false;
       if (isSystemWallet(wallet_address)) continue;
       try {
-        // background: yields BULK /account slots to user-facing wallet-page requests
-        const acc = await bulkApi.getFullAccount(wallet_address, { background: true });
+        // Live account stream first (no BULK call); POST /account only for wallets
+        // the stream doesn't hold, paced by `spacing` below.
+        const live = getLiveAccount(wallet_address);
+        usedHttp = !live; // set before the call, so a throw still gets paced
+        const acc = live
+          ? { margin: { ...live.margin, totalBalance: Number(live.margin.totalMargin ?? live.margin.totalBalance) } as any, positions: live.positions as any[] }
+          // background: yields BULK /account slots to user-facing wallet-page requests
+          : await bulkApi.getFullAccount(wallet_address, { background: true });
+        if (usedHttp) { if (acc) spacing = Math.max(SPACING_MS, spacing - 100); else spacing = Math.min(MAX_SPACING_MS, spacing * 2); }
+        else streamed++;
         const m = acc?.margin;
         if (m) {
           const netPnl =
@@ -91,9 +107,12 @@ async function enrichOnce(): Promise<void> {
         }
       } catch {
         // One bad/absent account must not abort the sweep.
+        if (usedHttp) spacing = Math.min(MAX_SPACING_MS, spacing * 2);
       }
-      await new Promise((r) => setTimeout(r, SPACING_MS + Math.floor((Math.random() - 0.5) * 2 * JITTER_MS)));
+      // Only HTTP fetches are paced; streamed wallets cost BULK nothing.
+      if (usedHttp) await new Promise((r) => setTimeout(r, spacing + Math.floor((Math.random() - 0.5) * 2 * JITTER_MS)));
     }
+    console.log(`📈 Enrichment: ${streamed} wallets from the live stream, ${scanned - streamed} via HTTP (pace ${spacing}ms)`);
 
     if (scanned > 0) await setCache(LIQMAP_KEY, { at: Date.now(), wallets: scanned, positions: book }, 86400);
 

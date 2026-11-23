@@ -15,6 +15,8 @@ import { isSystemWallet } from './systemWallets';
 import { ingestTradePrint, onFeedGap, tradeQueueDepth } from '../jobs/wsListener';
 
 const SPACING_MS = 450;          // between account calls (~2 req/s, BULK allows 5)
+const MAX_SPACING_MS = 5000;     // adaptive: doubles after a failed call, eases back on success
+let spacing = SPACING_MS;
 const MAX_WALLETS = 6000;
 const MAX_PAGES_PER_WALLET = 20; // 5,000 fills a page
 const SEED_DAYS = 3;
@@ -79,7 +81,8 @@ async function run(fromMs: number, toMs_: number, note?: string): Promise<void> 
     let cursor: string | null = null;
     for (let page = 0; page < MAX_PAGES_PER_WALLET; page++) {
       const res = await bulkApi.accountRows(wallet, 'fills', cursor ? { cursor, limit: 5000 } : { startSlot: slots.start, endSlot: slots.end, limit: 5000 });
-      await sleep(SPACING_MS);
+      spacing = res ? Math.max(SPACING_MS, spacing - 50) : Math.min(MAX_SPACING_MS, spacing * 2);
+      await sleep(spacing);
       if (!res) { status.errors++; break; }
       for (const r of res.rows) {
         const t = toMs(r.timestamp);

@@ -385,6 +385,10 @@ async function processTradeBatch(): Promise<void> {
       console.error('global_stats batch increment failed:', err);
     });
 
+    // Daily per-wallet/per-market rollup (kept for good; trades itself is pruned
+    // after 2 days). Both sides credited: taker on its side, maker on the other.
+    await upsertWalletDaily(trades).catch((err: unknown) => console.error('wallet_daily upsert failed:', err));
+
     // Aggregate trader stats in memory (don't write to DB yet). Credit BOTH
     // the maker and the taker: each of them traded this notional, so each
     // wallet's lifetime volume/trade count must include it. This is how BULK's
@@ -411,6 +415,36 @@ async function processTradeBatch(): Promise<void> {
   } finally {
     isProcessingBatch = false;
   }
+}
+
+type DailyRow = { day: string; w: string; s: string; vol: number; n: number; buy: number; sell: number; maker: number };
+async function upsertWalletDaily(trades: { symbol: string; side: string; maker: string | null; taker: string | null; walletAddress: string | null; value: number; time: number }[]): Promise<void> {
+  const m = new Map<string, DailyRow>();
+  const add = (w: string | null, s: string, t: number, v: number, buy: boolean, maker: boolean) => {
+    if (!w || !s) return;
+    const day = new Date(t > 1e14 ? t / 1e6 : t).toISOString().slice(0, 10);
+    const k = `${day}|${w}|${s}`;
+    const r = m.get(k) ?? { day, w, s, vol: 0, n: 0, buy: 0, sell: 0, maker: 0 };
+    r.vol += v; r.n++; if (buy) r.buy += v; else r.sell += v; if (maker) r.maker += v;
+    m.set(k, r);
+  };
+  for (const t of trades) {
+    const takerBuy = t.side === 'buy';
+    const taker = t.taker ?? t.walletAddress;
+    add(taker, t.symbol, t.time, t.value, takerBuy, false);
+    if (t.maker && t.maker !== taker) add(t.maker, t.symbol, t.time, t.value, !takerBuy, true);
+  }
+  if (!m.size) return;
+  const rows = Array.from(m.values());
+  await query(
+    `INSERT INTO wallet_daily (day, wallet_address, symbol, volume, trades, buy_volume, sell_volume, maker_volume)
+     SELECT * FROM UNNEST($1::date[], $2::varchar[], $3::varchar[], $4::numeric[], $5::int[], $6::numeric[], $7::numeric[], $8::numeric[])
+     ON CONFLICT (day, wallet_address, symbol) DO UPDATE SET
+       volume = wallet_daily.volume + EXCLUDED.volume, trades = wallet_daily.trades + EXCLUDED.trades,
+       buy_volume = wallet_daily.buy_volume + EXCLUDED.buy_volume, sell_volume = wallet_daily.sell_volume + EXCLUDED.sell_volume,
+       maker_volume = wallet_daily.maker_volume + EXCLUDED.maker_volume`,
+    [rows.map((r) => r.day), rows.map((r) => r.w), rows.map((r) => r.s), rows.map((r) => r.vol), rows.map((r) => r.n), rows.map((r) => r.buy), rows.map((r) => r.sell), rows.map((r) => r.maker)],
+  );
 }
 
 // Flush aggregated trader stats to DB (runs less frequently)
@@ -527,12 +561,23 @@ async function recordLiquidation(liq: {
 
   try {
     // Insert liquidation
-    await query(
+    const inserted = await query(
       `INSERT INTO liquidations (wallet_address, symbol, side, size, price, value, timestamp)
        VALUES ($1::varchar, $2::varchar, $3::varchar, $4, $5, $6, to_timestamp($7/1000.0))
-       ON CONFLICT DO NOTHING`,
+       ON CONFLICT DO NOTHING
+       RETURNING id`,
       [walletAddress, liq.symbol, liq.side, Math.abs(liq.size), liq.price, value, liq.time]
     );
+    // Count it in the daily rollup only when it was new (not a duplicate print).
+    if (walletAddress && Array.isArray(inserted) && inserted.length) {
+      await query(
+        `INSERT INTO wallet_daily (day, wallet_address, symbol, liq_count, liq_value)
+         VALUES ((to_timestamp($3/1000.0) AT TIME ZONE 'UTC')::date, $1, $2, 1, $4)
+         ON CONFLICT (day, wallet_address, symbol) DO UPDATE SET
+           liq_count = wallet_daily.liq_count + 1, liq_value = wallet_daily.liq_value + EXCLUDED.liq_value`,
+        [walletAddress, liq.symbol, liq.time > 1e14 ? Math.floor(liq.time / 1e6) : liq.time, value],
+      ).catch((err: unknown) => console.error('wallet_daily liq upsert failed:', err));
+    }
 
     // Update trader stats if wallet known (single query, no notifications to save connections)
     if (walletAddress) {
