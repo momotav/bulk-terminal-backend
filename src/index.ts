@@ -19,6 +19,7 @@ import { startLeaderboardEnrichment } from './jobs/leaderboardEnrichment';
 import { startGapBackfill } from './services/gapBackfill';
 import { seedWalletDaily } from './services/walletDaily';
 import { startAccountStream } from './services/accountStream';
+import { startMarketSnapshots } from './jobs/marketSnapshots';
 import { startReconciliation, latestHealth } from './jobs/reconciliation';
 import { startDevnetPoller } from './jobs/devnetPoller';
 import { initRedis, getCacheStats } from './services/cache';
@@ -428,6 +429,8 @@ async function start() {
   startGapBackfill();
   // Live account state for the top traders (replaces polling them every 5 min).
   startAccountStream();
+  // Liquidity + positioning history, every 5 min.
+  startMarketSnapshots();
 
   // Enrich the PnL leaderboard from BULK account data for our top traders by
   // volume (BULK's own indexer leaderboard is disabled — we build it ourselves).

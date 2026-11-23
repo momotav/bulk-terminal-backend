@@ -283,6 +283,34 @@ export async function initializeDatabase(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_wallet_daily_wallet ON wallet_daily (wallet_address, day);
     `);
 
+    // Market microstructure history (every 5 min per market): spread, depth and
+    // the round-trip cost of trading at size. Plus where the top traders stand
+    // (positioning, from the live account stream).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS liquidity_snapshots (
+        ts TIMESTAMP NOT NULL,
+        symbol VARCHAR(20) NOT NULL,
+        mid NUMERIC(24, 10),
+        spread_bps NUMERIC(14, 6),
+        bid_depth_2pct NUMERIC(24, 2),
+        ask_depth_2pct NUMERIC(24, 2),
+        cost_10k NUMERIC(14, 6),
+        cost_100k NUMERIC(14, 6),
+        cost_1m NUMERIC(14, 6),
+        PRIMARY KEY (symbol, ts)
+      );
+      CREATE TABLE IF NOT EXISTS positioning_snapshots (
+        ts TIMESTAMP NOT NULL,
+        symbol VARCHAR(20) NOT NULL,
+        long_usd NUMERIC(24, 2), short_usd NUMERIC(24, 2),
+        long_n INTEGER, short_n INTEGER,
+        long_entry NUMERIC(24, 10), short_entry NUMERIC(24, 10),
+        top5_share NUMERIC(8, 4),
+        wallets INTEGER,
+        PRIMARY KEY (symbol, ts)
+      );
+    `);
+
     // Shared fills and orders, kept for good. BULK only keeps ~8 days of account
     // history, so a share link would die once its fill ages out; the first time a
     // link is opened or copied, what it shows is stored here.

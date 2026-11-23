@@ -2961,6 +2961,110 @@ router.get('/fee-tiers', async (req: Request, res: Response) => {
 // account reads (top traders by volume, refreshed every ~5 min). Without a symbol:
 // per-market totals for the picker. With one: that market's positions plus how
 // much of its open interest they cover, so the map is honest about its reach.
+// ─── Market microstructure / positioning / funding analytics ───────────────
+const sym = (raw: unknown) => { const r = String(raw || '').toUpperCase().replace(/[^A-Z0-9-]/g, ''); return r ? (r.endsWith('-USD') ? r : `${r}-USD`) : ''; };
+const daysOf = (raw: unknown, max = 90) => Math.max(1, Math.min(max, parseInt(String(raw || '7'), 10) || 7));
+
+// GET /analytics/liquidity-history?symbol=BTC&days=7 — spread, depth and the
+// round-trip cost at $10K/$100K/$1M over time (5-min points up to 2 days, hourly
+// beyond), plus the average cost by UTC hour of day.
+router.get('/liquidity-history', async (req: Request, res: Response) => {
+  try {
+    const symbol = sym(req.query.symbol || 'BTC'); const days = daysOf(req.query.days);
+    const result = await swrCache(`liqhist:${symbol}:${days}`, 120, async () => {
+      const bucket = days <= 2 ? 'ts' : `date_trunc('hour', ts)`;
+      const series = await query(
+        `SELECT ${bucket} AS t, AVG(mid) AS mid, AVG(spread_bps) AS spread, AVG(bid_depth_2pct) AS bid, AVG(ask_depth_2pct) AS ask,
+                AVG(cost_10k) AS c10k, AVG(cost_100k) AS c100k, AVG(cost_1m) AS c1m
+         FROM liquidity_snapshots WHERE symbol = $1 AND ts > NOW() - make_interval(days => $2)
+         GROUP BY 1 ORDER BY 1`, [symbol, days]);
+      const hours = await query(
+        `SELECT EXTRACT(HOUR FROM ts)::int AS h, AVG(cost_100k) AS c100k, AVG(spread_bps) AS spread, AVG(bid_depth_2pct + ask_depth_2pct) AS depth
+         FROM liquidity_snapshots WHERE symbol = $1 AND ts > NOW() - make_interval(days => $2)
+         GROUP BY 1 ORDER BY 1`, [symbol, days]);
+      const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+      return {
+        symbol, days,
+        series: series.map((r: any) => ({ t: new Date(r.t).getTime(), mid: num(r.mid), spread: num(r.spread), bidDepth: num(r.bid), askDepth: num(r.ask), c10k: num(r.c10k), c100k: num(r.c100k), c1m: num(r.c1m) })),
+        byHour: hours.map((r: any) => ({ hour: r.h, c100k: num(r.c100k), spread: num(r.spread), depth: num(r.depth) })),
+      };
+    }, 3600);
+    res.json(result);
+  } catch (e: any) { res.status(500).json({ error: e.message || 'liquidity history failed' }); }
+});
+
+// GET /analytics/positioning — where the top traders stand per market (latest
+// snapshot, with the change over 24h). ?symbol=&days= for one market's history.
+router.get('/positioning', async (req: Request, res: Response) => {
+  try {
+    const symbol = sym(req.query.symbol);
+    if (symbol) {
+      const days = daysOf(req.query.days, 30);
+      const rows = await swrCache(`posit:${symbol}:${days}`, 120, () => query(
+        `SELECT ${days <= 2 ? 'ts' : `date_trunc('hour', ts)`} AS t, AVG(long_usd) AS l, AVG(short_usd) AS s, AVG(long_entry) AS le, AVG(short_entry) AS se, AVG(long_n) AS ln, AVG(short_n) AS sn
+         FROM positioning_snapshots WHERE symbol = $1 AND ts > NOW() - make_interval(days => $2) GROUP BY 1 ORDER BY 1`, [symbol, days]), 3600);
+      return res.json({ symbol, days, series: rows.map((r: any) => ({ t: new Date(r.t).getTime(), long: Number(r.l), short: Number(r.s), longEntry: r.le === null ? null : Number(r.le), shortEntry: r.se === null ? null : Number(r.se), longN: Number(r.ln), shortN: Number(r.sn) })) });
+    }
+    const result = await swrCache('posit:latest', 60, async () => {
+      const latest = await query(
+        `SELECT DISTINCT ON (symbol) symbol, ts, long_usd, short_usd, long_n, short_n, long_entry, short_entry, top5_share, wallets
+         FROM positioning_snapshots WHERE ts > NOW() - INTERVAL '30 minutes' ORDER BY symbol, ts DESC`);
+      const dayAgo = await query(
+        `SELECT DISTINCT ON (symbol) symbol, long_usd, short_usd FROM positioning_snapshots
+         WHERE ts BETWEEN NOW() - INTERVAL '25 hours' AND NOW() - INTERVAL '23 hours' ORDER BY symbol, ts DESC`);
+      const prev = new Map(dayAgo.map((r: any) => [r.symbol, r]));
+      return latest.map((r: any) => {
+        const l = Number(r.long_usd), s = Number(r.short_usd), p: any = prev.get(r.symbol);
+        const ratio = l + s > 0 ? l / (l + s) : null;
+        const prevRatio = p && Number(p.long_usd) + Number(p.short_usd) > 0 ? Number(p.long_usd) / (Number(p.long_usd) + Number(p.short_usd)) : null;
+        return { symbol: r.symbol, ts: new Date(r.ts).getTime(), long: l, short: s, longN: r.long_n, shortN: r.short_n,
+          longEntry: r.long_entry === null ? null : Number(r.long_entry), shortEntry: r.short_entry === null ? null : Number(r.short_entry),
+          top5Share: r.top5_share === null ? null : Number(r.top5_share), wallets: r.wallets, longRatio: ratio, longRatio24hAgo: prevRatio };
+      }).sort((a: any, b: any) => (b.long + b.short) - (a.long + a.short));
+    }, 600);
+    res.json({ markets: result });
+  } catch (e: any) { res.status(500).json({ error: e.message || 'positioning failed' }); }
+});
+
+// GET /analytics/funding-premium?days=7[&symbol=] — funding and mark-vs-oracle
+// premium per market from the live ticker snapshots: summary for every market,
+// or one market's hourly series.
+router.get('/funding-premium', async (req: Request, res: Response) => {
+  try {
+    const symbol = sym(req.query.symbol); const days = daysOf(req.query.days, 60);
+    if (symbol) {
+      const rows = await swrCache(`fundprem:${symbol}:${days}`, 300, () => query(
+        `SELECT date_trunc('hour', timestamp) AS t, AVG(funding_rate) AS f, AVG(mark_oracle_bps) AS p, AVG(mark_price) AS m
+         FROM ticker_snapshots WHERE symbol = $1 AND network = $3 AND timestamp > NOW() - make_interval(days => $2)
+         GROUP BY 1 ORDER BY 1`, [symbol, days, getRequestNetwork()]), 3600);
+      return res.json({ symbol, days, series: rows.map((r: any) => ({ t: new Date(r.t).getTime(), funding: r.f === null ? null : Number(r.f), premium: r.p === null ? null : Number(r.p), mark: r.m === null ? null : Number(r.m) })) });
+    }
+    const result = await swrCache(`fundprem:all:${days}`, 300, async () => {
+      const rows = await query(
+        `WITH h AS (
+           SELECT symbol, date_trunc('hour', timestamp) AS t, AVG(funding_rate) AS f, AVG(mark_oracle_bps) AS p
+           FROM ticker_snapshots WHERE network = $2 AND timestamp > NOW() - make_interval(days => $1)
+           GROUP BY 1, 2
+         ), o AS (
+           SELECT *, LAG(f) OVER (PARTITION BY symbol ORDER BY t) AS pf FROM h
+         )
+         SELECT symbol,
+                AVG(f) AS f_avg,
+                AVG(f) FILTER (WHERE t > NOW() - INTERVAL '24 hours') AS f_24h,
+                (ARRAY_AGG(f ORDER BY t DESC))[1] AS f_now,
+                AVG(CASE WHEN f > 0 THEN 1.0 ELSE 0 END) AS pos_share,
+                SUM(CASE WHEN pf IS NOT NULL AND SIGN(f) <> SIGN(pf) AND f <> 0 AND pf <> 0 THEN 1 ELSE 0 END) AS flips,
+                AVG(p) AS p_avg, AVG(ABS(p)) AS p_abs, (ARRAY_AGG(p ORDER BY t DESC))[1] AS p_now,
+                COUNT(*) AS hours
+         FROM o GROUP BY symbol`, [days, getRequestNetwork()]);
+      const n = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+      return rows.map((r: any) => ({ symbol: r.symbol, fundingNow: n(r.f_now), funding24h: n(r.f_24h), fundingAvg: n(r.f_avg), positiveShare: n(r.pos_share), flips: Number(r.flips), premiumNow: n(r.p_now), premiumAvg: n(r.p_avg), premiumAbsAvg: n(r.p_abs), hours: Number(r.hours) }))
+        .filter((r: any) => r.hours >= 3);
+    }, 3600);
+    res.json({ days, markets: result });
+  } catch (e: any) { res.status(500).json({ error: e.message || 'funding analytics failed' }); }
+});
+
 // GET /analytics/live-status — is the live market stream feeding us?
 router.get('/live-status', (_req: Request, res: Response) => { res.json({ ...liveMarketStatus(), accounts: accountStreamStatus(), backfill: getBackfillStatus() }); });
 
@@ -3261,7 +3365,7 @@ const OB_STALE_MAX_MS = 5 * 60_000; // never serve a book older than 5 minutes
 
 // Fetch BULK's /l2book and fold it into our normalized snapshot shape. Throws on
 // any upstream/parse failure so the caller can decide whether to serve stale.
-async function loadOrderBook(coin: string, nlevels: number): Promise<any> {
+export async function loadOrderBook(coin: string, nlevels: number): Promise<any> {
   const url = `${BULK_API_BASE}/l2book?type=l2book&coin=${encodeURIComponent(coin)}&nlevels=${nlevels}`;
   const upstream = await bulkFetch(url);
   if (!upstream.ok) throw new Error(`BULK /l2book returned ${upstream.status}`);

@@ -130,6 +130,13 @@ export function getLiveAccount(wallet: string, maxAgeMs = 40 * 60_000): LiveAcco
   return { margin: { ...s.margin, unrealizedPnl: positions.length ? unrealized : Number(s.margin.unrealizedPnl) || 0 }, positions, snapshotAt: s.snapshotAt, updatedAt: s.updatedAt };
 }
 
+/** Every tracked wallet's fresh live state (positioning snapshots). */
+export function allLiveAccounts(maxAgeMs = 40 * 60_000): { wallet: string; positions: LivePosition[] }[] {
+  const out: { wallet: string; positions: LivePosition[] }[] = [];
+  for (const [wallet, s] of state) if (Date.now() - s.snapshotAt <= maxAgeMs) out.push({ wallet, positions: Array.from(s.positions.values()) });
+  return out;
+}
+
 export function accountStreamStatus() {
   const open = shards.filter((s) => s.ws?.readyState === WebSocket.OPEN).length;
   let fresh = 0; for (const s of state.values()) if (Date.now() - s.snapshotAt < 40 * 60_000) fresh++;
