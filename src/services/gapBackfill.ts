@@ -117,10 +117,26 @@ export function startGapBackfill(): void {
   onFeedGap((from, to) => { void backfillGap(from, to, 'feed reconnected'); });
   setTimeout(async () => {
     try {
-      const row = await queryOne<{ last: string | null }>(`SELECT MAX(timestamp) AS last FROM trades`);
+      // Holes in what we recorded: any stretch of the last 48h (our trades table
+      // keeps ~2 days) with no trade for 15+ minutes. The exchange prints every few
+      // seconds, so silence that long means we missed it. Filled holes have trades
+      // again, so a later restart doesn't redo them.
+      const holes = await query<{ a: string; b: string }>(
+        `SELECT ts AS a, nxt AS b FROM (
+           SELECT timestamp AS ts, LEAD(timestamp) OVER (ORDER BY timestamp) AS nxt
+           FROM trades WHERE timestamp > NOW() - INTERVAL '48 hours' AND timestamp < to_timestamp($1/1000.0)
+         ) x WHERE nxt - ts > INTERVAL '15 minutes' ORDER BY ts`,
+        [bootAt],
+      );
+      for (const h of holes) {
+        const a = new Date(h.a).getTime(), b = new Date(h.b).getTime();
+        void backfillGap(a + 1, b - 1, 'startup: hole in recorded trades');
+      }
+      // And the stretch right before this boot, if the feed was already dead.
+      const row = await queryOne<{ last: string | null }>(`SELECT MAX(timestamp) AS last FROM trades WHERE timestamp < to_timestamp($1/1000.0)`, [bootAt]);
       const last = row?.last ? new Date(row.last).getTime() : null;
-      // BULK keeps ~8 days of account history; don't reach further than that.
-      if (last && bootAt - last > 5 * 60_000) void backfillGap(Math.max(last + 1, bootAt - 7.5 * 86_400_000), bootAt, 'startup: trades missing since last record');
+      if (last && bootAt - last > 15 * 60_000) void backfillGap(Math.max(last + 1, bootAt - 7.5 * 86_400_000), bootAt, 'startup: trades missing before boot');
+      if (!holes.length && !(last && bootAt - last > 15 * 60_000)) console.log('🩹 startup: no gaps in recorded trades');
     } catch (e) { console.error('🩹 startup gap check failed:', e); }
   }, 60_000);
 }
