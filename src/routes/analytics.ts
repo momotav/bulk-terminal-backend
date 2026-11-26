@@ -9,6 +9,7 @@ import { liveExchangeTotals, liveTickers, liveMarketStatus } from '../services/l
 import { getBackfillStatus } from '../services/gapBackfill';
 import { accountStreamStatus } from '../services/accountStream';
 import { getRequestNetwork } from '../services/networkContext';
+import { buildCohorts, liveWallets, positionChanges, type CohortKind } from '../services/cohorts';
 
 const router = Router();
 
@@ -3063,6 +3064,68 @@ router.get('/funding-premium', async (req: Request, res: Response) => {
     }, 3600);
     res.json({ days, markets: result });
   } catch (e: any) { res.status(500).json({ error: e.message || 'funding analytics failed' }); }
+});
+
+// GET /analytics/cohorts?kind=pnl|size — the top traders grouped by all-time PnL
+// or account size, with each group's long/short exposure (total and per market).
+// ?cohort=<key>&days= for one group's history (symbol 'ALL' or ?symbol=).
+router.get('/cohorts', async (req: Request, res: Response) => {
+  try {
+    const cohort = String(req.query.cohort || '').replace(/[^a-z_]/g, '');
+    if (cohort) {
+      const days = daysOf(req.query.days, 90);
+      const symbol = sym(req.query.symbol) || 'ALL';
+      const rows = await swrCache(`cohort:${cohort}:${symbol}:${days}`, 120, () => query(
+        `SELECT ${days <= 2 ? 'ts' : `date_trunc('hour', ts)`} AS t, AVG(long_usd) AS l, AVG(short_usd) AS s, AVG(wallets) AS w
+         FROM cohort_snapshots WHERE cohort = $1 AND symbol = $2 AND ts > NOW() - make_interval(days => $3) GROUP BY 1 ORDER BY 1`,
+        [cohort, symbol, days]), 3600);
+      return res.json({ cohort, symbol, days, series: rows.map((r: any) => ({ t: new Date(r.t).getTime(), long: Number(r.l), short: Number(r.s), wallets: r.w === null ? null : Number(r.w) })) });
+    }
+    const kind: CohortKind = req.query.kind === 'size' ? 'size' : 'pnl';
+    const result = await swrCache(`cohorts:${kind}`, 30, async () => {
+      const wallets = liveWallets();
+      const cohorts = buildCohorts(kind, wallets);
+      // Each group's exposure 24h ago, for the change in long share.
+      const prev = await query(
+        `SELECT DISTINCT ON (cohort) cohort, long_usd, short_usd FROM cohort_snapshots
+         WHERE symbol = 'ALL' AND ts BETWEEN NOW() - INTERVAL '25 hours' AND NOW() - INTERVAL '23 hours' ORDER BY cohort, ts DESC`);
+      const p = new Map(prev.map((r: any) => [r.cohort, r]));
+      return {
+        at: Date.now(), kind, wallets: wallets.length,
+        cohorts: cohorts.map((c) => {
+          const r: any = p.get(c.key);
+          const pl = r ? Number(r.long_usd) : 0, ps = r ? Number(r.short_usd) : 0;
+          return { ...c, markets: c.markets.slice(0, 12), longShare24hAgo: pl + ps > 0 ? pl / (pl + ps) : null };
+        }),
+      };
+    }, 600);
+    res.json(result);
+  } catch (e: any) { res.status(500).json({ error: e.message || 'cohorts failed' }); }
+});
+
+// GET /analytics/position-changes?window=60 — what the top traders opened,
+// closed, added, cut or flipped over the window (minutes: 15 … 10080), biggest
+// first, with the net change per market.
+router.get('/position-changes', async (req: Request, res: Response) => {
+  try {
+    const win = Math.max(15, Math.min(10_080, parseInt(String(req.query.window || '60'), 10) || 60));
+    const result = await swrCache(`poschg:${win}`, 60, async () => {
+      const { from, to, changes } = await positionChanges(win);
+      const net = new Map<string, { symbol: string; longAdded: number; shortAdded: number; wallets: number }>();
+      for (const c of changes) {
+        const m = net.get(c.symbol) ?? { symbol: c.symbol, longAdded: 0, shortAdded: 0, wallets: 0 };
+        // Split the size change into long and short exposure (a flip moves both).
+        const before = c.sizeBefore, now = c.sizeNow, px = Math.abs(c.deltaUsd) / Math.max(Math.abs(now - before), 1e-12);
+        m.longAdded += (Math.max(now, 0) - Math.max(before, 0)) * px;
+        m.shortAdded += (Math.max(-now, 0) - Math.max(-before, 0)) * px;
+        m.wallets++;
+        net.set(c.symbol, m);
+      }
+      const markets = Array.from(net.values()).sort((a, b) => Math.abs(b.longAdded - b.shortAdded) - Math.abs(a.longAdded - a.shortAdded));
+      return { window: win, from, to, changes: changes.slice(0, 300), total: changes.length, markets };
+    }, 600);
+    res.json(result);
+  } catch (e: any) { res.status(500).json({ error: e.message || 'position changes failed' }); }
 });
 
 // GET /analytics/live-status — is the live market stream feeding us?

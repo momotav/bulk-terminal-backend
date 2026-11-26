@@ -12,6 +12,7 @@ import { getCache } from '../services/cache';
 import { getActiveSymbols } from '../services/markets';
 import { allLiveAccounts } from '../services/accountStream';
 import { loadOrderBook } from '../routes/analytics';
+import { snapshotCohorts } from '../services/cohorts';
 
 const EVERY_MS = 5 * 60_000;
 const PACE_MS = 350;
@@ -96,6 +97,7 @@ async function tick(): Promise<void> {
     const ts = new Date(Math.floor(Date.now() / EVERY_MS) * EVERY_MS); // aligned buckets
     const symbols = await getActiveSymbols().catch(() => [] as string[]);
     await positioning(ts);
+    await snapshotCohorts(ts).catch((e) => console.error('cohort snapshot failed:', e));
     await liquidity(symbols, ts);
   } catch (e) {
     console.error('market snapshots failed:', e);

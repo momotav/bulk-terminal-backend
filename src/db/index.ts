@@ -309,6 +309,24 @@ export async function initializeDatabase(): Promise<void> {
         wallets INTEGER,
         PRIMARY KEY (symbol, ts)
       );
+      -- Every tracked wallet's open positions every 5 min (kept 8 days): who
+      -- added or cut over a window. symbol '' = the wallet had no positions.
+      CREATE TABLE IF NOT EXISTS wallet_positions (
+        ts TIMESTAMP NOT NULL,
+        wallet VARCHAR(64) NOT NULL,
+        symbol VARCHAR(20) NOT NULL,
+        size NUMERIC(30, 10), notional NUMERIC(24, 2), entry NUMERIC(24, 10),
+        PRIMARY KEY (ts, wallet, symbol)
+      );
+      -- Each trader cohort's long/short exposure every 5 min (symbol 'ALL' = total).
+      CREATE TABLE IF NOT EXISTS cohort_snapshots (
+        ts TIMESTAMP NOT NULL,
+        cohort VARCHAR(24) NOT NULL,
+        symbol VARCHAR(20) NOT NULL,
+        long_usd NUMERIC(24, 2), short_usd NUMERIC(24, 2),
+        wallets INTEGER,
+        PRIMARY KEY (cohort, symbol, ts)
+      );
     `);
 
     // Shared fills and orders, kept for good. BULK only keeps ~8 days of account
