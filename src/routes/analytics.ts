@@ -10,6 +10,7 @@ import { getBackfillStatus } from '../services/gapBackfill';
 import { accountStreamStatus } from '../services/accountStream';
 import { getRequestNetwork } from '../services/networkContext';
 import { buildCohorts, liveWallets, positionChanges, type CohortKind } from '../services/cohorts';
+import { flowSeries, flowSummary } from '../services/orderFlow';
 
 const router = Router();
 
@@ -3126,6 +3127,25 @@ router.get('/position-changes', async (req: Request, res: Response) => {
     }, 600);
     res.json(result);
   } catch (e: any) { res.status(500).json({ error: e.message || 'position changes failed' }); }
+});
+
+// GET /analytics/order-flow?hours=24 — taker buys vs sells per market over the
+// window, with the price and open-interest change and what kind of flow that was
+// (new longs / short covering / new shorts / longs closing). ?symbol=&days= for
+// one market's hourly flow, cumulative net, price and OI.
+router.get('/order-flow', async (req: Request, res: Response) => {
+  try {
+    const network = getRequestNetwork();
+    const symbol = sym(req.query.symbol);
+    if (symbol) {
+      const days = daysOf(req.query.days, 90);
+      const series = await swrCache(`flow:${network}:${symbol}:${days}`, 120, () => flowSeries(network, symbol, days), 3600);
+      return res.json({ symbol, days, series });
+    }
+    const hours = Math.max(1, Math.min(24 * 90, parseInt(String(req.query.hours || '24'), 10) || 24));
+    const markets = await swrCache(`flow:${network}:all:${hours}`, 120, () => flowSummary(network, hours), 3600);
+    res.json({ hours, markets });
+  } catch (e: any) { res.status(500).json({ error: e.message || 'order flow failed' }); }
 });
 
 // GET /analytics/live-status — is the live market stream feeding us?

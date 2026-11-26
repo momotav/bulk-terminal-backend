@@ -13,6 +13,8 @@ import { getActiveSymbols } from '../services/markets';
 import { allLiveAccounts } from '../services/accountStream';
 import { loadOrderBook } from '../routes/analytics';
 import { snapshotCohorts } from '../services/cohorts';
+import { rollupFlow } from '../services/orderFlow';
+import { getRequestNetwork } from '../services/networkContext';
 
 const EVERY_MS = 5 * 60_000;
 const PACE_MS = 350;
@@ -90,6 +92,7 @@ async function positioning(ts: Date): Promise<void> {
 }
 
 let running = false;
+let flowSeeded = false;
 async function tick(): Promise<void> {
   if (running) return;
   running = true;
@@ -98,6 +101,8 @@ async function tick(): Promise<void> {
     const symbols = await getActiveSymbols().catch(() => [] as string[]);
     await positioning(ts);
     await snapshotCohorts(ts).catch((e) => console.error('cohort snapshot failed:', e));
+    // First run after a start re-rolls everything the trades table still holds.
+    await rollupFlow(getRequestNetwork(), flowSeeded ? 6 : 72).then(() => { flowSeeded = true; }).catch((e) => console.error('flow rollup failed:', e));
     await liquidity(symbols, ts);
   } catch (e) {
     console.error('market snapshots failed:', e);

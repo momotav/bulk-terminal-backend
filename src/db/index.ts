@@ -318,6 +318,15 @@ export async function initializeDatabase(): Promise<void> {
         size NUMERIC(30, 10), notional NUMERIC(24, 2), entry NUMERIC(24, 10),
         PRIMARY KEY (ts, wallet, symbol)
       );
+      -- Taker buy/sell notional per market per hour (trades is pruned after 2 days).
+      CREATE TABLE IF NOT EXISTS flow_hourly (
+        hour TIMESTAMP NOT NULL,
+        symbol VARCHAR(20) NOT NULL,
+        network VARCHAR(16) NOT NULL DEFAULT 'mainnet',
+        buy_usd NUMERIC(24, 2) NOT NULL DEFAULT 0, sell_usd NUMERIC(24, 2) NOT NULL DEFAULT 0,
+        buys INTEGER NOT NULL DEFAULT 0, sells INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (symbol, network, hour)
+      );
       -- Each trader cohort's long/short exposure every 5 min (symbol 'ALL' = total).
       CREATE TABLE IF NOT EXISTS cohort_snapshots (
         ts TIMESTAMP NOT NULL,
