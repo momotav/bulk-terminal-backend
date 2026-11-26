@@ -2708,28 +2708,38 @@ router.get('/regime', async (req: Request, res: Response) => {
     // Fetch regime data for every market BULK has listed — new coins
     // automatically appear here once BULK starts returning regime fields.
     const symbols = await getActiveSymbols();
-    const regimeData: any[] = [];
-
+    const row = (symbol: string, ticker: any) => ({
+      symbol: coinFromSymbol(symbol),
+      regime: ticker.regime ?? 0,
+      regimeDt: ticker.regimeDt ?? 0,
+      regimeVol: ticker.regimeVol ?? 0,
+      fairBookPx: ticker.fairBookPx ?? 0,
+      markPrice: ticker.markPrice ?? 0,
+      fairBias: ticker.fairBias ?? 0,
+      timestamp: ticker.timestamp,
+    });
+    // The live ticker stream already carries every market's regime fields, so
+    // this is normally zero BULK calls. It used to fetch /ticker for each market
+    // one after another (~9s for ~36 markets). REST only fills markets the
+    // stream hasn't covered, four at a time.
+    const live = new Map((liveTickers(symbols) ?? []).map((t: any) => [t.symbol, t]));
+    const bySymbol = new Map<string, any>();
+    const missing: string[] = [];
     for (const symbol of symbols) {
-      try {
-        const tickerRes = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
-        if (tickerRes.ok) {
-          const ticker = await tickerRes.json() as any;
-          regimeData.push({
-            symbol: coinFromSymbol(symbol),
-            regime: ticker.regime ?? 0,
-            regimeDt: ticker.regimeDt ?? 0,
-            regimeVol: ticker.regimeVol ?? 0,
-            fairBookPx: ticker.fairBookPx ?? 0,
-            markPrice: ticker.markPrice ?? 0,
-            fairBias: ticker.fairBias ?? 0,
-            timestamp: ticker.timestamp
-          });
-        }
-      } catch (e) {
-        console.error(`Failed to fetch regime for ${symbol}:`, e);
-      }
+      const t: any = live.get(symbol);
+      if (t && t.regime !== undefined) bySymbol.set(symbol, row(symbol, t)); else missing.push(symbol);
     }
+    for (let i = 0; i < missing.length; i += 4) {
+      await Promise.all(missing.slice(i, i + 4).map(async (symbol) => {
+        try {
+          const tickerRes = await bulkFetch(`${BULK_API_BASE}/ticker/${symbol}`);
+          if (tickerRes.ok) bySymbol.set(symbol, row(symbol, await tickerRes.json()));
+        } catch (e) {
+          console.error(`Failed to fetch regime for ${symbol}:`, e);
+        }
+      }));
+    }
+    const regimeData = symbols.map((s) => bySymbol.get(s)).filter(Boolean);
 
     // Calculate aggregate regime (weighted by some factor or just average)
     const avgRegime = regimeData.length > 0
